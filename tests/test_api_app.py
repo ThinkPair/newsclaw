@@ -12590,7 +12590,10 @@ class TestBackendAPI:
         cfg = Config(
             llm=LLMConfig(
                 default_provider="openai",
-                openai=LLMProviderConfig(api_key="sk-abcdef1234567890xyzw", model="gpt-4o"),  # gitleaks:allow
+                openai=LLMProviderConfig(
+                    api_key="sk-abcdef1234567890xyzw",  # gitleaks:allow
+                    model="gpt-4o",
+                ),
             ),
         )
         monkeypatch.setattr(
@@ -15047,7 +15050,9 @@ class TestEmbeddingAndCompatProviderE2E:
 
         # In-memory config has the real key
         assert cfg.llm.default_provider == "openai_compatible"
-        assert cfg.llm.openai_compatible.api_key == "gsk-fresh-groq-key-1234567890"  # gitleaks:allow
+        assert cfg.llm.openai_compatible.api_key == (
+            "gsk-fresh-groq-key-1234567890"  # gitleaks:allow
+        )
         assert cfg.llm.openai_compatible.model == "llama-3.1-70b-versatile"
         assert cfg.llm.openai_compatible.base_url == "https://api.groq.com/openai/v1"
 
