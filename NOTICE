@@ -1,0 +1,22 @@
+NewsClaw / 新闻爪
+===================
+
+NewsClaw is an independent, local-only news-domain adaptation of
+OpenBiliClaw. It does not require the upstream project at runtime.
+
+Substantial portions of the architecture, interaction design, and source code
+are derived from OpenBiliClaw:
+
+  https://github.com/whiteguo233/OpenBiliClaw
+
+Those portions remain available under the MIT License included in LICENSE:
+
+  Copyright (c) 2026 OpenBiliClaw Contributors
+
+The browser and DSH clients may also contain code adapted from
+dsh-openbiliclaw, whose BSD-3-Clause notice is retained with that client.
+
+News articles, publisher names, publisher marks, and third-party API data are
+not covered by the software licenses. NewsClaw stores provenance and links to
+the original publisher. The default build is for the owner's personal,
+non-commercial, local use only.

@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "NewsClaw · 新闻爪",
+  "description": "新闻爪本地侧栏客户端：连接你的本机 NewsClaw，不注入网页、不读取 Cookie。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "newsclaw-firefox@local.newsclaw",
+      "strict_min_version": "140.0"
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "scripts": [
+      "background/service-worker.js"
+    ]
+  },
+  "action": {
+    "default_title": "打开新闻爪侧栏",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "sidebar_action": {
+    "default_title": "NewsClaw · 新闻爪",
+    "default_panel": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:* http://localhost:*; frame-src http://127.0.0.1:* http://localhost:*"
+  }
+}

@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>NewsClaw · 首次设置</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/m/icon-32.png?v=4">
+  <style>
+    :root {
+      --bg: #fff9f2; --panel: rgba(255,255,255,.88); --text: #211b1d; --muted: #7b7073;
+      --line: #eee2e4; --brand: #fb7299; --brand-deep: #e65c86; --soft: #fff0f5;
+      --ok: #248b5b; --warn: #bb7900; --danger: #c63d55; --shadow: 0 28px 75px rgba(62,35,43,.12);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: var(--text); background:
+      radial-gradient(circle at 12% 8%, rgba(251,114,153,.15), transparent 30%),
+      radial-gradient(circle at 88% 92%, rgba(250,190,80,.10), transparent 32%), var(--bg);
+      font: 14px/1.55 Inter, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .shell { width: min(1060px, calc(100% - 32px)); margin: 0 auto; padding: 26px 0 54px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-size: 18px; font-weight: 760; }
+    .brand img { width: 36px; height: 36px; border-radius: 11px; box-shadow: 0 7px 18px rgba(251,114,153,.22); }
+    .privacy { color: var(--muted); font-size: 12px; }
+    .frame { display: grid; grid-template-columns: 245px minmax(0,1fr); min-height: 650px; background: var(--panel);
+      border: 1px solid rgba(238,226,228,.9); border-radius: 24px; overflow: hidden; box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+    aside { padding: 30px 22px; background: rgba(255,247,249,.76); border-right: 1px solid var(--line); }
+    .aside-title { margin: 0 0 6px; font-size: 20px; }
+    .aside-copy { margin: 0 0 28px; color: var(--muted); font-size: 13px; }
+    .steps { display: grid; gap: 8px; }
+    .step-tab { display: grid; grid-template-columns: 30px 1fr; gap: 10px; align-items: center; padding: 11px;
+      border-radius: 13px; color: var(--muted); }
+    .step-tab b { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: #fff; border: 1px solid var(--line); }
+    .step-tab strong { display: block; color: inherit; font-size: 13px; }
+    .step-tab small { display: block; font-size: 11px; }
+    .step-tab.active { color: var(--brand-deep); background: var(--soft); }
+    .step-tab.active b { color: #fff; background: var(--brand); border-color: var(--brand); }
+    .step-tab.done b { color: #fff; background: var(--ok); border-color: var(--ok); }
+    main { padding: 38px 44px 30px; display: flex; flex-direction: column; }
+    .eyebrow { margin: 0 0 8px; color: var(--brand-deep); font-size: 11px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(26px,4vw,38px); letter-spacing: -.035em; line-height: 1.2; }
+    .lead { margin: 12px 0 25px; max-width: 680px; color: var(--muted); font-size: 15px; }
+    .panel { display: none; flex: 1; }
+    .panel.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 13px; }
+    .field { display: grid; gap: 6px; }
+    .field.full { grid-column: 1 / -1; }
+    .field span { font-size: 12px; color: var(--muted); font-weight: 650; }
+    input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; color: var(--text); background: #fff; outline: none; }
+    input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(251,114,153,.12); }
+    .note { margin: 14px 0 0; padding: 12px 14px; border-radius: 12px; color: var(--muted); background: #fffafc; border: 1px solid var(--line); font-size: 12px; }
+    .source-list { display: grid; gap: 10px; }
+    .setup-rss-source-items { display: contents; }
+    .source { display: grid; grid-template-columns: 42px 1fr auto; gap: 12px; align-items: center; padding: 13px 14px; border: 1px solid var(--line); border-radius: 15px; background: #fff; }
+    .source-mark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; color: #fff; font-weight: 800; background: linear-gradient(135deg,var(--brand),#f69e68); }
+    .source strong, .source small { display: block; }
+    .source small { color: var(--muted); }
+    .health { padding: 4px 9px; border-radius: 999px; color: var(--muted); background: #f4f1f2; font-size: 11px; white-space: nowrap; }
+    .health[data-tone="ok"] { color: var(--ok); background: #edf8f2; }
+    .health[data-tone="warn"] { color: var(--warn); background: #fff6dd; }
+    .health[data-tone="error"] { color: var(--danger); background: #fff0f2; }
+    .tag-group { margin-bottom: 18px; }
+    .tag-group h3 { margin: 0 0 9px; font-size: 14px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 8px; }
+    .tag { border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; color: var(--muted); background: #fff; }
+    .tag[aria-pressed="true"] { color: var(--brand-deep); border-color: rgba(251,114,153,.45); background: var(--soft); }
+    .progress-card { padding: 20px; border: 1px solid var(--line); border-radius: 17px; background: #fff; }
+    .progress-line { height: 8px; margin: 16px 0; border-radius: 99px; overflow: hidden; background: #f3edef; }
+    .progress-line i { display: block; width: 16%; height: 100%; border-radius: inherit; background: linear-gradient(90deg,var(--brand),#f5ad6e); transition: width .4s ease; }
+    .status { min-height: 22px; margin: 14px 0 0; color: var(--muted); }
+    .status.error { color: var(--danger); }
+    .status.ok { color: var(--ok); }
+    footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 28px; margin-top: auto; }
+    .btn { border: 1px solid var(--line); border-radius: 11px; padding: 10px 16px; color: var(--text); background: #fff; font-weight: 680; }
+    .btn.primary { color: #fff; border-color: var(--brand); background: var(--brand); box-shadow: 0 8px 18px rgba(251,114,153,.22); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .done-card { text-align: center; padding: 38px 12px; }
+    .done-mark { display: grid; place-items: center; width: 62px; height: 62px; margin: 0 auto 16px; border-radius: 50%; color: #fff; background: var(--ok); font-size: 28px; }
+    @media (max-width: 780px) { .shell { width: min(100% - 18px,650px); padding-top: 10px; } .privacy { display:none; } .frame { grid-template-columns: 1fr; } aside { padding: 18px; border-right: 0; border-bottom: 1px solid var(--line); } .aside-copy { margin-bottom: 14px; } .steps { grid-template-columns: repeat(4,1fr); } .step-tab { grid-template-columns: 1fr; justify-items:center; padding:8px 3px; text-align:center; } .step-tab small { display:none; } main { padding: 26px 20px 22px; min-height: 590px; } .grid { grid-template-columns: 1fr; } .field.full { grid-column:auto; } .source { grid-template-columns: 38px 1fr; } .health { grid-column:2; justify-self:start; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar"><div class="brand"><img src="/m/icon-maskable-192.png" alt=""><span>NewsClaw · 新闻爪</span></div><div class="privacy">本机运行 · 凭据不离开你的设备</div></div>
+    <div class="frame">
+      <aside>
+        <h2 class="aside-title">第一次认识你</h2>
+        <p class="aside-copy">四步完成连接，从零开始建立只属于你的新闻画像。</p>
+        <div class="steps">
+          <div class="step-tab active" data-step-tab="0"><b>1</b><span><strong>连接 AI</strong><small>验证 DeepSeek</small></span></div>
+          <div class="step-tab" data-step-tab="1"><b>2</b><span><strong>验证来源</strong><small>Tushare / RSS</small></span></div>
+          <div class="step-tab" data-step-tab="2"><b>3</b><span><strong>从零画像</strong><small>方向与避雷</small></span></div>
+          <div class="step-tab" data-step-tab="3"><b>4</b><span><strong>首批推荐</strong><small>建立推荐池</small></span></div>
+        </div>
+      </aside>
+      <main>
+        <section class="panel active" data-panel="0">
+          <p class="eyebrow">Step 01 · AI</p><h1>先把理解能力接上</h1>
+          <p class="lead">NewsClaw 用 AI 总结“为什么适合你、可能影响链、后续观察点”。API Key 只写入本机配置，页面不会回显原值。</p>
+          <div class="grid">
+            <label class="field"><span>服务商</span><select id="provider"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI 兼容</option><option value="ollama">Ollama 本地</option></select></label>
+            <label class="field"><span>模型</span><input id="model" value="deepseek-chat" autocomplete="off"></label>
+            <label class="field full"><span>API 地址</span><input id="baseUrl" value="https://api.deepseek.com" autocomplete="off"></label>
+            <label class="field full"><span>API Key（已配置可留空）</span><input id="apiKey" type="password" autocomplete="new-password" placeholder="留空表示安全复用本机已有凭据"></label>
+          </div>
+          <p class="note">不需要在浏览器扩展里保存 Key，也不要把 Key 贴进对话或日志。</p>
+        </section>
+
+        <section class="panel" data-panel="1">
+          <p class="eyebrow">Step 02 · Sources</p><h1>逐项验证真实新闻源</h1>
+          <p class="lead">权限、限流、空结果和正文缺失都会分别显示。单一来源失败只进入降级，不会让整个页面假装刷新成功。</p>
+          <div class="source-list" id="sourceList">
+            <article class="source" data-source="tushare_news"><span class="source-mark">快</span><span><strong>财经快讯</strong><small>Tushare news · 多家主流财经媒体</small></span><span class="health">待验证</span></article>
+            <article class="source" data-source="tushare_major_news"><span class="source-mark">深</span><span><strong>长篇新闻</strong><small>Tushare major_news · 新华、财新、中证等</small></span><span class="health">待验证</span></article>
+            <article class="source" data-source="tushare_cctv_news"><span class="source-mark">视</span><span><strong>央视新闻联播</strong><small>Tushare cctv_news</small></span><span class="health">待验证</span></article>
+            <div id="setupRssSourceItems" class="setup-rss-source-items" aria-label="逐个 RSS 新闻源"></div>
+          </div>
+          <label class="field" style="margin-top:14px"><span>Tushare Token（已配置可留空）</span><input id="tushareToken" type="password" autocomplete="new-password" placeholder="留空表示安全复用本机已有凭据"></label>
+          <button class="btn" id="validateSources" type="button" style="margin-top:14px">立即验证全部来源</button>
+        </section>
+
+        <section class="panel" data-panel="2">
+          <p class="eyebrow">Step 03 · Profile</p><h1>从零告诉它你的方向</h1>
+          <p class="lead">这不是固定配额，只是第一批证据。之后打开推荐、喜欢、不感兴趣、忽略、评论和对话会继续修正画像；收藏与稍后读只保存在本机，不会自动改变画像。你的手工修改永远优先。</p>
+          <div class="tag-group"><h3>我希望重点提升</h3><div class="tags" data-tags="interests"><button class="tag" aria-pressed="true">宏观政策</button><button class="tag" aria-pressed="true">A 股行业</button><button class="tag" aria-pressed="true">科技产业</button><button class="tag" aria-pressed="false">社会议题</button><button class="tag" aria-pressed="true">创作选题</button><button class="tag" aria-pressed="false">国际关系</button><button class="tag" aria-pressed="false">消费趋势</button></div></div>
+          <div class="tag-group"><h3>我想避开的内容</h3><div class="tags" data-tags="avoid"><button class="tag" aria-pressed="true">标题党</button><button class="tag" aria-pressed="true">无来源传言</button><button class="tag" aria-pressed="true">重复转载</button><button class="tag" aria-pressed="true">直接买卖建议</button><button class="tag" aria-pressed="false">娱乐八卦</button></div></div>
+          <label class="field"><span>还有什么需要避开（可选）</span><textarea id="profileNote" rows="3" placeholder="例如：未经核验的传言、重复转载、把标题当全文的解读。"></textarea></label>
+        </section>
+
+        <section class="panel" data-panel="3">
+          <p class="eyebrow">Step 04 · Bootstrap</p><h1>建立第一批可信推荐</h1>
+          <p class="lead">系统会从已验证来源拉取新闻、去重、按时效淘汰，并基于刚才的方向生成首批解释。不会导入任何旧系统的行为或画像。</p>
+          <div class="progress-card"><strong id="bootstrapTitle">准备开始</strong><div class="progress-line"><i id="progressBar"></i></div><p id="bootstrapCopy">点击下方按钮，创建全新的新闻画像与推荐池。</p></div>
+        </section>
+
+        <section class="panel" data-panel="4">
+          <div class="done-card"><div class="done-mark">✓</div><p class="eyebrow">Ready</p><h1>新闻爪已经准备好了</h1><p class="lead" style="margin-inline:auto">先从首批新闻开始读。打开推荐、喜欢、不感兴趣、忽略、评论和对话会留下可追溯证据，逐步让推荐更贴近真实需要。</p><a class="btn primary" href="/web">进入 NewsClaw</a></div>
+        </section>
+
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <footer id="footer"><button class="btn" id="back" type="button" disabled>上一步</button><button class="btn primary" id="next" type="button">验证 AI 并继续</button></footer>
+      </main>
+    </div>
+  </div>
+  <script>
+    (() => {
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const status = $("#status"); const next = $("#next"); const back = $("#back"); const footer = $("#footer");
+      const state = { step: 0, sourceValidated: false, bootstrapStarted: false };
+      const requestId = () => crypto.randomUUID?.() || `news-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const request = async (path, options = {}) => {
+        const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 30000);
+        try {
+          const response = await fetch(`/api${path}`, { credentials: "same-origin", headers: { "X-OBC-Auth": "1", ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) }, ...options, signal: controller.signal });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) { const error = new Error(data?.detail || data?.message || `${path} 请求失败：HTTP ${response.status}`); error.status = response.status; throw error; }
+          return data;
+        } finally { clearTimeout(timeout); }
+      };
+      const setStatus = (text, tone = "") => { status.textContent = text || ""; status.className = `status ${tone}`.trim(); };
+      const showStep = (step) => {
+        state.step = step; $$("[data-panel]").forEach((panel) => panel.classList.toggle("active", Number(panel.dataset.panel) === step));
+        $$("[data-step-tab]").forEach((tab) => { const n = Number(tab.dataset.stepTab); tab.classList.toggle("active", n === step); tab.classList.toggle("done", n < step); });
+        back.disabled = step === 0 || step > 3; next.hidden = step > 3; back.hidden = step > 3; footer.hidden = step > 3;
+        next.textContent = ["验证 AI 并继续", "验证来源并继续", "确认方向并继续", "建立首批推荐"][step] || "继续";
+        setStatus("");
+      };
+      const buildLlmUpdate = () => {
+        const provider = $("#provider").value;
+        const instance = {
+          model: $("#model").value.trim(),
+          base_url: $("#baseUrl").value.trim(),
+        };
+        const apiKey = $("#apiKey").value.trim();
+        if (apiKey) instance.api_key = apiKey;
+        return { default_provider: provider, [provider]: instance };
+      };
+      const waitForConfigApply = async (result) => {
+        if (result?.apply_state !== "queued") return;
+        const revision = Number(result?.apply_revision || 0);
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          const snapshot = await request("/config/apply-status", { timeoutMs: 12000 });
+          const stateName = String(snapshot?.state || "").toLowerCase();
+          if (stateName === "failed" && Number(snapshot?.requested_revision || 0) >= revision) {
+            throw new Error(snapshot?.error || snapshot?.message || "AI 配置运行时应用失败");
+          }
+          if (stateName === "applied" && Number(snapshot?.applied_revision || 0) >= revision) return;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        throw new Error("AI 配置已保存，但运行时仍未完成应用；请稍后重试验证");
+      };
+      const probeAndSaveLlm = async () => {
+        const llm = buildLlmUpdate();
+        const probe = await request("/config/probe-service", {
+          method: "POST",
+          body: JSON.stringify({ kind: "llm", config: { llm } }),
+          timeoutMs: 60000,
+        });
+        if (probe?.ok !== true) throw new Error(probe?.message || probe?.error || "AI 服务连接失败");
+        const result = await request("/config", {
+          method: "PUT",
+          body: JSON.stringify({ llm }),
+          timeoutMs: 60000,
+        });
+        await waitForConfigApply(result);
+        $("#apiKey").value = "";
+        return probe;
+      };
+      const saveSourceCredential = async () => {
+        const token = $("#tushareToken").value.trim();
+        if (token) {
+          await request("/news/credentials/tushare", {
+            method: "PUT",
+            body: JSON.stringify({ token }),
+            timeoutMs: 60000,
+          });
+          $("#tushareToken").value = "";
+        }
+      };
+      const sourceGroup = (item) => {
+        const id = String(item?.source_id || item?.id || item?.key || item?.source_key || "");
+        if (id === "tushare:news") return "tushare_news";
+        if (id === "tushare:major_news") return "tushare_major_news";
+        if (id === "tushare:cctv_news") return "tushare_cctv_news";
+        if (item?.kind === "rss" || id.startsWith("rss:")) return item?.custom ? "custom_rss" : "official_rss";
+        return id;
+      };
+      const sourceHealth = (item) => item?.credential_configured === false ? "no_permission" : String(
+        (item?.health && typeof item.health === "object" ? item.health.status : item?.health)
+        || item?.state || item?.status || "unverified"
+      ).toLowerCase();
+      const renderSources = (payload) => {
+        const items = Array.isArray(payload) ? payload : (payload?.items || payload?.sources || []);
+        const groups = new Map();
+        items.forEach((item) => {
+          const key = sourceGroup(item);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(item);
+          const sourceId = String(item?.source_id || item?.id || "");
+          if (sourceId) groups.set(sourceId, [item]);
+        });
+        const rssContainer = $("#setupRssSourceItems");
+        rssContainer?.replaceChildren();
+        items.filter((item) => ["official_rss", "custom_rss"].includes(sourceGroup(item))).forEach((item) => {
+          const sourceId = String(item?.source_id || item?.id || "");
+          if (!rssContainer || !sourceId) return;
+          const row = document.createElement("article");
+          row.className = "source";
+          row.dataset.source = sourceId;
+          row.innerHTML = '<span class="source-mark">订</span><span><strong></strong><small></small></span><span class="health">待验证</span>';
+          $("strong", row).textContent = String(item?.media || item?.name || sourceId);
+          $("small", row).textContent = String(item?.provider || item?.technical_provider || item?.url || "RSS / Atom");
+          rssContainer.append(row);
+        });
+        $$("[data-source]").forEach((row) => {
+          const group = groups.get(row.dataset.source) || [];
+          if (!group.length) return;
+          const healths = group.map(sourceHealth);
+          const healthy = healths.filter((value) => ["ok", "ready", "healthy"].includes(value)).length;
+          const health = healthy === group.length ? "ok" : healthy > 0 ? "degraded" : healths[0];
+          const badge = $(".health", row);
+          const labels = { ok: "可用", ready: "可用", healthy: "可用", degraded: "降级", unavailable: "不可用", timeout: "超时", rate_limited: "频率受限", no_permission: "无权限", error: "失败", empty: "本轮无数据" };
+          badge.textContent = labels[health] || "待验证";
+          badge.dataset.tone = ["ok","ready","healthy"].includes(health) ? "ok" : ["degraded","timeout","rate_limited","empty"].includes(health) ? "warn" : ["no_permission","unavailable","error"].includes(health) ? "error" : "";
+          const errors = group.map((item) => item?.error || item?.health?.error_message || "").filter(Boolean);
+          if (errors.length) $("small", row).textContent = errors.slice(0, 2).join("；");
+        });
+      };
+      const validateSources = async () => {
+        await saveSourceCredential();
+        let result;
+        try {
+          result = await request("/news/sources/probe", { method: "POST", body: JSON.stringify({ source_ids: [] }), timeoutMs: 90000 });
+        } catch (error) {
+          if (error.status !== 404) throw error;
+          result = await request("/news/refresh", { method: "POST", body: JSON.stringify({ request_id: requestId() }), timeoutMs: 90000 });
+        }
+        renderSources(result);
+        try { renderSources(await request("/news/sources")); } catch {}
+        state.sourceValidated = true;
+        return result;
+      };
+      const selectedTags = (kind) => $$(`[data-tags="${kind}"] .tag[aria-pressed="true"]`).map((tag) => tag.textContent.trim());
+      const startBootstrap = async () => {
+        const interests = selectedTags("interests");
+        const avoid = selectedTags("avoid");
+        const note = $("#profileNote").value.trim();
+        if (note) avoid.push(note);
+        const identity = JSON.stringify([interests, avoid]);
+        if (state.bootstrapIdentity !== identity || !state.bootstrapRequestId) {
+          state.bootstrapIdentity = identity;
+          state.bootstrapRequestId = requestId();
+        }
+        const payload = { interests, avoid, avoid_terms: avoid, request_id: state.bootstrapRequestId };
+        // This is the only supported first-run contract. Never fall back to
+        // the video-era /api/init route, because it has different inputs and
+        // persistence semantics.
+        return request("/news/bootstrap", {
+          method: "POST",
+          body: JSON.stringify(payload),
+          timeoutMs: 30000,
+        });
+      };
+      const finishBootstrap = (snapshot, degraded = false) => {
+        $("#progressBar").style.width = "100%";
+        showStep(4);
+        if (degraded) {
+          setStatus(snapshot?.error || snapshot?.message || "首轮建立已结束，个别新闻源处于降级状态；进入后可在新闻源设置查看真实结果。", "error");
+        } else {
+          setStatus("首批真实新闻推荐已经生成，正在进入新闻爪…", "ok");
+        }
+        window.setTimeout(() => window.location.assign("/web"), 900);
+      };
+      const pollBootstrap = async () => {
+        let transientFailures = 0;
+        for (let i = 0; i < 450; i += 1) {
+          let snapshot;
+          try {
+            snapshot = await request("/news/bootstrap/status", { timeoutMs: 12000 });
+            transientFailures = 0;
+          } catch (error) {
+            transientFailures += 1;
+            if (transientFailures >= 5) throw error;
+            $("#bootstrapCopy").textContent = "本机服务短暂不可达，正在继续等待后台任务…";
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            continue;
+          }
+          const stage = String(snapshot.stage || snapshot.status || "running").toLowerCase();
+          const percent = Math.max(10, Math.min(99, Number(snapshot.progress || snapshot.percent || (20 + i / 5))));
+          $("#progressBar").style.width = `${percent}%`;
+          $("#bootstrapTitle").textContent = snapshot.title || ({
+            queued: "任务已经排队",
+            running: "正在建立首批推荐",
+            validating: "验证新闻源",
+            fetching: "拉取真实新闻",
+            profiling: "建立五层画像",
+            ranking: "生成首批推荐",
+            completed: "已经完成",
+            degraded: "已完成，部分来源降级",
+          }[stage] || "正在建立推荐池");
+          $("#bootstrapCopy").textContent = snapshot.message || snapshot.detail || "后台任务会持续运行，关闭浏览器也不会丢失进度。";
+          if (snapshot.completed || ["completed", "ready", "succeeded"].includes(stage)) {
+            finishBootstrap(snapshot, false);
+            return;
+          }
+          if (stage === "degraded") {
+            finishBootstrap(snapshot, true);
+            return;
+          }
+          if (snapshot.failed || stage === "failed") {
+            throw new Error(snapshot.error || snapshot.message || snapshot.detail || "首次建立失败，请检查新闻源与 AI 设置后重试");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+        throw new Error("后台任务仍在运行，请稍后刷新此页面查看进度");
+      };
+      $$(".tag").forEach((tag) => tag.addEventListener("click", () => tag.setAttribute("aria-pressed", tag.getAttribute("aria-pressed") === "true" ? "false" : "true")));
+      $("#validateSources").addEventListener("click", async () => { const button = $("#validateSources"); button.disabled = true; setStatus("正在逐项验证来源权限…"); try { await validateSources(); setStatus("验证完成。无权限或损坏的来源会保持降级，不影响其他来源。", "ok"); } catch (error) { setStatus(error.message || "验证失败", "error"); } finally { button.disabled = false; } });
+      back.addEventListener("click", () => showStep(Math.max(0, state.step - 1)));
+      next.addEventListener("click", async () => { next.disabled = true; try { if (state.step === 0) { setStatus("正在真实连接 AI 服务…"); const probe = await probeAndSaveLlm(); setStatus(`AI 连接成功：${probe?.provider || $("#provider").value} ${probe?.model || $("#model").value}`, "ok"); showStep(1); } else if (state.step === 1) { setStatus("正在验证新闻源…"); await validateSources(); showStep(2); } else if (state.step === 2) { if (selectedTags("interests").length < 3) throw new Error("至少选择三个希望提升的方向"); showStep(3); } else if (state.step === 3) { setStatus("已提交后台任务，正在创建全新画像与推荐池…"); state.bootstrapStarted = true; const result = await startBootstrap(); const stage = String(result?.status || "").toLowerCase(); if (result?.completed || ["completed","ready","succeeded"].includes(stage)) finishBootstrap(result, false); else if (stage === "degraded") finishBootstrap(result, true); else await pollBootstrap(); } } catch (error) { setStatus(error?.name === "AbortError" ? "请求超时，请检查本机服务后重试。" : (error.message || "操作失败"), "error"); } finally { next.disabled = false; } });
+      request("/news/bootstrap/status", { timeoutMs: 8000 }).then((snapshot) => {
+        const stage = String(snapshot?.stage || snapshot?.status || "").toLowerCase();
+        if (snapshot?.sources) renderSources(snapshot.sources);
+        if (snapshot?.completed || ["completed", "ready", "succeeded"].includes(stage)) {
+          finishBootstrap(snapshot, false);
+          return;
+        }
+        if (stage === "degraded") {
+          finishBootstrap(snapshot, true);
+          return;
+        }
+        if (["queued", "running", "validating", "fetching", "profiling", "ranking"].includes(stage)) {
+          state.bootstrapStarted = true;
+          showStep(3);
+          setStatus("检测到仍在运行的后台任务，正在恢复进度…");
+          void pollBootstrap().catch((error) => setStatus(error?.message || "进度读取失败", "error"));
+        }
+      }).catch(() => {});
+      showStep(0);
+    })();
+  </script>
+</body>
+</html>

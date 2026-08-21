@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>NewsClaw 推荐首页</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/m/icon-32.png?v=4">
+  <script>
+    (() => {
+      let accent = "classic";
+      try {
+        const storage = window.localStorage;
+        const theme = storage?.getItem("obc.theme");
+        if (theme === "light" || theme === "dark") {
+          document.documentElement.dataset.theme = theme;
+        }
+        const hue = storage?.getItem("obc.themeHue");
+        if (hue) { document.documentElement.style.setProperty("--hue-primary", hue); }
+        const storedAccent = storage?.getItem("obc.accentStyle");
+        const hasCustomHue = hue !== null && hue !== "";
+        // 迁移必须在样式加载前完成：老用户已有 hue 时保留 modern，新用户用 classic。
+        accent = storedAccent === "modern" || storedAccent === "classic"
+          ? storedAccent
+          : hasCustomHue ? "modern" : "classic";
+        if (storedAccent !== accent) {
+          try { storage?.setItem("obc.accentStyle", accent); } catch {}
+        }
+      } catch {}
+      if (accent === "classic") document.documentElement.dataset.accent = "classic";
+    })();
+  </script>
+  <link rel="stylesheet" href="/web/assets/css/app.css">
+  <link rel="stylesheet" href="/web/assets/css/classic.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="top-left">
+        <button class="icon-btn side-drawer-btn" id="sideDrawerBtn" type="button" aria-label="打开侧边菜单">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
+        </button>
+        <a class="brand" href="#home" aria-label="NewsClaw 首页">
+          <img class="brand-mark" src="/m/icon-maskable-192.png" alt="">
+          <span class="brand-copy"><span class="brand-title">NewsClaw</span><span class="brand-sub">你的本地新闻理解入口</span></span>
+        </a>
+      </div>
+      <form class="search" id="searchForm">
+        <input id="searchInput" type="search" placeholder="筛选当前已加载的推荐">
+        <button type="submit">筛选</button>
+      </form>
+      <div class="top-actions" aria-label="状态与消息">
+        <button class="product-about" id="aboutButton" type="button" title="了解新闻爪的定位、隐私边界与许可" aria-label="关于新闻爪">
+          <span class="product-about-inner">
+            <img class="product-about-mark" src="/m/icon-maskable-192.png" alt="">
+            <span class="product-about-copy">关于新闻爪</span>
+          </span>
+        </button>
+        <button class="backend-status-pill" id="openSettingsHero" type="button">
+          <span class="badge-dot"></span><span id="statusLabel">已连接本地后端</span>
+        </button>
+        <button class="top-theme-btn icon-btn" id="themeToggleBtn" type="button" title="主题：跟随系统" aria-label="主题：跟随系统">
+          <span id="themeToggleGlyph" aria-hidden="true">◐</span>
+        </button>
+        <div class="mobile-entry-wrap">
+          <button class="top-mobile-btn" id="mobileQrBtn" type="button" title="扫码在手机上使用" aria-label="手机版入口：扫码在手机上使用">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6.5" y="2" width="11" height="20" rx="2.8"/><path d="M10.2 5.2h3.6"/><circle cx="12" cy="18.4" r="0.5" fill="currentColor" stroke="none"/></svg>
+            <span>手机版</span>
+            <span class="mobile-new-dot" id="mobileQrDot" hidden></span>
+          </button>
+          <div class="mobile-qr-callout" id="mobileQrCallout" hidden>
+            <button class="mobile-qr-callout-body" id="mobileQrCalloutOpen" type="button">手机扫码，躺着刷推荐 →</button>
+            <button class="mobile-qr-callout-close" id="mobileQrCalloutClose" type="button" aria-label="关闭提示">×</button>
+          </div>
+        </div>
+        <button class="top-message-btn" id="messagesBtn" type="button" aria-label="消息">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0" stroke-linecap="round"/>
+          </svg>
+          <span class="message-dot" id="messagesDot" hidden></span>
+        </button>
+      </div>
+      <button class="icon-btn mobile-menu-btn" id="mobileMenuBtn" type="button" aria-label="打开手机菜单">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <div class="fatal-banner" id="fatalBanner" role="alert"></div>
+
+    <div class="app-body">
+      <aside class="side-drawer" id="sideDrawer" aria-label="侧边菜单" aria-hidden="true">
+        <div class="side-drawer-scrim" id="sideDrawerScrim"></div>
+        <div class="side-drawer-panel" aria-label="侧边菜单">
+          <nav class="side-drawer-nav" aria-label="全局功能">
+          <button class="nav-action" id="homeBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></span><span>首页</span></button>
+          <button class="nav-action" id="contentLibraryBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H10l2 2h5.5A2.5 2.5 0 0 1 20 7.5v9A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5z"/><path d="M8 10h8M8 14h6"/></svg></span><span>内容库</span></button>
+          <button class="nav-action" id="profileBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h3a1 1 0 0 0 1 -1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h3a1 1 0 0 1 1 1v3a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4h-1a1 1 0 0 0 -1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-1a2 2 0 0 0 -4 0v1a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h1a2 2 0 0 0 0 -4h-1a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1"/></svg></span><span>我的画像</span></button>
+          <button class="nav-action" id="chatBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span>聊聊口味</span><span class="nav-count-badge" id="chatPendingCountBadge" hidden></span></button>
+          <button class="nav-action" id="settingsBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span><span>设置</span></button>
+        </nav>
+        <section class="side-section side-runtime-panel" aria-label="实时运行摘要">
+          <p class="eyebrow">Runtime</p>
+          <h3>推荐池实时看板</h3>
+          <p id="runtimeSummary">连接 FastAPI 后，这里会显示候选池、补货和新动作记录。</p>
+          <div class="hero-status-grid" aria-label="推荐池实时状态">
+            <div><span>当前可换库存</span><strong id="poolAvailable">—</strong></div>
+            <div><span>补货进展</span><strong id="poolReplenished">—</strong></div>
+            <div><span>补货状态</span><strong id="poolRefreshState">—</strong></div>
+          </div>
+          <div class="metric-row">
+            <div class="metric"><strong id="metricPool">—</strong><span>当前可换</span></div>
+            <div class="metric"><strong id="metricUnread">—</strong><span>通知数</span></div>
+            <div class="metric"><strong id="metricSources">—</strong><span>内容源</span></div>
+          </div>
+          <p class="hero-topics">最近主题：<span id="poolTopics">等待后端同步</span></p>
+          <p id="accountSyncStatus" class="account-sync-status" hidden></p>
+        </section>
+        <section class="side-section side-activity-section" data-od-id="activity-rail" aria-label="后台动态摘要">
+          <p class="eyebrow">Activity</p>
+          <h3>后台刚记住的事</h3>
+          <div class="activity-list" id="activityList"></div>
+          <div class="drawer-actions"><button class="small-btn" id="activityBtn" type="button">查看全部动态</button></div>
+        </section>
+      </div>
+    </aside>
+
+    <main class="layout" id="home">
+      <section class="main-col" id="homePage" aria-label="推荐首页" data-od-id="recommendation-home">
+        <section class="delight" id="delightBanner" data-od-id="delight-banner">
+          <div class="thumb" id="delightThumb" role="button" tabindex="0" aria-label="打开当前惊喜推荐"></div>
+          <div class="delight-body">
+            <div class="delight-meta">
+              <p class="eyebrow">惊喜推荐</p>
+              <div class="delight-queue-tools" aria-label="惊喜推荐队列管理">
+                <div class="delight-nav" aria-label="惊喜推荐队列导航">
+                  <button class="icon-btn" data-delight="prev" type="button" aria-label="上一条惊喜推荐">‹</button>
+                  <span id="delightCount">1/1</span>
+                  <button class="icon-btn" data-delight="next" type="button" aria-label="下一条惊喜推荐">›</button>
+                </div>
+                <button class="delight-dismiss-btn" data-delight="dismiss" type="button" aria-label="看过了，不再推荐" title="看过了，不再推荐">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="delight-copy">
+              <h3 id="delightTitle">你可能会意外喜欢：县域经济的债务齿轮</h3>
+              <p id="delightStats" class="video-stats" hidden></p>
+              <p id="delightPublished" class="published-time" hidden></p>
+              <div id="delightExcerpt" class="delight-excerpt" hidden>
+                <p id="delightExcerptText" class="delight-excerpt-text"></p>
+                <button id="delightExcerptToggle" class="delight-excerpt-toggle" type="button" aria-expanded="false" aria-controls="delightExcerptText" hidden>展开正文</button>
+              </div>
+              <p id="delightReason">你最近的轨迹同时出现了宏观债务、地方财政和长叙事内容，这条把它们咬合得很清楚。</p>
+              <div class="delight-chat-turns" id="delightTurns" hidden></div>
+            </div>
+          </div>
+          <div class="delight-actions" aria-label="惊喜推荐操作">
+            <div class="delight-main-actions" aria-label="打开或讨论这条推荐">
+                <button class="small-btn" data-delight="view" type="button">阅读原文</button>
+                <div class="comment-field"><input id="delightCommentInput" placeholder="想围绕这条聊什么？" aria-label="想围绕这条聊什么？"></div>
+                <button class="small-btn composer-cancel" data-delight="cancel-comment" type="button" aria-label="返回" title="返回">‹</button>
+                <button class="small-btn chat-action" data-delight="chat" type="button">聊一聊</button>
+              </div>
+              <div class="delight-feedback-actions card-feedback-icons" aria-label="反馈这条推荐">
+                <button class="feedback-icon-btn" data-delight="like" type="button" aria-label="喜欢" title="喜欢" aria-pressed="false">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M7 10v10"/><path d="M15 5.2 14 10h5.4a1.8 1.8 0 0 1 1.7 2.2l-1.5 6A2.4 2.4 0 0 1 17.3 20H7"/><path d="M7 10l4.5-5.3A2 2 0 0 1 15 6v4"/></svg>
+                </button>
+                <span class="feedback-separator" aria-hidden="true">/</span>
+                <button class="feedback-icon-btn" data-delight="dislike" type="button" aria-label="不感兴趣" title="不感兴趣">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M17 14V4"/><path d="M9 18.8 10 14H4.6a1.8 1.8 0 0 1-1.7-2.2l1.5-6A2.4 2.4 0 0 1 6.7 4H17"/><path d="M17 14l-4.5 5.3A2 2 0 0 1 9 18v-4"/></svg>
+                </button>
+                <span class="feedback-separator" aria-hidden="true">/</span>
+                <button class="feedback-icon-btn watch-later-btn" data-delight="watch-later" type="button" aria-label="稍后读" title="稍后读" aria-pressed="false">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3.2 1.9"/></svg>
+                </button>
+                <span class="feedback-separator" aria-hidden="true">/</span>
+                <button class="feedback-icon-btn favorite-btn" data-delight="favorite" type="button" aria-label="收藏" title="收藏" aria-pressed="false">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.65 5.37 5.93.86-4.29 4.18 1.01 5.9L12 17.1l-5.31 2.8 1.01-5.9L3.41 9.83l5.93-.86z"/></svg>
+                </button>
+              </div>
+          </div>
+          <p class="status-line" id="delightStatus" aria-live="polite"></p>
+        </section>
+
+        <section data-od-id="recommendations">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Recommendations</p>
+              <h2>为你推荐的内容</h2>
+              <p>新闻爪根据你的近期兴趣筛选真实新闻，有任何意见尽管和我聊。</p>
+            </div>
+            <div class="drawer-actions recommendation-actions">
+              <button class="icon-btn" id="reshuffleBtn" type="button" aria-label="换一批" title="换一批">↻</button>
+              <button class="pill-btn" id="resetFiltersBtn" type="button" hidden="">重置筛选</button>
+            </div>
+          </div>
+          <!-- chip 由 renderFilters 渲染成 role=tab（含 aria-selected 与库存计数） -->
+          <div class="filter-row" id="filterRow" role="tablist" aria-label="推荐来源与库存"></div>
+          <!-- 首屏骨架占位：后端推荐取回前先撑住版面，renderVideos 首次渲染时整体替换 -->
+          <div class="card-grid" id="videoGrid">
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+          </div>
+          <div id="loadMoreSentinel" aria-hidden="true"></div>
+          <div class="load-row"><button class="pill-btn dark" id="loadMoreBtn" type="button">加载更多推荐</button></div>
+        </section>
+      </section>
+
+      <section class="content-library-page content-page" id="contentLibraryPage" aria-labelledby="desktopContentLibraryTitle" hidden>
+        <div class="content-library-page-head">
+          <p class="eyebrow">Your library</p>
+          <h2 id="desktopContentLibraryTitle">内容库</h2>
+          <p class="video-meta">稍后读、收藏和近 30 天历史，都只保存在这台电脑上。</p>
+        </div>
+        <div class="content-library-tabs" role="tablist" aria-label="内容库分类">
+          <button id="contentLibraryWatchLaterTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="watchLaterPage" tabindex="-1"><span>稍后读</span><span class="nav-count-badge" id="watchLaterCountBadge" hidden></span></button>
+          <button id="contentLibraryFavoritesTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="favoritesPage" tabindex="-1"><span>收藏</span><span class="nav-count-badge" id="favoritesCountBadge" hidden></span></button>
+          <button id="contentLibraryHistoryTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="historyPage" tabindex="-1">历史记录</button>
+        </div>
+
+      <section class="saved-page content-library-panel" id="watchLaterPage" role="tabpanel" aria-labelledby="contentLibraryWatchLaterTab" hidden>
+        <div class="content-page-head">
+          <div>
+            <p class="eyebrow">Watch later</p>
+            <h2 data-saved-heading tabindex="-1">稍后读</h2>
+            <p class="video-meta">你加入稍后读的新闻会在本机排队，看完随手移除即可。</p>
+          </div>
+          <button class="pill-btn" id="watchLaterSyncAll" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
+        </div>
+        <p class="saved-sync-status" id="watchLaterSyncStatus" aria-live="polite"></p>
+        <div class="saved-grid" id="watchLaterList"></div>
+        <div class="saved-empty" id="watchLaterEmpty" hidden>还没有稍后读的内容，去推荐里点时钟图标加入吧。</div>
+      </section>
+
+      <section class="saved-page content-library-panel" id="favoritesPage" role="tabpanel" aria-labelledby="contentLibraryFavoritesTab" hidden>
+        <div class="content-page-head">
+          <div>
+            <p class="eyebrow">Favorites</p>
+            <h2 data-saved-heading tabindex="-1">我的收藏</h2>
+            <p class="video-meta">点 ★ 收藏的内容会长期留在这里，和稍后读互相独立。</p>
+          </div>
+          <button class="pill-btn" id="favoritesSyncAll" data-saved-list-action="sync-all" type="button" disabled hidden>同步未同步内容（0）</button>
+        </div>
+        <p class="saved-sync-status" id="favoritesSyncStatus" aria-live="polite"></p>
+        <div class="saved-grid" id="favoritesList"></div>
+        <div class="saved-empty" id="favoritesEmpty" hidden>还没有收藏的内容，去推荐里点星标收藏吧。</div>
+      </section>
+
+      <section class="history-page content-library-panel" id="historyPage" role="tabpanel" aria-labelledby="contentLibraryHistoryTab" hidden>
+        <div class="content-page-head history-page-head">
+          <div>
+            <p class="eyebrow">Your trail</p>
+            <h2>历史记录</h2>
+            <p class="video-meta">只保留近 30 天；每组分页加载，新闻配图仅在接近视口时请求。</p>
+          </div>
+          <button class="pill-btn" id="historyRefreshBtn" type="button">刷新历史</button>
+        </div>
+        <div class="history-sections" id="historySections" aria-live="polite"></div>
+      </section>
+      </section>
+
+      <section class="profile-page" id="profilePage" aria-label="我的画像" hidden>
+        <div class="profile-page-head">
+          <div>
+            <p class="eyebrow">Soul profile</p>
+            <h2>我的画像</h2>
+          </div>
+        </div>
+        <div class="profile-list profile-page-list" id="profileDetails"></div>
+        <div class="drawer-actions profile-page-actions"><button class="pill-btn dark" id="profileMemoryMoreBtn" type="button" hidden="">加载更多近期记忆</button></div>
+      </section>
+
+      <section class="chat-page content-page" id="chatPage" aria-label="聊聊口味" hidden>
+        <div class="content-page-head">
+          <div>
+            <p class="eyebrow">Dialogue</p>
+            <h2>聊聊口味</h2>
+            <p class="video-meta">告诉新闻爪你的偏好、边界和最近想看的方向。</p>
+          </div>
+        </div>
+        <div class="dialogue-pending">
+          <button id="desktopPendingToggle" type="button" aria-expanded="false" aria-controls="desktopPendingConfirmations">
+            <span class="dialogue-pending-toggle-title">待聊确认 <span class="dialogue-pending-toggle-count" id="desktopPendingCount">0</span></span>
+            <span class="dialogue-pending-toggle-chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7 10 5 5 5-5"/></svg>
+            </span>
+          </button>
+          <div class="profile-card-list" id="desktopPendingConfirmations" aria-label="待聊确认列表" hidden></div>
+        </div>
+        <div class="chat-log" id="chatLog" role="region" aria-label="口味对话记录" tabindex="0"></div>
+        <form class="chat-input" id="chatForm"><input id="chatInput" aria-label="和新闻爪聊聊你的口味" placeholder="说说你最近怎么想——你是什么样的人、喜欢什么、讨厌什么，都可以直接说。"><button class="pill-btn primary" type="submit">发送</button></form>
+      </section>
+
+      <section class="settings-page content-page" id="settingsPage" aria-label="后端设置" hidden>
+        <div class="content-page-head">
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h2>后端与模型设置</h2>
+            <p class="video-meta">配置模型、新闻源、调度和本地运行参数。</p>
+          </div>
+        </div>
+        <form id="settingsForm" class="settings-grid">
+        <div class="settings-tabs" role="tablist" aria-label="设置分类">
+          <button id="settingsTabModels" class="settings-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="settingsPanelModels" tabindex="0" data-settings-tab="models">模型</button>
+          <button id="settingsTabSources" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsPanelSources" tabindex="-1" data-settings-tab="sources">新闻源</button>
+          <button id="settingsTabScheduler" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsPanelScheduler" tabindex="-1" data-settings-tab="scheduler">调度</button>
+          <button id="settingsTabGeneral" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsPanelGeneral" tabindex="-1" data-settings-tab="general">通用</button>
+          <button id="settingsTabFrontend" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsPanelFrontend" tabindex="-1" data-settings-tab="frontend">前端</button>
+          <button id="settingsTabLogging" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsPanelLogging" tabindex="-1" data-settings-tab="logging">日志</button>
+        </div>
+
+        <div id="settingsPanelModels" class="settings-panel" data-settings-panel="models" role="tabpanel" aria-labelledby="settingsTabModels">
+          <section class="llm-routing-section" aria-labelledby="llmInstancesHeading">
+            <div class="llm-section-head">
+              <div>
+                <p class="settings-section-kicker">Endpoints</p>
+                <h3 id="llmInstancesHeading">LLM 实例</h3>
+                <p class="settings-note-inline">一个实例就是完整可调用端点：渠道、Base URL、凭据和模型都在这里配置。</p>
+              </div>
+              <button class="pill-btn primary llm-add-instance" id="addLlmInstance" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                新建实例
+              </button>
+            </div>
+            <div class="llm-instance-grid" id="llmInstanceList" aria-live="polite"></div>
+          </section>
+
+          <section class="llm-routing-section" aria-labelledby="llmGlobalChainHeading">
+            <div class="llm-section-head">
+              <div>
+                <p class="settings-section-kicker">Global route</p>
+                <h3 id="llmGlobalChainHeading">默认调用链</h3>
+                <p class="settings-note-inline">从上到下依次请求；失败、超时或限流时自动尝试下一实例。</p>
+              </div>
+              <button class="pill-btn" id="probeLlmChain" type="button">测试整条链</button>
+            </div>
+            <div class="llm-runtime-tuning">
+              <label class="settings-field"><span>LLM 并发数</span><input id="llmConcurrency" type="number" min="1" max="16" inputmode="numeric" placeholder="4"></label>
+              <label class="settings-field"><span>单实例超时（秒）</span><input id="llmTimeout" type="number" min="10" max="1200" inputmode="numeric" placeholder="1200"></label>
+            </div>
+            <ol class="llm-chain-list" id="llmDefaultChain" aria-label="默认 LLM 调用链"></ol>
+            <div class="llm-chain-add-row">
+              <label class="settings-field llm-chain-picker"><span>添加实例</span><select id="llmDefaultChainPicker" translate="no"></select></label>
+              <button class="pill-btn" id="addLlmDefaultChainItem" type="button">加入链尾</button>
+            </div>
+            <p class="settings-probe-status" id="probeLlmChainStatus" aria-live="polite"></p>
+          </section>
+
+          <section class="llm-routing-section" aria-labelledby="llmModuleRoutesHeading">
+            <div class="llm-section-head">
+              <div>
+                <p class="settings-section-kicker">Module routes</p>
+                <h3 id="llmModuleRoutesHeading">模块调用链</h3>
+                <p class="settings-note-inline">默认继承全局链；需要成本、速度或能力隔离时再切换为自定义链。</p>
+              </div>
+            </div>
+            <div class="llm-module-grid">
+              <article class="llm-module-card" data-llm-module="soul">
+                <div class="llm-module-head"><div><h4>画像理解</h4><p>Soul / profile</p></div><label class="settings-field compact"><span>路由</span><select id="moduleSoulMode"><option value="inherit">继承全局</option><option value="custom">自定义链</option></select></label></div>
+                <div class="llm-module-custom" id="moduleSoulCustom" hidden>
+                  <ol class="llm-chain-list compact" id="moduleSoulChain" aria-label="画像理解自定义调用链"></ol>
+                  <div class="llm-chain-add-row"><select id="moduleSoulPicker" aria-label="选择画像理解实例" translate="no"></select><button class="pill-btn" id="moduleSoulAdd" type="button">加入链尾</button></div>
+                </div>
+              </article>
+              <article class="llm-module-card" data-llm-module="discovery">
+                <div class="llm-module-head"><div><h4>内容发现</h4><p>Discovery / keywords</p></div><label class="settings-field compact"><span>路由</span><select id="moduleDiscoveryMode"><option value="inherit">继承全局</option><option value="custom">自定义链</option></select></label></div>
+                <div class="llm-module-custom" id="moduleDiscoveryCustom" hidden>
+                  <ol class="llm-chain-list compact" id="moduleDiscoveryChain" aria-label="内容发现自定义调用链"></ol>
+                  <div class="llm-chain-add-row"><select id="moduleDiscoveryPicker" aria-label="选择内容发现实例" translate="no"></select><button class="pill-btn" id="moduleDiscoveryAdd" type="button">加入链尾</button></div>
+                </div>
+              </article>
+              <article class="llm-module-card" data-llm-module="recommendation">
+                <div class="llm-module-head"><div><h4>推荐表达</h4><p>Recommendation copy</p></div><label class="settings-field compact"><span>路由</span><select id="moduleRecommendationMode"><option value="inherit">继承全局</option><option value="custom">自定义链</option></select></label></div>
+                <div class="llm-module-custom" id="moduleRecommendationCustom" hidden>
+                  <ol class="llm-chain-list compact" id="moduleRecommendationChain" aria-label="推荐表达自定义调用链"></ol>
+                  <div class="llm-chain-add-row"><select id="moduleRecommendationPicker" aria-label="选择推荐表达实例" translate="no"></select><button class="pill-btn" id="moduleRecommendationAdd" type="button">加入链尾</button></div>
+                </div>
+              </article>
+              <article class="llm-module-card" data-llm-module="evaluation">
+                <div class="llm-module-head"><div><h4>内容评估</h4><p>Evaluation / scoring</p></div><label class="settings-field compact"><span>路由</span><select id="moduleEvaluationMode"><option value="inherit">继承全局</option><option value="custom">自定义链</option></select></label></div>
+                <div class="llm-module-custom" id="moduleEvaluationCustom" hidden>
+                  <ol class="llm-chain-list compact" id="moduleEvaluationChain" aria-label="内容评估自定义调用链"></ol>
+                  <div class="llm-chain-add-row"><select id="moduleEvaluationPicker" aria-label="选择内容评估实例" translate="no"></select><button class="pill-btn" id="moduleEvaluationAdd" type="button">加入链尾</button></div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <p class="settings-section-title">Embedding</p>
+          <div class="settings-subtabs" role="tablist" aria-label="Embedding 设置类型">
+            <button class="settings-subtab is-active" type="button" data-model-settings-group="embedding" data-model-settings-tab="default">默认</button>
+            <button class="settings-subtab" type="button" data-model-settings-group="embedding" data-model-settings-tab="fallback">备选</button>
+          </div>
+
+          <div class="settings-subpanel is-active" data-model-settings-group="embedding" data-model-settings-panel="default">
+            <label class="settings-field"><span>Embedding Provider</span><select id="embeddingProvider" translate="no"><option value="">未启用（不跟随聊天链）</option><option value="ollama">ollama</option><option value="openai">openai</option><option value="gemini">gemini</option><option value="openai_compatible">openai_compatible</option><option value="dashscope">dashscope (qwen3-vl)</option></select></label>
+            <label class="settings-field"><span>Embedding 模型</span><input id="embeddingModel" value="bge-m3"></label>
+            <label class="settings-field"><span>Embedding API Key</span><input id="embeddingApiKey" autocomplete="off"></label>
+            <label class="settings-field"><span>Embedding Base URL</span><input id="embeddingBaseUrl"></label>
+            <label class="settings-field"><span>Embedding 维度</span><input id="embeddingOutputDimensionality" type="number" min="0" step="1" inputmode="numeric" placeholder="1024"></label>
+            <label class="settings-field"><span>相似度阈值</span><input id="embeddingSimilarity" inputmode="decimal" placeholder="0.82"></label>
+            <div class="settings-probe-row">
+              <button class="pill-btn" id="probeEmbedding" type="button">测试 Embedding</button>
+              <span class="settings-probe-status" id="probeEmbeddingStatus" aria-live="polite"></span>
+            </div>
+          </div>
+
+          <div class="settings-subpanel" data-model-settings-group="embedding" data-model-settings-panel="fallback" hidden>
+            <p class="settings-note-inline">默认 Embedding 端点不可用时才尝试备选类型。备选会复用同类型首个已启用 LLM 实例的凭据；请确保两个 Embedding 模型输出维度兼容，避免相似度结果漂移。</p>
+            <label class="settings-field"><span>备选 Embedding Provider</span><select id="embeddingFallbackProvider" translate="no"><option value="">不启用 fallback</option><option value="ollama">ollama</option><option value="openai">openai</option><option value="gemini">gemini</option><option value="openai_compatible">openai_compatible</option></select></label>
+          </div>
+        </div>
+
+        <div id="settingsPanelSources" class="settings-panel" data-settings-panel="sources" role="tabpanel" aria-labelledby="settingsTabSources" hidden>
+          <p class="settings-note-inline"><strong>当前真实生效：</strong>来源开关、Tushare 权限、RSS 地址、健康验证、失败重试和“立即刷新”。单源排序权重与独立刷新频率尚未接入运行时，本版已隐藏，避免让保存成功看起来像已经生效。</p>
+          <p class="settings-note-inline">NewsClaw 只使用 Tushare 新闻接口和网站主动提供的 RSS/Atom，不读取浏览器 Cookie，不逆向隐藏接口，也不抓取网页。Token 只保存在本机，页面和日志只显示脱敏状态。</p>
+
+          <div class="settings-probe-row news-tushare-credential-row">
+            <label class="settings-field"><span>Tushare Token（已配置可留空）</span><input id="newsTushareToken" type="password" autocomplete="new-password" placeholder="输入新 Token 后点保存；页面不会回显原值"></label>
+            <button class="pill-btn" id="newsSaveTushareTokenBtn" type="button">保存 Token</button>
+            <span id="newsTushareTokenStatus" class="settings-probe-status" aria-live="polite">正在读取配置状态…</span>
+          </div>
+
+          <div id="newsSourceStatusList" class="source-card-list news-source-card-list" aria-live="polite">
+            <article class="source-card news-source-card" data-news-source="tushare_news">
+              <div class="source-card-face">
+                <span class="source-card-logo" aria-hidden="true">快</span>
+                <span class="source-card-head"><strong class="source-card-name">财经快讯</strong><span class="source-status-badges"><span class="source-source-badge">提供方：Tushare news</span><span class="source-access-badge" data-news-health>待验证</span></span><p class="src-detail" data-news-detail>覆盖财联社、华尔街见闻、第一财经、新浪财经、东方财富、同花顺等媒体。</p><span class="source-card-hint-slot" data-news-last-success>尚无成功记录</span></span>
+                <span class="source-card-right"><label class="source-card-share"><span>权重</span><input id="newsTushareNewsWeight" value="5" inputmode="numeric" aria-label="财经快讯权重"></label><label class="source-card-enable"><span class="sr-only">启用财经快讯</span><select id="newsTushareNewsEnabled"><option value="on">启用</option><option value="off">停用</option></select></label></span>
+              </div>
+              <div class="news-source-frequency"><label class="settings-field"><span>刷新频率（分钟）</span><input id="newsTushareNewsInterval" type="number" min="1" step="1" value="5"></label></div>
+            </article>
+
+            <article class="source-card news-source-card" data-news-source="tushare_major_news">
+              <div class="source-card-face">
+                <span class="source-card-logo" aria-hidden="true">深</span>
+                <span class="source-card-head"><strong class="source-card-name">长篇新闻</strong><span class="source-status-badges"><span class="source-source-badge">提供方：Tushare major_news</span><span class="source-access-badge" data-news-health>待验证</span></span><p class="src-detail" data-news-detail>覆盖新华网、财新网、中证网、第一财经、财联社等长篇报道。</p><span class="source-card-hint-slot" data-news-last-success>尚无成功记录</span></span>
+                <span class="source-card-right"><label class="source-card-share"><span>权重</span><input id="newsTushareMajorWeight" value="4" inputmode="numeric" aria-label="长篇新闻权重"></label><label class="source-card-enable"><span class="sr-only">启用长篇新闻</span><select id="newsTushareMajorEnabled"><option value="on">启用</option><option value="off">停用</option></select></label></span>
+              </div>
+              <div class="news-source-frequency"><label class="settings-field"><span>刷新频率（分钟）</span><input id="newsTushareMajorInterval" type="number" min="5" step="1" value="30"></label></div>
+            </article>
+
+            <article class="source-card news-source-card" data-news-source="tushare_cctv_news">
+              <div class="source-card-face">
+                <span class="source-card-logo" aria-hidden="true">视</span>
+                <span class="source-card-head"><strong class="source-card-name">央视新闻联播</strong><span class="source-status-badges"><span class="source-source-badge">提供方：Tushare cctv_news</span><span class="source-access-badge" data-news-health>待验证</span></span><p class="src-detail" data-news-detail>用于补充政策、宏观和全国性议题，不提供行情或交易信号。</p><span class="source-card-hint-slot" data-news-last-success>尚无成功记录</span></span>
+                <span class="source-card-right"><label class="source-card-share"><span>权重</span><input id="newsTushareCctvWeight" value="3" inputmode="numeric" aria-label="央视新闻联播权重"></label><label class="source-card-enable"><span class="sr-only">启用央视新闻联播</span><select id="newsTushareCctvEnabled"><option value="on">启用</option><option value="off">停用</option></select></label></span>
+              </div>
+              <div class="news-source-frequency"><label class="settings-field"><span>刷新频率（分钟）</span><input id="newsTushareCctvInterval" type="number" min="30" step="1" value="360"></label></div>
+            </article>
+
+            <div id="newsRssSourceItems" class="news-rss-source-items" aria-label="逐个 RSS 新闻源"></div>
+
+            <article class="source-card news-source-card news-source-editor">
+              <div class="source-card-face">
+                <span class="source-card-logo" aria-hidden="true">+</span>
+                <span class="source-card-head"><strong class="source-card-name">添加或移除自定义 RSS</strong><span class="source-status-badges"><span class="source-source-badge">提供方：用户配置</span></span><p class="src-detail">每行一个 RSS/Atom 地址。保存后，每个地址会成为一张可独立启停、独立显示健康状态的媒体卡。</p></span>
+              </div>
+              <div class="news-source-frequency news-source-custom"><label class="settings-field full"><span>RSS / Atom 地址（每行一个）</span><textarea id="newsCustomRssUrls" rows="4" placeholder="https://example.com/feed.xml"></textarea></label></div>
+            </article>
+
+            <div class="news-source-actions"><button class="pill-btn" id="newsValidateSourcesBtn" type="button">验证全部新闻源</button><button class="pill-btn primary" id="newsRefreshNowBtn" type="button">立即刷新新闻</button><span id="newsSourceActionStatus" class="settings-probe-status" aria-live="polite"></span></div>
+          </div>
+        </div>
+
+        <div id="settingsPanelScheduler" class="settings-panel" data-settings-panel="scheduler" role="tabpanel" aria-labelledby="settingsTabScheduler" hidden>
+          <p class="settings-note-inline">这里只展示新闻爪当前真实接入的运行节奏。保存后热生效，无需重启。</p>
+          <p class="settings-section-title">调度</p>
+          <label class="settings-field"><span>后台 LLM 请求</span><select id="schedulerEnabled"><option value="on">开启</option><option value="off">暂停</option></select></label>
+          <label class="settings-field"><span>浏览器关闭后</span><select id="pauseDisconnect"><option value="pause">暂停后台</option><option value="keep">继续运行</option></select></label>
+          <label class="settings-field" hidden><span>断开宽限秒数</span><input id="extensionDisconnectGrace" inputmode="numeric" placeholder="90"></label>
+          <label class="settings-field"><span>候选池目标数</span><input id="poolTarget" value="600" inputmode="numeric"></label>
+          <label class="settings-field" hidden><span>来源健康复查间隔小时</span><input id="accountSyncInterval" inputmode="numeric" placeholder="6"></label>
+          <input id="autoUpdate" type="hidden" value="off">
+          <input id="autoUpdateInterval" type="hidden" value="6">
+          <article class="settings-local-update-card">
+            <div><strong>独立本机版</strong><span>版本维护</span></div>
+            <p>新闻爪不会从其他项目自动拉取或安装更新。后续版本由本机“DSH 插件工坊”备份、验收后升级。</p>
+          </article>
+          <p class="settings-section-title">运行节奏</p>
+          <div class="inline-row">
+            <label class="settings-field"><span>调度检查间隔（分钟）</span><input id="refreshCheckInterval" inputmode="numeric" placeholder="10"></label>
+            <label class="settings-field" hidden><span>行为触发阈值</span><input id="signalEventThreshold" inputmode="numeric" placeholder="6"></label>
+            <label class="settings-field"><span>反馈分析积累阈值</span><input id="feedbackBatchThreshold" inputmode="numeric" placeholder="3"></label>
+            <label class="settings-field" hidden><span>单轮发现上限</span><input id="discoveryLimit" inputmode="numeric" placeholder="30"></label>
+          </div>
+          <div class="inline-row">
+            <label class="settings-field"><span>热门刷新分钟</span><input id="trendingRefreshMinutes" inputmode="numeric" placeholder="3"></label>
+            <label class="settings-field"><span>探索刷新分钟</span><input id="exploreRefreshMinutes" inputmode="numeric" placeholder="3"></label>
+            <label class="settings-field"><span>主动推送轮询秒数</span><input id="proactivePushInterval" inputmode="numeric" placeholder="120"></label>
+            <label class="settings-field"><span>猜测器空闲检查分钟</span><input id="speculatorIdleInterval" inputmode="numeric" placeholder="30"></label>
+          </div>
+          <p class="settings-section-title">猜测兴趣</p>
+          <div class="inline-row">
+            <label class="settings-field"><span>猜测兴趣间隔分钟</span><input id="speculationInterval" inputmode="numeric" placeholder="10"></label>
+            <label class="settings-field"><span>猜测兴趣存活天数</span><input id="speculationTtl" inputmode="numeric" placeholder="3"></label>
+            <label class="settings-field"><span>猜测兴趣冷却天数</span><input id="speculationCooldown" inputmode="numeric" placeholder="7"></label>
+            <label class="settings-field"><span>猜测确认阈值</span><input id="speculationThreshold" inputmode="numeric" placeholder="3"></label>
+          </div>
+          <div class="inline-row">
+            <label class="settings-field"><span>最大活跃猜测数</span><input id="speculationMaxActive" inputmode="numeric" placeholder="5"></label>
+            <label class="settings-field"><span>主要兴趣域上限</span><input id="speculationMaxPrimary" inputmode="numeric" placeholder="15"></label>
+            <label class="settings-field"><span>次要兴趣项上限</span><input id="speculationMaxSecondary" inputmode="numeric" placeholder="60"></label>
+            <span></span>
+          </div>
+        </div>
+
+        <div id="settingsPanelGeneral" class="settings-panel" data-settings-panel="general" role="tabpanel" aria-labelledby="settingsTabGeneral" hidden>
+          <p class="settings-section-title">通用</p>
+          <label class="settings-field"><span>语言</span><select id="language"><option value="zh">中文</option><option value="en">English</option></select></label>
+          <label class="settings-field"><span>数据目录</span><input id="dataDir" placeholder="data"></label>
+          <label class="settings-field full"><span>SQLite 数据库存放方式</span><input id="storageDbPath" placeholder="由数据目录自动管理（内部兼容路径）" readonly aria-readonly="true"></label>
+          <p class="settings-section-title">本地保存</p>
+          <div class="settings-note-inline">收藏、稍后读与阅读历史只保存在本机 NewsClaw 数据库。新闻爪不会登录媒体账号，也不会向原网站写入任何收藏或稍后读记录。</div>
+          <p class="settings-section-title">本机访问与启动</p>
+          <label class="settings-field"><span>局域网访问密码</span><input id="authEnabled" type="checkbox"></label>
+          <label class="settings-field" id="authPasswordField" hidden><span>访问密码</span><input id="authPassword" type="password" autocomplete="new-password" placeholder="设置局域网 / 远程访问密码"></label>
+          <div class="drawer-actions" id="authSaveRow" style="grid-column: 1 / -1" hidden><button class="pill-btn" id="authSave" type="button">保存密码设置</button></div>
+          <p class="settings-note-inline" id="authHint">本机与浏览器插件免登录；开启后局域网 / 远程设备访问需要密码。</p>
+          <label class="settings-field"><span>开机自启动</span><input id="autostartEnabled" type="checkbox"></label>
+          <p class="settings-note-inline" id="autostartHint">开启后下次登录系统会自动拉起后端（不影响当前进程）。</p>
+          <p class="settings-section-title">网络</p>
+          <label class="settings-field"><span>海外网络模式</span><select id="networkProxyMode"><option value="direct">直连（忽略系统代理）</option><option value="system" selected>跟随系统代理</option><option value="custom">自定义代理</option></select></label>
+          <label class="settings-field full"><span>自定义代理地址</span><input id="networkProxy" placeholder="socks5://127.0.0.1:1080"></label>
+          <div class="settings-probe-row">
+            <button class="pill-btn" id="probeNetworkProxy" type="button">测试代理</button>
+            <span class="settings-probe-status" id="probeNetworkProxyStatus" aria-live="polite"></span>
+          </div>
+          <p class="settings-note-inline" id="networkProxyHint">当前只作用于明确需要海外出网的 AI 服务。Tushare 与 RSS 仍按来源客户端直连；自定义模式支持 http/https/socks5/socks5h。</p>
+          <p class="settings-section-title">画像校正</p>
+          <section class="settings-reinit-card" aria-labelledby="reinitHeading">
+            <div class="settings-reinit-head">
+              <div>
+                <p class="settings-section-kicker">Profile rebuild</p>
+                <h3 id="reinitHeading">新闻画像持续学习</h3>
+              </div>
+              <span class="settings-migration-badge">当前为只读说明</span>
+            </div>
+          <p class="settings-reinit-copy">“一键清空并重建画像”尚未开放。当前请在画像页手工编辑，或通过打开推荐、喜欢、不感兴趣、忽略、评论/对话和兴趣/避雷探测持续校正；这些操作都会使用新闻反馈合同。收藏、稍后读和当前列表筛选只改变本机内容状态，不会被宣称为画像学习。</p>
+          </section>
+          <p class="settings-section-title">数据迁移</p>
+          <section class="settings-migration-card" aria-labelledby="migrationHeading">
+            <div class="settings-migration-head">
+              <div>
+                <p class="settings-section-kicker">Portable backup</p>
+                <h3 id="migrationHeading">把新闻爪完整搬到另一台机器</h3>
+              </div>
+              <span class="settings-migration-badge">重启后生效</span>
+            </div>
+            <p class="settings-migration-copy">导出配置与 API Key、Tushare 凭据、画像、行为与推荐历史。向量缓存、日志、历史备份、证书、系统自启动、Web 访问密码、签名密钥和环境变量的值不会打包；导入时保留目标机的访问门禁并撤销旧会话。</p>
+            <div class="settings-migration-inventory" role="list" aria-label="迁移内容">
+              <span role="listitem"><strong>配置与凭据</strong><small>模型、新闻源、API Key、Tushare Token</small></span>
+              <span role="listitem"><strong>画像与历史</strong><small>记忆、对话、反馈、收藏与推荐记录</small></span>
+              <span role="listitem"><strong>安全替换</strong><small>导入先校验，重启时替换并保留回滚副本</small></span>
+            </div>
+            <p class="settings-migration-warning"><strong>敏感文件：</strong>迁移包当前不加密。任何拿到文件的人都可能读取其中的 API Key 和 Tushare Token，请只保存在可信设备并在迁移后删除。</p>
+            <div class="settings-migration-actions">
+              <button class="pill-btn primary" id="migrationExportBtn" type="button">导出全部信息</button>
+              <button class="pill-btn" id="migrationImportBtn" type="button" aria-controls="migrationImportFile">导入迁移包</button>
+              <button class="pill-btn" id="migrationCancelBtn" type="button" hidden>取消待导入</button>
+              <input id="migrationImportFile" type="file" accept=".newsclaw-backup,.obcbackup,application/zip,application/octet-stream,application/vnd.newsclaw.backup+zip,application/vnd.openbiliclaw.backup+zip" hidden data-settings-ignore-dirty>
+            </div>
+            <p class="settings-migration-status" id="migrationStatus" role="status" aria-live="polite">只能在运行后端的本机操作。</p>
+          </section>
+        </div>
+
+        <div id="settingsPanelFrontend" class="settings-panel" data-settings-panel="frontend" role="tabpanel" aria-labelledby="settingsTabFrontend" hidden>
+          <p class="settings-section-title">前端相关设置</p>
+          <label class="settings-field"><span>后端地址</span><input id="backendHost" placeholder="默认跟随当前页面地址"></label>
+          <label class="settings-field"><span>后端端口</span><input id="backendPort" inputmode="numeric" placeholder="默认跟随当前页面端口"></label>
+          <label class="settings-field"><span>惊喜推荐加载数量</span><input id="delightQueueLimit" value="20" inputmode="numeric" min="1" max="100"></label>
+          <div class="settings-field full settings-theme-field">
+            <span>外观主题</span>
+            <div class="theme-segmented" id="themeModeSetting" role="radiogroup" aria-label="外观主题">
+              <button type="button" role="radio" data-theme-choice="auto">跟随系统</button>
+              <button type="button" role="radio" data-theme-choice="light">浅色</button>
+              <button type="button" role="radio" data-theme-choice="dark">深色</button>
+            </div>
+          </div>
+          <div class="settings-field full">
+            <span>色彩引擎</span>
+            <div class="theme-segmented theme-segmented-2col" id="themeAccentSetting" role="radiogroup" aria-label="色彩引擎">
+              <button type="button" role="radio" data-accent-choice="modern">动态主题色</button>
+              <button type="button" role="radio" data-accent-choice="classic">经典配色</button>
+            </div>
+          </div>
+          <div class="settings-field full settings-hue-field">
+            <span>主题色相</span>
+            <div class="hue-swatches" id="themeHueSetting" role="radiogroup" aria-label="主题色相">
+              <button type="button" role="radio" data-hue="0" class="hue-swatch" style="--swatch:oklch(80% 0.16 0)" title="烈焰红">烈焰红</button>
+              <button type="button" role="radio" data-hue="30" class="hue-swatch" style="--swatch:oklch(80% 0.16 30)" title="珊瑚橙">珊瑚橙</button>
+              <button type="button" role="radio" data-hue="60" class="hue-swatch" style="--swatch:oklch(80% 0.16 60)" title="柠檬黄">柠檬黄</button>
+              <button type="button" role="radio" data-hue="90" class="hue-swatch" style="--swatch:oklch(80% 0.16 90)" title="嫩草绿">嫩草绿</button>
+              <button type="button" role="radio" data-hue="120" class="hue-swatch" style="--swatch:oklch(80% 0.16 120)" title="薄荷绿">薄荷绿</button>
+              <button type="button" role="radio" data-hue="150" class="hue-swatch" style="--swatch:oklch(80% 0.16 150)" title="自然绿">自然绿</button>
+              <button type="button" role="radio" data-hue="180" class="hue-swatch" style="--swatch:oklch(80% 0.16 180)" title="青瓷色">青瓷色</button>
+              <button type="button" role="radio" data-hue="210" class="hue-swatch" style="--swatch:oklch(80% 0.16 210)" title="极客蓝">极客蓝</button>
+              <button type="button" role="radio" data-hue="240" class="hue-swatch" style="--swatch:oklch(80% 0.16 240)" title="星空蓝">星空蓝</button>
+              <button type="button" role="radio" data-hue="270" class="hue-swatch" style="--swatch:oklch(80% 0.16 270)" title="暗夜紫">暗夜紫</button>
+              <button type="button" role="radio" data-hue="300" class="hue-swatch" style="--swatch:oklch(80% 0.16 300)" title="梦幻紫">梦幻紫</button>
+              <button type="button" role="radio" data-hue="330" class="hue-swatch" style="--swatch:oklch(80% 0.16 330)" title="元气粉">元气粉</button>
+            </div>
+            <div class="hue-slider-wrap">
+              <input type="range" id="hueSlider" min="0" max="360" value="20" class="hue-slider" aria-label="自定义色相">
+              <input type="number" id="hueValueInput" min="0" max="360" value="20" class="hue-value" aria-label="色相值">
+            </div>
+            <p class="settings-hue-hint" hidden>经典模式下不可用，切换至动态主题色后可自定义色相</p>
+          </div>
+          <label class="settings-field full settings-switch-field" title="开启：滚动到底部且推荐池可用时自动加载更多；关闭：保留纯手动加载。">
+            <span>滚动到底自动加载推荐</span>
+            <span class="settings-switch-copy">开启：滚动到底部且推荐池可用时自动加载更多；关闭：保留纯手动加载。</span>
+            <span class="reshuffle-toggle settings-toggle-inline">
+              <input id="autoLoadOnScrollSetting" type="checkbox" checked>
+              <span class="reshuffle-switch" aria-hidden="true"></span>
+              <span id="autoLoadOnScrollSettingText">开启</span>
+            </span>
+          </label>
+          <p class="settings-note-inline">后端地址、端口、外观主题、色彩引擎和自动加载偏好保存在当前浏览器；惊喜推荐加载数量会随保存配置写入后端，供桌面 Web、移动 Web 和插件共享。</p>
+        </div>
+
+        <div id="settingsPanelLogging" class="settings-panel" data-settings-panel="logging" role="tabpanel" aria-labelledby="settingsTabLogging" hidden>
+          <p class="settings-section-title">日志</p>
+          <label class="settings-field"><span>控制台级别</span><select id="logLevel" translate="no"><option value="DEBUG">DEBUG</option><option value="INFO" selected="">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
+          <label class="settings-field"><span>文件级别</span><select id="logFileLevel" translate="no"><option value="DEBUG" selected="">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select></label>
+          <label class="settings-field full"><span>完整日志路径</span><input id="logPath" placeholder="logs/newsclaw.log"></label>
+          <div class="inline-row">
+            <label class="settings-field"><span>单日志文件上限 MB</span><input id="logMaxFileSize" inputmode="numeric" placeholder="100"></label>
+            <label class="settings-field"><span>日志备份份数</span><input id="logBackupCount" inputmode="numeric" placeholder="1"></label>
+            <label class="settings-field"><span>日志目录预算 MB</span><input id="logAggregateBudget" inputmode="numeric" placeholder="500"></label>
+            <label class="settings-field"><span>非托管日志保留天数</span><input id="logUnmanagedMaxAge" inputmode="numeric" placeholder="30"></label>
+          </div>
+          <label class="settings-field"><span>非托管日志截断 MB</span><input id="logUnmanagedTruncate" inputmode="numeric" placeholder="200"></label>
+        </div>
+
+        <label class="settings-field full"><span>配置状态</span><textarea id="configStatus" rows="3" readonly="" aria-live="polite">可连接 FastAPI：/api/health、/api/config、/api/runtime-status。保存后调用 PUT /api/config，并热重载运行时。</textarea></label>
+        <div class="settings-savebar" id="settingsSaveBar" data-dirty="false">
+          <span class="settings-savebar-msg" id="settingsSaveMsg" aria-live="polite">没有未保存的修改</span>
+          <span class="settings-savebar-actions">
+            <button class="pill-btn" id="settingsDiscardBtn" type="button" disabled>放弃修改</button>
+            <button class="pill-btn primary" id="settingsSaveBtn" type="submit" disabled>保存配置</button>
+          </span>
+        </div>
+      </form>
+      </section>
+
+      <div class="llm-instance-dialog" id="llmInstanceDialog" role="dialog" aria-modal="true" aria-labelledby="llmInstanceDialogTitle" hidden>
+        <div class="llm-instance-dialog-backdrop" data-close-llm-instance-dialog></div>
+        <section class="llm-instance-dialog-panel" tabindex="-1">
+          <div class="llm-instance-dialog-head">
+            <div><p class="settings-section-kicker">LLM endpoint</p><h3 id="llmInstanceDialogTitle">新建 LLM 实例</h3></div>
+            <button class="icon-btn" id="closeLlmInstanceDialog" type="button" aria-label="关闭实例编辑器">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+            </button>
+          </div>
+          <div class="llm-instance-form">
+            <label class="settings-field"><span>实例名称</span><input id="llmInstanceName" autocomplete="off" placeholder="例如：DeepSeek 官方"></label>
+            <label class="settings-field"><span>实例 ID</span><input id="llmInstanceId" autocomplete="off" spellcheck="false" placeholder="deepseek-main" aria-describedby="llmInstanceIdHint"></label>
+            <p class="settings-note-inline llm-instance-id-hint" id="llmInstanceIdHint">保存后 ID 不可修改；调用链通过它稳定引用实例。</p>
+            <label class="settings-field"><span>Provider 类型</span><select id="llmInstanceProviderType" translate="no"><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="deepseek">DeepSeek</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="openai_compatible">OpenAI-compatible</option></select></label>
+            <label class="settings-field"><span>状态</span><select id="llmInstanceEnabled"><option value="on">启用</option><option value="off">停用</option></select></label>
+            <label class="settings-field full">
+              <span>模型</span>
+              <div class="llm-discovery-control">
+                <input id="llmInstanceModel" list="llmInstanceModelOptions" autocomplete="off" spellcheck="false" placeholder="选择接口返回的模型，或直接手填" aria-describedby="llmInstanceModelDiscoveryStatus">
+                <button class="pill-btn llm-discovery-button" id="refreshLlmInstanceModels" type="button">获取模型</button>
+              </div>
+              <datalist id="llmInstanceModelOptions"></datalist>
+              <small class="llm-field-help" id="llmInstanceModelDiscoveryStatus" aria-live="polite">OpenAI 兼容端点可从 /models 获取；接口不支持时仍可手填。</small>
+            </label>
+            <label class="settings-field full"><span>Base URL</span><input id="llmInstanceBaseUrl" type="url" autocomplete="off" spellcheck="false" placeholder="官方渠道可留空；兼容网关必须填写"></label>
+            <label class="settings-field full"><span>API Key</span><input id="llmInstanceApiKey" type="password" autocomplete="new-password" placeholder="留空保留已配置的密钥"></label>
+            <label class="settings-field full" id="llmInstanceClearApiKeyField" hidden><span>清除已保存的 API Key</span><input id="llmInstanceClearApiKey" type="checkbox"></label>
+            <label class="settings-field" data-instance-field="openai-auth"><span>OpenAI 认证方式</span><select id="llmInstanceAuthMode"><option value="api_key">API Key</option><option value="codex_oauth">Codex OAuth</option></select></label>
+            <label class="settings-field" data-instance-field="openai-protocol"><span>API 协议</span><select id="llmInstanceApiFlavor"><option value="">chat/completions（默认）</option><option value="responses">responses</option></select></label>
+            <label class="settings-field" data-instance-field="reasoning">
+              <span>Reasoning effort</span>
+              <input id="llmInstanceReasoning" list="llmInstanceReasoningOptions" autocomplete="off" spellcheck="false" placeholder="Auto（留空不显式指定）" aria-describedby="llmInstanceReasoningHint">
+              <datalist id="llmInstanceReasoningOptions">
+                <option value="none"></option>
+                <option value="minimal"></option>
+                <option value="low"></option>
+                <option value="medium"></option>
+                <option value="high"></option>
+                <option value="xhigh"></option>
+                <option value="max"></option>
+              </datalist>
+              <small class="llm-field-help" id="llmInstanceReasoningHint">协议没有 Effort 枚举接口；这里是本地建议，也支持手填，保存后请测试连接。</small>
+            </label>
+            <label class="settings-field" data-instance-field="ollama"><span>Ollama 上下文窗口</span><input id="llmInstanceNumCtx" type="number" min="0" inputmode="numeric" placeholder="0（服务默认）"></label>
+            <label class="settings-field full" data-instance-field="openrouter"><span>HTTP Referer</span><input id="llmInstanceReferer" type="url" autocomplete="off" placeholder="https://example.com"></label>
+            <label class="settings-field full" data-instance-field="openrouter"><span>X-Title</span><input id="llmInstanceTitle" autocomplete="off" placeholder="NewsClaw"></label>
+          </div>
+          <p class="llm-instance-form-error" id="llmInstanceFormError" role="alert" aria-live="assertive"></p>
+          <div class="drawer-actions">
+            <button class="pill-btn" id="cancelLlmInstance" type="button">取消</button>
+            <button class="pill-btn primary" id="saveLlmInstance" type="button">保存实例</button>
+          </div>
+        </section>
+      </div>
+    </main>
+    </div>
+  </div>
+
+  <section class="mobile-menu" id="mobileMenu" aria-label="手机菜单">
+    <div class="mobile-menu-panel">
+      <div class="mobile-menu-head">
+        <div><p class="eyebrow">NewsClaw</p><h2>菜单</h2></div>
+        <button class="icon-btn" id="mobileMenuClose" type="button" aria-label="关闭手机菜单">×</button>
+      </div>
+      <form class="mobile-search" id="mobileSearchForm">
+        <input id="mobileSearchInput" type="search" placeholder="筛选当前已加载的推荐">
+        <button class="pill-btn dark" type="submit">筛选</button>
+      </form>
+      <div class="mobile-menu-list" aria-label="手机功能入口">
+        <button class="mobile-menu-item" data-mobile-page="profilePage" type="button"><span>我的画像</span><small id="mobileProfileHint">查看完整画像和近期记忆</small></button>
+        <button class="mobile-menu-item" data-mobile-page="chatPage" type="button"><span>聊聊口味</span><small>告诉新闻爪你的偏好和边界</small></button>
+        <button class="mobile-menu-item" data-mobile-panel="messagesDrawer" type="button"><span>消息</span><small><span id="mobileMessageCount">0</span> 条通知</small></button>
+        <button class="mobile-menu-item" data-mobile-page="settingsPage" data-settings="models" type="button"><span>设置</span><small>模型、前端、新闻源和调度配置</small></button>
+        <button class="mobile-menu-item" data-mobile-panel="aboutOverlay" type="button"><span>关于新闻爪</span><small>产品定位、数据边界与技术许可</small></button>
+      </div>
+      <section class="mobile-summary-card" aria-label="新闻爪眼里的你">
+        <div class="mobile-summary-head"><p class="eyebrow">Profile</p><button class="small-btn" data-mobile-page="profilePage" type="button">查看画像</button></div>
+        <h3>新闻爪眼里的你</h3>
+        <div class="profile-chip-row" id="mobileProfileChips"></div>
+        <p class="video-meta" id="mobileProfilePortrait">偏好结构化解释、长新闻和跨学科桥接。</p>
+        <div class="kv">
+          <div class="kv-row"><span>MBTI 推断</span><strong id="mobileRailMbti">—</strong></div>
+          <div class="kv-row"><span>探索开放度</span><strong id="mobileRailOpenness">—</strong></div>
+          <div class="kv-row"><span>深度偏好</span><strong id="mobileRailDepth">—</strong></div>
+        </div>
+      </section>
+      <section class="mobile-summary-card" aria-label="后台刚记住的事">
+        <div class="mobile-summary-head"><p class="eyebrow">Activity</p><button class="small-btn" data-mobile-panel="activityDrawer" type="button">查看全部</button></div>
+        <h3>后台刚记住的事</h3>
+        <div class="activity-list" id="mobileActivityList"></div>
+      </section>
+    </div>
+  </section>
+
+  <section class="overlay" id="aboutOverlay" aria-label="关于新闻爪" data-od-id="about-newsclaw">
+    <div class="scrim" data-close="aboutOverlay"></div>
+    <div class="modal-panel about-panel" role="dialog" aria-modal="true" aria-labelledby="aboutNewsClawTitle">
+      <div class="modal-head">
+        <div><p class="eyebrow">Independent local news agent</p><h2 id="aboutNewsClawTitle">关于新闻爪</h2></div>
+        <button class="icon-btn" data-close="aboutOverlay" type="button" aria-label="关闭关于新闻爪">×</button>
+      </div>
+      <p class="about-lead">NewsClaw / 新闻爪是一款独立运行的本地个性化新闻 Agent。它每天按你的关注方向整理真实新闻，帮助你提升宏观理解、辅助投资研究和内容创作。</p>
+      <div class="about-capability-grid" aria-label="新闻爪的核心能力">
+        <article><strong>找到真实新闻</strong><span>从你启用的新闻 API、官方 RSS 与自定义 RSS 获取内容，并保留来源与时间。</span></article>
+        <article><strong>解释与你的关系</strong><span>结合你的画像说明为什么值得看、可能的影响链，以及后续观察点。</span></article>
+        <article><strong>越用越懂你</strong><span>打开推荐、喜欢、不感兴趣、忽略、评论和对话会修正后续推荐；收藏与稍后读只在本机保存。</span></article>
+      </div>
+      <section class="about-boundary-card">
+        <p class="settings-section-kicker">Product boundary</p>
+        <h3>这是独立产品，不是换皮入口</h3>
+        <ul>
+          <li>新闻爪不是 OpenBiliClaw 的皮肤、插件或官方新闻版，也不依赖它运行。</li>
+          <li>数据库、画像、配置和行为记录保存在本机；启用 AI 后，只把完成任务所需的相关内容交给你配置的模型服务。</li>
+          <li>产品提供信息整理与理解辅助，不给出买卖指令，也不连接券商或自动交易。</li>
+        </ul>
+      </section>
+      <section class="about-license-card">
+        <p class="settings-section-kicker">Technology &amp; licenses</p>
+        <h3>技术来源与许可</h3>
+        <p>部分交互、记忆与工程代码依据 OpenBiliClaw 的开源许可进行适配；它只属于技术来源，不是新闻爪的产品主页、客服、更新渠道或新闻服务。完整著作权与第三方许可随本机项目保存在 <code>LICENSE</code>、<code>NOTICE</code> 与 <code>licenses</code> 中。</p>
+      </section>
+      <div class="drawer-actions about-actions"><button class="pill-btn primary" data-close="aboutOverlay" type="button">知道了</button></div>
+    </div>
+  </section>
+
+  <section class="drawer" id="messagesDrawer" aria-label="消息中心" data-od-id="messages-drawer">
+    <div class="scrim" data-close="messagesDrawer"></div>
+    <div class="drawer-panel" id="messagesPanel">
+      <div class="drawer-head" id="messagesHead"><button class="small-btn mobile-back-btn" data-mobile-back type="button">← 返回菜单</button><div><p class="eyebrow">Inbox</p><h2>消息</h2></div><button class="icon-btn" data-close="messagesDrawer" type="button">×</button></div>
+      <div class="message-list" id="messageList"></div>
+      <div class="message-chat-view" id="messageChatView" hidden>
+        <div class="drawer-head message-chat-head">
+          <button class="small-btn" id="messageChatBackBtn" type="button">← 返回消息</button>
+          <button class="icon-btn" data-close="messagesDrawer" type="button">×</button>
+        </div>
+        <p class="eyebrow">Taste dialogue</p>
+        <h2 id="messageChatTitle">聊聊这个兴趣</h2>
+        <p class="video-meta" id="messageChatContext">这轮对话会沿用同一个后端聊天会话。</p>
+        <div class="chat-log" id="messageChatLog"></div>
+        <form class="chat-input" id="messageChatForm"><input id="messageChatInput" placeholder="继续补充你的口味、边界或例子"><button class="pill-btn primary" type="submit">发送</button></form>
+      </div>
+    </div>
+  </section>
+
+  <section class="drawer" id="mobileQrDrawer" aria-label="手机版入口" data-od-id="mobile-qr-drawer">
+    <div class="scrim" data-close="mobileQrDrawer"></div>
+    <div class="drawer-panel mobile-qr-panel">
+      <div class="drawer-head"><div><p class="eyebrow">Mobile web</p><h2>手机上也能用</h2></div><button class="icon-btn" data-close="mobileQrDrawer" type="button">×</button></div>
+      <p class="video-meta mobile-qr-lead">手机与电脑共用同一份推荐、收藏、画像和对话，点开新闻即可阅读原文。</p>
+      <div class="mobile-qr-card">
+        <div class="mobile-qr-canvas" id="mobileQrCanvas" aria-live="polite"></div>
+        <code class="mobile-qr-url" id="mobileQrUrl"></code>
+        <div class="drawer-actions">
+          <button class="pill-btn primary" id="mobileQrCopyBtn" type="button">复制链接</button>
+        </div>
+      </div>
+      <ol class="mobile-qr-steps" aria-label="使用步骤">
+        <li><span class="step-num">1</span>手机和这台电脑连同一个 WiFi</li>
+        <li><span class="step-num">2</span>用相机或浏览器扫码打开</li>
+        <li><span class="step-num">3</span>「添加到主屏幕」，下次像 App 一样直接开</li>
+      </ol>
+      <p class="mobile-qr-hint" id="mobileQrHint" hidden></p>
+    </div>
+  </section>
+
+  <section class="drawer" id="activityDrawer" aria-label="动态历史" data-od-id="activity-drawer">
+    <div class="scrim" data-close="activityDrawer"></div>
+    <div class="drawer-panel">
+      <div class="drawer-head"><button class="small-btn mobile-back-btn" data-mobile-back type="button">← 返回菜单</button><div><p class="eyebrow">Activity history</p><h2>动态历史</h2></div><button class="icon-btn" data-close="activityDrawer" type="button">×</button></div>
+      <div class="activity-list" id="activityHistory"></div>
+      <div class="drawer-actions"><button class="pill-btn dark" id="activityMoreBtn" type="button">加载更早动态</button></div>
+    </div>
+  </section>
+
+  <aside class="theme-notice" id="themeNotice" role="region" aria-live="polite" aria-labelledby="themeNoticeTitle" aria-describedby="themeNoticeDescription" hidden>
+    <strong id="themeNoticeTitle">已启用经典配色</strong>
+    <p id="themeNoticeDescription">喜欢自定义色彩？可在“设置 → 前端”切换到动态主题色并调节色相。</p>
+    <div class="theme-notice-actions">
+      <button class="notice-btn secondary" id="themeNoticeDismiss" type="button">知道了</button>
+      <button class="notice-btn primary" id="themeNoticeSettings" type="button">前往设置</button>
+    </div>
+  </aside>
+  <div class="toast-container" id="toastContainer" role="status" aria-live="polite"></div>
+  <button id="backToTop" class="back-to-top" type="button" aria-label="回到顶部" title="回到顶部" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m6 14 6-6 6 6" />
+    </svg>
+    <span>顶部</span>
+  </button>
+  <script src="/web/assets/js/mobile-qr.js" defer></script>
+  <script src="/web/assets/js/pending-actions.js" defer></script>
+  <script src="/web/assets/js/saved-sync-core.js" defer></script>
+  <!-- Frontend helpers shared with the extension side panel (and, for source
+       status, the setup wizard); served from /shared because /web is rooted at
+       web/desktop. -->
+  <script src="/shared/dialogue-confirmation.js" defer></script>
+  <script src="/shared/source-status.js" defer></script>
+  <script src="/web/assets/js/app.js" defer></script>
+</body></html>

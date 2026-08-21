@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NewsClaw · 新闻爪</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="../icons/icon32.png">
+  <style>
+    :root {
+      color-scheme: light;
+      --brand: #fb7299;
+      --brand-strong: #f05282;
+      --ink: #26354d;
+      --muted: #77839a;
+      --line: #e5eaf2;
+      --panel: rgba(255, 255, 255, .94);
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html, body { width: 100%; height: 100%; min-width: 280px; margin: 0; }
+    body {
+      overflow: hidden;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 0 0, rgba(251,114,153,.16), transparent 34%),
+        linear-gradient(180deg, #fffafd 0%, #f5f9ff 100%);
+    }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .shell { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+    .topbar {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 58px;
+      padding: 9px 12px;
+      border-bottom: 1px solid rgba(229,234,242,.92);
+      background: rgba(255,255,255,.9);
+      box-shadow: 0 5px 18px rgba(57,76,110,.08);
+      backdrop-filter: blur(14px);
+    }
+    .brand-mark { width: 34px; height: 34px; border-radius: 11px; }
+    .brand { min-width: 0; flex: 1; }
+    .brand strong { display: block; font-size: 15px; line-height: 1.25; }
+    .brand small { display: block; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #d2d8e3; box-shadow: 0 0 0 4px rgba(210,216,227,.28); }
+    .status-dot.online { background: #31b87b; box-shadow: 0 0 0 4px rgba(49,184,123,.15); }
+    .status-dot.degraded { background: #f2a53b; box-shadow: 0 0 0 4px rgba(242,165,59,.16); }
+    .icon-btn {
+      width: 32px; height: 32px; padding: 0; border: 1px solid var(--line);
+      border-radius: 10px; color: #59677f; background: #fff;
+    }
+    .content { position: relative; min-height: 0; }
+    .client-frame { width: 100%; height: 100%; border: 0; background: #fff; }
+    .state-card {
+      position: absolute; inset: 0; z-index: 1; display: grid; place-items: center;
+      padding: 24px; background: linear-gradient(180deg, rgba(255,250,253,.98), rgba(245,249,255,.98));
+    }
+    .state-inner { width: min(100%, 330px); text-align: center; }
+    .state-inner img { width: 64px; height: 64px; margin-bottom: 12px; border-radius: 18px; box-shadow: 0 12px 28px rgba(251,114,153,.18); }
+    .state-inner h1 { margin: 0 0 8px; font-size: 20px; }
+    .state-inner p { margin: 0 auto 18px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .actions { display: flex; justify-content: center; gap: 8px; }
+    .pill {
+      min-height: 38px; padding: 0 16px; border: 1px solid var(--line); border-radius: 999px;
+      color: #56647b; background: #fff;
+    }
+    .pill.primary { border-color: var(--brand); color: #fff; background: linear-gradient(135deg, var(--brand), var(--brand-strong)); }
+    .settings {
+      position: absolute; inset: 0; z-index: 3; display: grid; place-items: start center;
+      padding: 78px 18px 18px; background: rgba(35,48,70,.24); backdrop-filter: blur(5px);
+    }
+    .settings-card { width: min(100%, 360px); padding: 18px; border: 1px solid rgba(255,255,255,.7); border-radius: 18px; background: var(--panel); box-shadow: 0 20px 42px rgba(48,66,99,.18); }
+    .settings-card h2 { margin: 0 0 5px; font-size: 17px; }
+    .settings-card p { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .settings-card label { display: grid; gap: 6px; color: #5d6b82; font-size: 12px; }
+    .settings-card input { width: 100%; height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 11px; color: var(--ink); background: #fff; outline: none; }
+    .settings-card input:focus { border-color: rgba(251,114,153,.7); box-shadow: 0 0 0 3px rgba(251,114,153,.12); }
+    .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    .privacy-note { margin-top: 12px !important; padding-top: 12px; border-top: 1px solid var(--line); }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <img class="brand-mark" src="../icons/icon48.png" alt="">
+      <div class="brand"><strong>NewsClaw · 新闻爪</strong><small id="connectionText">正在连接本机服务…</small></div>
+      <span class="status-dot" id="connectionDot" aria-hidden="true"></span>
+      <button class="icon-btn" id="openFullButton" type="button" title="在新标签页打开" aria-label="在新标签页打开">↗</button>
+      <button class="icon-btn" id="settingsButton" type="button" title="连接设置" aria-label="连接设置">⚙</button>
+    </header>
+    <section class="content">
+      <iframe
+        class="client-frame"
+        id="clientFrame"
+        title="新闻爪侧栏"
+        sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
+      ></iframe>
+      <div class="state-card" id="stateCard">
+        <div class="state-inner">
+          <img src="../icons/icon128.png" alt="">
+          <h1 id="stateTitle">正在连接新闻爪</h1>
+          <p id="stateMessage">正在检查本机服务。扩展只连接本机 NewsClaw，不访问你正在浏览的网页。</p>
+          <div class="actions">
+            <button class="pill primary" id="retryButton" type="button">重新连接</button>
+            <button class="pill" id="stateSettingsButton" type="button">连接设置</button>
+          </div>
+        </div>
+      </div>
+      <div class="settings" id="settingsPanel" hidden>
+        <form class="settings-card" id="settingsForm">
+          <h2>连接本机 NewsClaw</h2>
+          <p>默认地址是正式端口 8430。开发环境也会自动尝试 8431。</p>
+          <label>本机服务地址
+            <input id="endpointInput" inputmode="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8430">
+          </label>
+          <div class="settings-actions">
+            <button class="pill" id="cancelSettingsButton" type="button">取消</button>
+            <button class="pill primary" type="submit">保存并连接</button>
+          </div>
+          <p class="privacy-note">只允许 127.0.0.1 或 localhost。本扩展没有网页注入、Cookie、活动标签页或任意网站权限。</p>
+        </form>
+      </div>
+    </section>
+  </main>
+  <script src="./popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://whiteguo233.github.io/OpenBiliClaw/sitemap.xml

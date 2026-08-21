@@ -1,0 +1,45 @@
+name: Validate Backend Source Tag
+
+on:
+  push:
+    tags:
+      - "backend-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate backend source tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify backend version matches source tag
+        shell: python
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          import os
+          import tomllib
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          expected_version = release_tag.removeprefix("backend-v")
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          actual_version = str(pyproject["project"]["version"])
+
+          if actual_version != expected_version:
+              raise SystemExit(
+                  f"backend source tag {release_tag} does not match pyproject version {actual_version}"
+              )
+
+      - name: Update aggregate latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          CHANNEL: backend
+        run: bash .github/scripts/sync-aggregate-release.sh

@@ -1,0 +1,34 @@
+{
+  "categories": {
+    "android": [
+      "feeds-news-blogging"
+    ],
+    "firefox": [
+      "feeds-news-blogging"
+    ]
+  },
+  "default_locale": "zh-CN",
+  "description": {
+    "en-US": "NewsClaw is the local sidebar client for an independent personalized news agent. It connects only to the NewsClaw service running on this computer, presents real-news recommendations, the local content library, profile and dialogue, and keeps every client on the same local database. The extension does not inject scripts into news websites, read cookies, inspect the active tab or request arbitrary website access. News sources are configured in the local NewsClaw service and may include licensed APIs, official RSS/Atom feeds and user-provided RSS feeds. When AI analysis is enabled, only task-relevant news content is sent to the model provider configured by the user.",
+    "zh-CN": "NewsClaw / 新闻爪是一款独立个性化新闻 Agent 的本机侧栏客户端。它只连接这台电脑上运行的新闻爪服务，用于查看真实新闻推荐、内容库、画像与对话，所有客户端共用同一份本地数据库。扩展不向新闻网站注入脚本，不读取 Cookie，不查看当前标签页，也不申请任意网站权限。新闻来源由本机新闻爪配置，可包括已授权 API、官方 RSS/Atom 和用户自定义 RSS；启用 AI 分析后，仅将完成任务所需的相关新闻内容交给用户配置的模型服务。"
+  },
+  "is_experimental": true,
+  "name": {
+    "en-US": "NewsClaw",
+    "zh-CN": "NewsClaw · 新闻爪"
+  },
+  "requires_payment": false,
+  "slug": "newsclaw-local",
+  "summary": {
+    "en-US": "Local sidebar for personalized real-news discovery and understanding",
+    "zh-CN": "本机个性化真实新闻发现、理解与反馈侧栏"
+  },
+  "version": {
+    "approval_notes": "NewsClaw is a local-only sidebar client. It requests only storage plus loopback host access to 127.0.0.1/localhost. It has no content scripts, web-accessible resources, cookie permission, activeTab permission, scripting permission or arbitrary host permission. The sidebar embeds the user's own local NewsClaw mobile Web client and opens the same loopback service in a tab when requested. No telemetry or project-operated server is used. From the extension directory run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build:firefox`; the review artifact is `extension/dist-firefox`.",
+    "license": "MIT",
+    "release_notes": {
+      "en-US": "First independent NewsClaw release. Adds a loopback-only sidebar for recommendations, content library, profile and dialogue, with no page injection or cookie access.",
+      "zh-CN": "新闻爪独立首版：提供仅连接本机的推荐、内容库、画像与对话侧栏，不注入网页、不读取 Cookie。"
+    }
+  }
+}
