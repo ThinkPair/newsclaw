@@ -2,6 +2,10 @@
 
 **Understand you first, then proactively find real news.**
 
+📌 Latest: **v0.1.0**
+
+> Release boundary: NewsClaw does not use the upstream `openbiliclaw-v*` aggregate Release as its own update or download channel; this GitHub repository is private source hosting only.
+
 NewsClaw is an independent local-only personalized news agent for one person.
 It owns its news sources, product semantics, data, and configuration, and does
 not require another product at runtime.
