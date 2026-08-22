@@ -9,6 +9,12 @@ does not depend on Bilibili history, cookies, or a legacy user profile.
 The package only reads contracted news APIs and site-published RSS/Atom feeds.
 It does not fetch article pages or implement a crawler.
 
+NewsClaw's optional Tavily Search/Extract lives in the separate
+[`openbiliclaw.research`](research.md) module. It is an explicit user/Agent
+research lane, not a `NewsSourceAdapter`, and therefore does not weaken this
+package's scheduled-ingestion boundary or write research pages into the news
+candidate pool.
+
 ## Implemented features
 
 | Capability | Status | Notes |

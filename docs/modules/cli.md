@@ -585,6 +585,43 @@ $ uv run python -m openbiliclaw.integrations.openclaw.cli respond-interest-probe
 `sync-saved` 是唯一会从 Agent bridge 触发外部账号 native-save 的入口，必须带
 `--allow-state-changing`；`save-local`、`list-saved` 和 `remove-saved` 只操作本地 membership。
 
+NewsClaw 模式还提供两个供运行中 Agent Bridge 解析的 Tavily 研究子命令。它们不是
+顶层 `openbiliclaw` 命令，也不是可 cold-start 独立执行的模块 CLI；DSH 通过
+`POST /api/agent-bridge` 调用它们：
+
+Search payload：
+
+```json
+{
+  "command": "research-search",
+  "argv": ["--query", "本周 AI 基础设施有哪些关键变化？", "--topic", "news", "--time-range", "week", "--max-results", "5"]
+}
+```
+
+Extract payload：
+
+```json
+{
+  "command": "research-extract",
+  "argv": ["--query", "两份报告有哪些相同判断与冲突？", "--url", "https://example.com/report-a", "--url", "https://example.org/report-b", "--chunks-per-source", "2"]
+}
+```
+
+- `research-search --query` 必填；`--topic` 为 `general|news|finance`，默认
+  `general`；`--time-range` 可选 `day|week|month|year`；`--max-results` 默认 5，
+  范围 1–8。
+- `research-extract --query` 必填；`--url` 重复 1–3 次且只接受公开 HTTP(S) URL；
+  `--chunks-per-source` 默认 2，范围 1–3。
+- 两条命令都接受 `--refresh`，用于跳过当前新鲜缓存并创建新的 provider 请求。
+- 成功时 `data` 为统一 `{run_id, operation, query, provider,
+  provider_request_id, cache_hit, fresh_until, topic, time_range,
+  result_count, credits_used, evidence}` 结构；Key 不进入 JSON 输出。
+- 命令通过本机 `ResearchService` 调 Tavily；DSH/OpenClaw 等 Agent 宿主不保存
+  `TAVILY_API_KEY`。完整边界见 [Research 模块](research.md)。
+- 直接执行 `python -m openbiliclaw.integrations.openclaw.cli research-search ...`
+  不会构造 NewsRuntime，因此会明确失败；手工调用应使用 REST research 端点或运行中的
+  `/api/agent-bridge`。
+
 `listen` 默认转发 `delight.candidate`、`interest.probe` 和 `avoidance.probe`：
 
 ```bash
@@ -1498,3 +1535,8 @@ $ openbiliclaw db-repair
 `respond-spotlight --response open --article-id ... --request-id ...` 保留 `open` 语义并进入
 持久打开事件；只有 `ignore` 会别名为 `dismiss`。新闻命令输出继续增加 `article_id`、
 `media` 与 `original_url`，内部 `bvid/up_name` 字段仅为协议兼容别名。
+
+2026-08-22 起，NewsClaw Bridge 追加 `research-search` / `research-extract`。两条命令
+是只读外部研究入口：Search 固定 basic、默认 5 条且上限 8 条；Extract 要求问题和
+1–3 个显式公开 URL、每来源默认 2 个且上限 3 个片段。二者只写独立研究账本，
+不自动学习用户偏好或把网页证据送入推荐池。

@@ -3,10 +3,14 @@
 ## Scope
 
 NewsClaw is a single-user, local-only news recommendation system. Its four
-clients share one FastAPI process, one SQLite database, one five-layer profile,
-one recommendation pool, and one feedback ledger. No client can place trades,
-read browser cookies, scrape a news page, or publish the service to the public
-Internet by default.
+clients share one FastAPI process, one primary application SQLite database, one
+five-layer profile, one recommendation pool, and one feedback ledger. The
+optional Research lane keeps a separate `newsclaw_research.db` evidence ledger.
+No client can place trades,
+read browser cookies, directly scrape a news page, or publish the service to the
+public Internet by default. An explicit research request may ask Tavily to
+search the public web or extract evidence from 1–3 caller-supplied public URLs;
+that is a separate, bounded research lane rather than scheduled news ingestion.
 
 ## Runtime flow
 
@@ -36,6 +40,25 @@ Tushare news / major_news / cctv_news     Official or custom RSS/Atom
  open / like / dislike / ignore / read-later / save / search / chat
                                 |
         idempotent events -> profile ledger -> next recommendation
+```
+
+The on-demand research lane is deliberately separate:
+
+```text
+User or Agent question
+        |
+        v
+REST /api/research/* or Agent Bridge research-*
+        |
+        v
+ResearchService -> fresh local cache, or Tavily Search / Extract
+        |                                   |
+        +---------- bounded evidence + public source URLs
+                            |
+                            v
+                  newsclaw_research.db
+                            |
+                            +-- no automatic profile, discovery, or pool write
 ```
 
 ## Article contract
@@ -89,6 +112,34 @@ the next probe or refresh without restarting the service.
 The global refresh result reports every source outcome. It is `degraded` when
 one or more enabled sources fail, even when other sources succeed.
 
+## On-demand research contract
+
+Tavily is a `ResearchProvider`, not a `NewsSourceAdapter`. It is never placed in
+the Tushare/RSS refresh schedule and does not create news candidates by itself.
+
+- Search uses Tavily `basic` with `chunks_per_source=1`, defaults to five results and caps at eight.
+  Answer, raw-content, image and automatic-parameter fields are disabled.
+- Extract requires a research question and 1–3 explicit public HTTP(S) URLs.
+  It uses `basic`, defaults to two relevant chunks per source and caps at three.
+- Queries reject obvious email addresses, mobile numbers, local paths and
+  secrets before any network call. Extract rejects credentials in URLs,
+  localhost, private/loopback IPs and local/internal host suffixes.
+- Credentials live in the private NewsClaw credential file, with
+  `TAVILY_API_KEY` as the environment fallback. Status responses expose only
+  `configured`, `stored_locally`, `source` and a masked value. The key is used
+  only as an authorization header; it is never mixed into query/URL/evidence
+  text or shown back to any client.
+- Results are stored in `newsclaw_research.db` using `research_runs`,
+  `research_evidence` and `research_run_evidence`. Fresh-cache windows are 24
+  hours for general, 30 minutes for news and 15 minutes for finance; Extract
+  uses the general window. `refresh=true` bypasses freshness without rewriting
+  old evidence.
+
+Research evidence is external-world memory, not user memory. It cannot update
+the five-layer profile unless a later, separate user-confirmation workflow is
+explicitly designed. It also cannot flow into `discovery_candidates`,
+`content_cache`, the recommendation pool, saved items or feedback events.
+
 ## AI and evidence boundary
 
 LLM prompts receive an explicit evidence level. Title-only input must be
@@ -96,6 +147,12 @@ described as title-level information; the model cannot claim it read the full
 story. Explanations contain three named sections: why this fits the user,
 possible impact chain, and follow-up observation points. They are informational
 and must not contain buy/sell advice.
+
+Tavily results retain their source URL, provider request ID and local run ID.
+They are evidence fragments, not proof that every statement on the source page
+is true. A later model analysis must cite the returned URLs and distinguish
+quoted/source facts from its own inference. Provider answers are disabled so
+NewsClaw remains the owner of reasoning and provenance.
 
 Manual profile edits are an override layer above model inference. Inferred
 interests, avoidance hypotheses, awareness, and insights retain evidence,
@@ -106,12 +163,22 @@ confidence, lifecycle state, and deletion history.
 - Desktop Web retains the licensed interaction geometry for its top bar, left
   navigation, runtime and activity cards, spotlight hero, source filters,
   content library, profile, dialogue, messages, and seven settings categories.
+  Its Tavily card reads masked status and can save/delete the local key; its
+  “验证连接（不消耗搜索额度）” button posts to the local probe endpoint, whose
+  backend only calls Tavily's official `GET /usage`. It sends no Search query or
+  URL, creates no research run, consumes no search credit, and returns only the
+  redaction-safe `key_usage`, `key_limit`, `account_plan`, `plan_usage` and
+  `plan_limit` fields.
+  Phase 1 does not add a desktop research-question, result-list or history UI.
 - Mobile Web/PWA uses the same API and adds pull-to-refresh and explicit
-  online/degraded/offline state.
+  online/degraded/offline state. Phase 1 adds no Research controls and never
+  sends a Tavily credential to this client.
 - The browser extension is a display-only side-panel client. Its manifest has
   no news-site host permissions, content scripts, cookie access, or page hooks.
+  Phase 1 adds no Research control and never stores the Tavily credential.
 - DSH is a trailing grid column. Its plugin failure is isolated so Harness can
-  continue loading even if NewsClaw is unavailable.
+  continue loading even if NewsClaw is unavailable. Its research tools call the
+  local Agent Bridge and never hold the Tavily credential.
 
 All feedback writes carry stable `request_id`/`event_id` values. Duplicate
 clicks or retries return the original receipt and cannot teach twice.

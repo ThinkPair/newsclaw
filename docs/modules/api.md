@@ -270,3 +270,116 @@ NewsClaw 模式拒绝视频专属 `POST /api/init`，首次设置统一使用
 稍后读、历史与惊喜卡以 `article_id` 对外；新增持久幂等的
 `POST /api/notifications/ack`。精确状态码、重启语义和兼容入口见
 [NewsClaw 后端动作闭环审计](../newsclaw-backend-closure-matrix.md)。
+
+## NewsClaw Tavily 研究 API（2026-08-22）
+
+这组端点只在 NewsClaw 模式注册。Tavily 是用户/Agent 按需调用的研究提供方，不是
+定时新闻源；结果进入独立 `newsclaw_research.db`，不会自动写入画像、
+`discovery_candidates`、`content_cache` 或推荐池。完整模型与缓存合同见
+[Research 模块](research.md)。
+
+### Provider 状态与凭据
+
+| 方法 | 路径 | 请求 | 返回 |
+| --- | --- | --- | --- |
+| `GET` | `/api/research/providers/tavily` | 无 | `{provider, configured, stored_locally, source, masked}` |
+| `PUT` | `/api/research/providers/tavily/credential` | `{"api_key":"..."}` | `{ok:true, ...脱敏 provider 状态}` |
+| `DELETE` | `/api/research/providers/tavily/credential` | 无 | `{ok:true, ...删除后的脱敏 provider 状态}` |
+| `POST` | `/api/research/providers/tavily/probe` | 无 | `{ok:true, provider, key_usage, key_limit, account_plan, plan_usage, plan_limit}` |
+
+`source` 只可能是 `local | environment | none`。私有运行目录中的本地 Key 优先于
+`TAVILY_API_KEY` 环境变量；删除本地副本后，如环境变量仍存在，provider 仍显示
+`configured=true`、`source=environment`。GET、删除响应、错误和日志都不返回明文 Key。
+Key 只作为 Tavily 请求的 Authorization 鉴权值，不会混入 Search query、Extract URL
+或证据正文。
+
+写入值会先 trim，再要求长度 8–512 且不含空白字符；校验失败返回 `422`，不会覆盖
+已经保存的凭据。凭据文件采用合并更新，保存/删除 Tavily Key 不会覆盖 Tushare Token。
+
+桌面设置“验证连接（不消耗搜索额度）”调用本机 probe 端点。后端只使用 Key 鉴权
+访问 Tavily 官方 `GET /usage`，用于验证网络、Key、权限与额度；它不发送 Search，
+不创建研究 run，也不消耗搜索 credit。成功响应仅投影脱敏的 Key/套餐用量与上限
+字段，不返回凭据；具体额度字段可能为空，取决于 Tavily 账户响应。
+
+### `POST /api/research/search`
+
+```json
+{
+  "query": "本周 AI 基础设施有哪些关键变化？",
+  "topic": "news",
+  "time_range": "week",
+  "max_results": 5,
+  "refresh": false
+}
+```
+
+- `query` 必填且不超过研究模块的输入上限；明显包含私人资料、密钥或本机路径时
+  fail closed。
+- `topic` 默认为 `general`，只接受 `general | news | finance`。
+- `time_range` 可省略，只接受 `day | week | month | year`。
+- `max_results` 默认为 5，范围 1–8。
+- `refresh=false` 优先回放同一规范请求的新鲜缓存；`true` 强制重新调用 provider，
+  但不会删除旧研究 run。
+
+上游调用固定使用 Tavily `basic` Search 与 `chunks_per_source=1`，并关闭 answer、
+raw content、图片和自动参数。
+
+### `POST /api/research/extract`
+
+```json
+{
+  "urls": [
+    "https://example.com/report-a",
+    "https://example.org/report-b"
+  ],
+  "query": "两份报告对未来一年算力供给的判断有什么异同？",
+  "chunks_per_source": 2,
+  "refresh": false
+}
+```
+
+- `query` 必填，使用与 Search 相同的隐私检查。
+- `urls` 为 1–3 个显式公开 `http(s)` URL；拒绝账号密码、localhost、内网/环回
+  地址和本地主机后缀，并移除 fragment。
+- `chunks_per_source` 默认为 2，范围 1–3；上游固定使用 Tavily `basic` Extract，
+  不返回图片。
+- 该端点不会读取浏览器 Cookie，也不会从一个入口自动爬取整站。
+
+### 统一响应
+
+两条研究端点都返回：
+
+```json
+{
+  "run_id": "...",
+  "operation": "search",
+  "query": "...",
+  "provider": "tavily",
+  "provider_request_id": "...",
+  "cache_hit": false,
+  "fresh_until": "...",
+  "topic": "news",
+  "time_range": "week",
+  "result_count": 1,
+  "credits_used": 1,
+  "evidence": [
+    {
+      "url": "https://example.com/article",
+      "title": "...",
+      "content": "...",
+      "source_domain": "example.com",
+      "published_at": "...",
+      "score": 0.9
+    }
+  ]
+}
+```
+
+`cache_hit=true` 时不会再次调用 Tavily。默认 TTL 为 general 24 小时、news 30 分钟、
+finance 15 分钟；Extract 使用 general 的 24 小时缓存窗口。`provider_request_id` 和
+`credits_used` 仅反映 provider 已返回的可用信息。Tavily 未配置、限流、权限失败、
+超时或响应不可用时返回明确错误，错误正文不透传 provider 原始响应或凭据。
+
+研究输入通过两层校验：Pydantic 形状/范围失败以及研究隐私/公开 URL 校验返回
+`422`；未配置 Tavily 返回 `409`；Tavily 权限、限流、超时或响应错误统一映射为
+`502`，只保留可安全展示的原因。

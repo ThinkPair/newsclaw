@@ -294,6 +294,33 @@ uv run python -m openbiliclaw.integrations.openclaw.cli chat \
 uv run python -m openbiliclaw.integrations.openclaw.cli recommend --limit 3
 ```
 
+### 3A. NewsClaw 模式按需补充外部证据
+
+只有用户明确要查互联网或核对指定公开网页时才调用；它不会自动改变画像或推荐池：
+
+Search payload：
+
+```json
+{
+  "command": "research-search",
+  "argv": ["--query", "本周 AI 基础设施有哪些关键变化？", "--topic", "news", "--time-range", "week", "--max-results", "5"]
+}
+```
+
+Extract payload：
+
+```json
+{
+  "command": "research-extract",
+  "argv": ["--query", "这两份报告的主要分歧是什么？", "--url", "https://example.com/a", "--url", "https://example.com/b", "--chunks-per-source", "2"]
+}
+```
+
+把 payload 交给运行中 NewsClaw 的 `POST /api/agent-bridge`；DSH 对应工具会自动
+调用该入口。两条命令都可在 `argv` 加 `--refresh` 绕过新鲜缓存。Search 默认 basic/5 条且最多 8 条；
+Extract 只接受 1–3 个公开 HTTP(S) URL。Tavily Key 只在 NewsClaw 本机设置中配置，
+不要交给 Agent 宿主、写入 workspace 或放在命令参数里。
+
 ### 4. 写反馈
 
 ```bash
@@ -362,6 +389,7 @@ uv run python -m openbiliclaw.integrations.openclaw.cli sync-account
 6. 把 `doctor` 当成接线排障入口，而不是日常业务命令
 7. 写操作使用稳定 `request_id`；native save 必须携带显式授权
 8. 使用 `capabilities` / `emit-skill-descriptors` 发现能力，不要依赖过时文档中的旧列表
+9. Research 只在用户明确需要外部证据时调用，并保留返回 URL；不要把搜索结果自动写成用户偏好
 
 ## 常见问题
 

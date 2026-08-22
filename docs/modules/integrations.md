@@ -32,10 +32,10 @@ OpenClaw bootstrap 与 API/CLI production composition 使用同一组近期供�
 | OpenClaw bootstrap | ✅ | `build_openclaw_adapter_services()` 初始化 database/memory 后立刻用 canonical available 配置共享 LLM gate，再构造任何可调用 provider 的 service；构造 `SoulEngine` 时与 API runtime 一样透传 canonical `database`、`[soul.preference].satisfaction_filter_enabled`，以及 task-scoped `preference_prompt_view / awareness_prompt_view / insight_prompt_view`（默认 `legacy / compact-v1 / legacy`）；其中 Awareness 值只控制 `soul.awareness_confusions`，普通 `soul.awareness` 固定 `legacy`，避免 integration 面使用分裂的持久化、满意度过滤或 cognition rollout 语义；暴露 adapter 前同步调用 controller 的幂等 `run_startup_maintenance()`。OpenClaw direct adapter 不启动 daemon `run_forever()`，因此不 attach `CandidateEvalCoordinator` 或 `ExpressionCopyCoordinator`、不把 producer 标为 coordinator-owned；`recommend(refresh_if_needed=True)` 专用 controller 把首轮 source supply 与 inline claim 固定限制为 4（fetch oversample=1、min eval batch=4、inline evaluator=1），后续调用再继续补货。每次 durable admission 会在同一请求内 await `RecommendationEngine.drain_pending_expression_copy(profile, limit=4, max_extra_requests=0)`：首 batch 的有效 subset 立刻成为 canonical available，未完成行保持 pending 由下一请求续补，避免在 45 秒交互窗口内递归拆分；若该 subset 非空且推荐历史为空，`recommend(refresh_if_needed=True)` 会直接 serve 已复制 pool。若首 batch 全部无效，本次仍可能返回空池并由后续请求重试。该首批限制是 bootstrap 内部策略，不新增 `config.toml` 字段，API daemon 的 coordinator、每轮 60 条 copy drain 与 4× supply oversample 保持不变。 |
 | OpenClaw 近期供给接线 | ✅ | bootstrap 构造 `SearchStrategy` 时显式注入共享 `RECENT_SUPPLY_LANE_QUERIES=1` 与 `RECENT_SUPPLY_LANE_PAGE_SIZE=5`；与 API/CLI 使用同一有界 `pubdate` lane，避免 direct adapter 因 composition 漏接而失去近期供给。 |
 | OpenClaw 视觉预热配置 | ✅ | bootstrap 构造 `RecommendationEngine` 时透传视觉画像、关键帧 / 弹幕开关、采样帧数、两个 fetch limit、摘要长度和共享 `BilibiliAPIClient`；默认关闭路径保持 no-op，配置模型切换后的 provenance 重建仍由引擎负责 |
-| Agent Bridge adapter operations | ✅ | 已提供 `sync_account / get_profile / recommend / reshuffle / append_recommendations / submit_feedback / get_delight / respond_delight / get_runtime_status / get_activity_feed / get_platform_availability / chat / get_chat_history / profile edit / probe feedback / saved-list operations`；chat 仍显式固定为 `legacy_direct`，但新增 durable `turn_id`，不提交 API runtime 的 queue、也不持有 worker guard permit。失败转为携带安全 LLM 分类文案的 `AdapterOperationError`，不暴露原始上游细节。 |
+| Agent Bridge adapter operations | ✅ | 已提供 `sync_account / get_profile / recommend / reshuffle / append_recommendations / submit_feedback / get_delight / respond_delight / get_runtime_status / get_activity_feed / get_platform_availability / chat / get_chat_history / profile edit / probe feedback / saved-list operations`；NewsClaw runtime 另在 CLI bridge 路由只读的 `research-search / research-extract`。chat 仍显式固定为 `legacy_direct`，但新增 durable `turn_id`，不提交 API runtime 的 queue、也不持有 worker guard permit。失败转为携带安全 LLM 分类文案的 `AdapterOperationError`，不暴露原始上游细节。 |
 | 推荐消费后的 durable inventory 同步 | ✅ | API 与 OpenClaw composition 都给真实 `RecommendationEngine` 注入 post-commit callback；独立 serve DB worker 把 recommendation + shown 在同一短事务提交成功后，callback 直接携带 `pool_counts_after` 更新共享 gate，不再同步重读共享连接。写失败不触发 callback，callback 失败也不改写 durable 提交结果；API 另在响应关键路径外读取精确 canonical snapshot 收敛广播。 |
 | Agent capability manifest | ✅ | `get_capabilities` / `capabilities` 返回 `agent-bridge/v2`、宿主兼容名和完整 skill 名称；`skill.py` 是唯一注册表，防止核心功能只进 HTTP/UI 而漏进 Agent |
-| Agent skill descriptors | ✅ | 已提供协议中立的 24 个 descriptor 与 async handler；OpenClaw 前缀保留为兼容命名 |
+| Agent skill descriptors | ✅ | 基础 adapter 保持协议中立的 24 个 descriptor 与 async handler；NewsClaw runtime 在 `capabilities` 中追加 2 个研究能力名，DSH 以自己的工具 descriptor 映射对应 Bridge 命令 |
 | Agent CLI bridge | ✅ | 已提供 `python -m openbiliclaw.integrations.openclaw.cli`，输出稳定 JSON；Hermes / WorkBuddy 可直接复用该命令或从 `integrations.agent` 导入别名 |
 | Agent 主动探针闭环 | ✅ | 可拉取/响应 `interest.probe` 与 `avoidance.probe` 的 confirm/reject/defer/chat；`listen` 默认转发 delight、兴趣和避雷的候选及结果事件 |
 | Workspace skill pack | ✅ | 仓库根目录新增 `skills/openbiliclaw-adapter/SKILL.md`，可被 OpenClaw 直接发现 |
@@ -145,6 +145,8 @@ skills = build_openclaw_skills(adapter)
 - `openbiliclaw_get_profile_edit_state`, `openbiliclaw_edit_profile`
 - `openbiliclaw_save_local`, `openbiliclaw_remove_saved`, `openbiliclaw_list_saved`,
   `openbiliclaw_sync_saved`
+- `newsclaw_search_web`, `newsclaw_extract_evidence`（由 NewsClaw runtime 动态加入
+  `capabilities`，DSH 工具映射到 `research-search` / `research-extract`）
 
 ### 通过 CLI bridge 调用
 
@@ -198,6 +200,21 @@ CLI bridge 返回稳定 JSON：
 - `respond-interest-probe` 和 `respond-avoidance-probe` 都支持 `confirm|reject|defer|chat`；`defer` 会返回 snooze 时间和次数，`chat` 会进入带主题上下文的对话
 - `respond-avoidance-probe --response confirm|reject|defer|chat` 中，`confirm` 写入不喜欢方向并触发候选池清理，`reject` 只进入冷却
 - `save-local` / `list-saved` / `remove-saved` 只操作本地 membership；`sync-saved` 必须显式传 `--allow-state-changing`，避免 Agent 误写外部账号
+- `research-search` / `research-extract` 是 NewsClaw 的按需研究入口；两者只写
+  `newsclaw_research.db`，`--refresh` 只绕过新鲜缓存，不产生画像学习或推荐动作
+
+Research 命令需要运行中的 NewsClaw 注入 `NewsRuntime`，因此通过
+`POST /api/agent-bridge`（或 DSH 对应工具）调用：
+
+```json
+{
+  "command": "research-search",
+  "argv": ["--query", "本周 AI 基础设施有哪些关键变化？", "--topic", "news", "--time-range", "week"]
+}
+```
+
+直接 cold-start 执行同名 Python 模块子命令不会构造 NewsRuntime，并会如实返回
+operation error。
 
 ### Workspace Skill Pack
 

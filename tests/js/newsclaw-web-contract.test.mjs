@@ -22,6 +22,32 @@ test("desktop keeps the OpenBiliClaw shell while exposing news semantics", async
   assert.doesNotMatch(html, /阿B|你的本地全网推荐入口|Bangumi|B\s*站|bilibili\.com/);
 });
 
+test("desktop exposes write-only Tavily research credentials with an explicit privacy boundary", async () => {
+  const [html, js] = await Promise.all([
+    read("src/openbiliclaw/web/desktop/index.html"),
+    read("src/openbiliclaw/web/desktop/assets/js/app.js"),
+  ]);
+  for (const id of [
+    "newsTavilyApiKey",
+    "newsTavilyApiKeyStatus",
+    "newsSaveTavilyApiKeyBtn",
+    "newsDeleteTavilyApiKeyBtn",
+    "newsProbeTavilyBtn",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /Tavily 按需研究（不是新闻源）/);
+  assert.match(html, /查询和公开 URL 会发送给 Tavily/);
+  assert.match(html, /研究查询或 URL 中不得包含私人资料或任何凭据/);
+  assert.match(html, /API Key 仅保存在本机后端，调用 Tavily 时只用于鉴权/);
+  assert.match(html, /不会混入研究查询正文，也不会在页面展示或回显/);
+  assert.match(html, /验证连接（不消耗搜索额度）/);
+  assert.match(js, /"\/research\/providers\/tavily\/credential"/);
+  assert.match(js, /"\/research\/providers\/tavily\/probe"/);
+  assert.match(js, /JSON\.stringify\(\{ api_key: apiKey \}\)/);
+  assert.doesNotMatch(js, /localStorage[^\n]*Tavily|storageSet[^\n]*apiKey/i);
+});
+
 test("desktop surprise hero stays bounded for long news copy", async () => {
   const css = await read("src/openbiliclaw/web/desktop/assets/css/app.css");
   assert.match(css, /@media \(min-width: 821px\)[\s\S]*?\.delight\s*\{[\s\S]*?height:\s*380px;[\s\S]*?max-height:\s*380px;/);

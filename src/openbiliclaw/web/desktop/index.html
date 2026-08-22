@@ -428,6 +428,17 @@
             <span id="newsTushareTokenStatus" class="settings-probe-status" aria-live="polite">正在读取配置状态…</span>
           </div>
 
+          <article class="source-card news-source-card" data-research-provider="tavily">
+            <div class="source-card-face">
+              <span class="source-card-logo" aria-hidden="true">研</span>
+              <span class="source-card-head"><strong class="source-card-name">Tavily 按需研究（不是新闻源）</strong><span class="source-status-badges"><span class="source-source-badge">外部研究服务</span></span><p class="src-detail">只有主动研究时才调用。查询和公开 URL 会发送给 Tavily；研究查询或 URL 中不得包含私人资料或任何凭据。下方 API Key 仅保存在本机后端，调用 Tavily 时只用于鉴权，不会混入研究查询正文，也不会在页面展示或回显。</p><span id="newsTavilyApiKeyStatus" class="source-card-hint-slot" aria-live="polite">正在读取配置状态…</span></span>
+            </div>
+            <div class="news-source-frequency news-source-custom">
+              <label class="settings-field full"><span>Tavily API Key（已配置可留空）</span><input id="newsTavilyApiKey" type="password" autocomplete="new-password" placeholder="输入新 API Key 后点保存；页面不会回显原值"></label>
+              <div class="news-source-actions"><button class="pill-btn" id="newsSaveTavilyApiKeyBtn" type="button">保存 API Key</button><button class="pill-btn" id="newsDeleteTavilyApiKeyBtn" type="button">删除本机 Key</button><button class="pill-btn" id="newsProbeTavilyBtn" type="button">验证连接（不消耗搜索额度）</button></div>
+            </div>
+          </article>
+
           <div id="newsSourceStatusList" class="source-card-list news-source-card-list" aria-live="polite">
             <article class="source-card news-source-card" data-news-source="tushare_news">
               <div class="source-card-face">

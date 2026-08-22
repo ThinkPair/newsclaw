@@ -42,6 +42,9 @@ from openbiliclaw.news.protocol import FetchWindow, NewsSourceAdapter
 from openbiliclaw.news.reliability import RetryPolicy, SourceRunner, SourceTaskStore
 from openbiliclaw.news.rss import RSSAdapter
 from openbiliclaw.news.tushare import TushareNewsAdapter
+from openbiliclaw.research.routes import register_research_routes
+from openbiliclaw.research.service import ResearchService
+from openbiliclaw.research.store import ResearchStore
 from openbiliclaw.sources.event_format import build_event
 
 if TYPE_CHECKING:
@@ -396,6 +399,10 @@ class NewsRuntime:
         self.apply_runtime_settings_callback = apply_runtime_settings
         self.settings_store = NewsSettingsStore(data_path / "newsclaw_sources.json")
         self.credentials_path = data_path / "newsclaw_credentials.json"
+        self.research_service = ResearchService(
+            store=ResearchStore(data_path / "newsclaw_research.db"),
+            api_key_provider=self._tavily_api_key,
+        )
         self.task_store = SourceTaskStore(data_path / "newsclaw_source_tasks.db")
         self.command_ledger = SQLiteIdempotencyLedger(data_path / "newsclaw_commands.db")
         self.bootstrap_state_path = data_path / "newsclaw_bootstrap.json"
@@ -421,14 +428,38 @@ class NewsRuntime:
             ),
         )
 
-    def _local_tushare_token(self) -> str:
+    def _load_credentials(self) -> dict[str, object]:
         try:
             payload = json.loads(self.credentials_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return ""
+            return {}
         if not isinstance(payload, dict):
-            return ""
-        return str(payload.get("tushare_token") or "").strip()
+            return {}
+        return {str(key): value for key, value in payload.items()}
+
+    def _local_credential(self, key: str) -> str:
+        return str(self._load_credentials().get(key) or "").strip()
+
+    def _set_local_credential(self, key: str, value: str) -> None:
+        credentials = self._load_credentials()
+        credentials[key] = value
+        NewsSettingsStore._atomic_write(self.credentials_path, credentials)
+        with suppress(OSError):
+            self.credentials_path.chmod(0o600)
+
+    def _clear_local_credential(self, key: str) -> None:
+        credentials = self._load_credentials()
+        credentials.pop(key, None)
+        if credentials:
+            NewsSettingsStore._atomic_write(self.credentials_path, credentials)
+            with suppress(OSError):
+                self.credentials_path.chmod(0o600)
+            return
+        with suppress(FileNotFoundError):
+            self.credentials_path.unlink()
+
+    def _local_tushare_token(self) -> str:
+        return self._local_credential("tushare_token")
 
     def _tushare_token(self) -> str:
         # A token explicitly saved from the NewsClaw UI is the local product's
@@ -448,16 +479,43 @@ class NewsRuntime:
         )
         if invalid:
             raise ValueError("Tushare Token 格式无效")
-        NewsSettingsStore._atomic_write(
-            self.credentials_path,
-            {"tushare_token": normalized},
-        )
-        with suppress(OSError):
-            self.credentials_path.chmod(0o600)
+        self._set_local_credential("tushare_token", normalized)
 
     def clear_tushare_token(self) -> None:
-        with suppress(FileNotFoundError):
-            self.credentials_path.unlink()
+        self._clear_local_credential("tushare_token")
+
+    def _local_tavily_api_key(self) -> str:
+        return self._local_credential("tavily_api_key")
+
+    def _tavily_api_key(self) -> str:
+        # The local NewsClaw credential wins; the environment remains a
+        # non-persisted fallback for scripted and migrated installations.
+        return self._local_tavily_api_key() or os.environ.get("TAVILY_API_KEY", "").strip()
+
+    def set_tavily_api_key(self, api_key: str) -> None:
+        normalized = api_key.strip()
+        invalid = (
+            len(normalized) < 8
+            or len(normalized) > 512
+            or any(char.isspace() for char in normalized)
+        )
+        if invalid:
+            raise ValueError("Tavily API Key 格式无效")
+        self._set_local_credential("tavily_api_key", normalized)
+
+    def clear_tavily_api_key(self) -> None:
+        self._clear_local_credential("tavily_api_key")
+
+    def tavily_credential_status(self) -> dict[str, object]:
+        local = bool(self._local_tavily_api_key())
+        configured = bool(self._tavily_api_key())
+        return {
+            "provider": "tavily",
+            "configured": configured,
+            "stored_locally": local,
+            "source": "local" if local else "environment" if configured else "none",
+            "masked": "••••••••" if configured else "",
+        }
 
     def _tushare_client(self) -> Any | None:
         token = self._tushare_token()
@@ -1311,6 +1369,7 @@ def register_newsclaw_routes(
         apply_runtime_settings=apply_runtime_settings,
     )
     app.state.newsclaw_runtime = runtime
+    register_research_routes(app, runtime=runtime)
 
     @app.on_event("startup")
     async def _start_newsclaw_runtime() -> None:

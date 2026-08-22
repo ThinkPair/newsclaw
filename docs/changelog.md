@@ -17,6 +17,7 @@
 
 ## 未发布
 
+- **NewsClaw 本机受控 Tavily Research MVP**：新增按需 Search/Extract、独立 `newsclaw_research.db` 证据账本与 general 24h / news 30m / finance 15m TTL 缓存。Search 固定 basic 与 `chunks_per_source=1`、默认 5 条且上限 8 条，关闭 answer/raw content/images/auto parameters；Extract 要求问题和 1–3 个显式公开 HTTP(S) URL，basic 模式每来源默认 2、上限 3 个片段。新增 Tavily 凭据状态/本机写入删除、`/api/research/providers/tavily/probe`、`/api/research/search`、`/api/research/extract`，以及 Agent Bridge `research-search` / `research-extract`；桌面设置卡片明确标为“不是新闻源”，可查看脱敏状态、保存/删除 Key，并通过本机 probe 调用 Tavily 官方 `GET /usage` 验证连接和额度，不发送 Search、不消耗搜索 credit，只返回脱敏的 `key_usage` / `key_limit` / `account_plan` / `plan_usage` / `plan_limit`。Phase 1 研究交互只开放 DSH Agent 工具与后端 REST；桌面无研究问题/结果 UI，手机/PWA 和浏览器扩展无研究按钮且不持有 Key。Key 仅留在私有 runtime 或 `TAVILY_API_KEY` 环境回退。研究结果只作为带 URL 的外部证据，不自动写画像、新闻候选或推荐池。
 - **私有源码备份安全边界**：GitHub 源码快照不包含视觉验收截图、本地调试证据、运行数据和机器路径；视觉 QA 文档只保留可复核的视口、方法与结论，避免把真实画像、活动记录或推荐内容带入源码历史。专业密钥扫描命中的文档示例、测试假值与上游公开匿名客户端标识均已逐行说明，不使用整文件或整目录豁免。
 - **移动端新闻原生闭环**：共享 URL 投影在新闻或普通网页条目缺少原文地址时不再把兼容内容 ID 拼成 B 站视频链接；显式原文地址照常打开，旧 B 站视频回退保持兼容。移动画像中的“UP/UP主”用户文案统一为“媒体/记者”。
 - 数据隔离边界：NewsClaw 模式的待发通知、30 天内容历史、收藏 / 稍后读（含兼容列表与状态查询）和活动流只投影 `news` 内容；分页游标与总数在过滤后计算，旧视频行不会造成首屏假空。新闻爪迁移包新增产品标记，导入时 fail-closed 拒绝未标记的 OpenBiliClaw 包，避免把旧视频行为与画像带入新闻产品；普通 OpenBiliClaw 模式保持原查询和迁移兼容行为。
@@ -26,7 +27,7 @@
 - **独立产品品牌与更新边界**：桌面顶部移除上游 GitHub 入口与 Star 数，改为本地“关于新闻爪”；NewsClaw 模式不再查询上游项目统计，也拒绝从其他产品的 Release 通道检查或应用更新。浏览器扩展商店元数据、首次设置、手机端与断线提示统一使用 NewsClaw 的独立定位；许可证与技术来源仍完整保留在 LICENSE / NOTICE。
 - **配置真值校正**：来源权重、单源频率与旧视频高级功能尚未接入新闻运行时，桌面端已移除这些误导控件及“搜索词生成模式”；保存其他真实配置时只原样传回旧配置快照，不再伪造开关值或覆写 legacy OpenBiliClaw 兼容配置。搜索改名为“筛选当前已加载推荐”；调度检查统一使用分钟；探索与热门同时到期时优先执行超期更久的通道。
 - **Tushare 本机凭据**：首次设置和桌面新闻源页改走独立凭据接口，Token 只保存在私有运行目录、页面只显示脱敏状态；保存后下一次来源验证或刷新立即使用，环境变量继续作为兼容回退。
-- **DSH 设置真值**：侧栏设置页只读取新闻运行状态、来源健康和插件连接；完整业务配置统一打开电脑端，删除对旧配置接口的假写入，插件界面与 22 个工具共用同一 `apiUrl` / `timeoutMs`。
+- **DSH 设置真值**：侧栏设置页只读取新闻运行状态、来源健康和插件连接；完整业务配置统一打开电脑端，删除对旧配置接口的假写入，插件界面与 24 个工具共用同一 `apiUrl` / `timeoutMs`（其中两项为按需 Research）。
 - **四端用户操作闭环**：桌面端把 RSS 改为逐媒体独立卡片并只提交真实差异；首次设置真实探测并保存 AI、验证新闻源，再通过幂等 `/api/news/bootstrap` 建立新闻画像与首批推荐；推荐接口在新闻模式下强制过滤非新闻记录；桌面与手机收藏明确为本机内容库，不再伪装平台同步；手机二维码在正式服务仅监听 `127.0.0.1` 时拒绝生成和复制。可追溯控件矩阵与剩余 E2E 限制见 [新闻爪用户操作闭环矩阵](newsclaw-ui-control-closure.md)。
 
 ## v0.3.207：补货提速与搜索后端升级（2026-08-15）

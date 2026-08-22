@@ -899,3 +899,131 @@ def test_newsclaw_saved_aliases_map_article_identity(capsys) -> None:
     remove_payload = json.loads(capsys.readouterr().out)
     assert remove_payload["data"]["article_id"] == "na_1"
     assert adapter.removed_request.item_key == "news:na_1"
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_research_commands_require_runtime_and_forward_bounded_flags() -> None:
+    from typing import cast
+
+    from openbiliclaw.integrations.openclaw.cli import _build_parser, _run_command
+    from openbiliclaw.research.models import (
+        ResearchEvidence,
+        ResearchOperation,
+        ResearchResult,
+    )
+
+    class ResearchService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def search(self, **kwargs: object) -> ResearchResult:
+            self.calls.append(("search", dict(kwargs)))
+            return self._result("search")
+
+        async def extract(self, **kwargs: object) -> ResearchResult:
+            self.calls.append(("extract", dict(kwargs)))
+            return self._result("extract")
+
+        @staticmethod
+        def _result(operation: str) -> ResearchResult:
+            return ResearchResult(
+                run_id="rrun_cli",
+                operation=cast("ResearchOperation", operation),
+                query="question",
+                provider="tavily",
+                provider_request_id="provider-cli",
+                cache_hit=False,
+                fresh_until="2026-08-23T00:00:00+00:00",
+                topic="general",
+                time_range="",
+                evidence=(
+                    ResearchEvidence(
+                        url="https://example.com/a",
+                        title="Evidence",
+                        content="Public evidence",
+                        source_domain="example.com",
+                    ),
+                ),
+            )
+
+    parser = _build_parser()
+    service = ResearchService()
+    runtime = SimpleNamespace(research_service=service)
+    search_args = parser.parse_args(
+        [
+            "research-search",
+            "--query",
+            "question",
+            "--topic",
+            "finance",
+            "--time-range",
+            "month",
+            "--max-results",
+            "6",
+            "--refresh",
+        ]
+    )
+    extract_args = parser.parse_args(
+        [
+            "research-extract",
+            "--query",
+            "question",
+            "--url",
+            "https://example.com/a",
+            "--url",
+            "https://example.com/b",
+            "--chunks-per-source",
+            "3",
+        ]
+    )
+
+    search = await _run_command(search_args, object(), news_runtime=runtime)
+    extract = await _run_command(extract_args, object(), news_runtime=runtime)
+    unavailable = await _run_command(search_args, object(), news_runtime=None)
+
+    assert search["data"]["result_count"] == 1  # type: ignore[index]
+    assert extract["data"]["operation"] == "extract"  # type: ignore[index]
+    assert service.calls == [
+        (
+            "search",
+            {
+                "query": "question",
+                "topic": "finance",
+                "time_range": "month",
+                "max_results": 6,
+                "refresh": True,
+            },
+        ),
+        (
+            "extract",
+            {
+                "urls": ["https://example.com/a", "https://example.com/b"],
+                "query": "question",
+                "chunks_per_source": 3,
+                "refresh": False,
+            },
+        ),
+    ]
+    assert unavailable == {
+        "ok": False,
+        "error": "NewsClaw research is available only while the NewsClaw runtime is running.",
+        "error_type": "operation_error",
+    }
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_capabilities_include_research_only_with_runtime() -> None:
+    from openbiliclaw.integrations.openclaw.cli import _build_parser, _run_command
+
+    args = _build_parser().parse_args(["capabilities"])
+    without_runtime = await _run_command(args, _FakeCliAdapter())
+    with_runtime = await _run_command(
+        args,
+        _FakeCliAdapter(),
+        news_runtime=SimpleNamespace(research_service=object()),
+    )
+
+    assert "newsclaw_search_web" not in without_runtime["data"]["skill_names"]  # type: ignore[index]
+    assert "newsclaw_extract_evidence" not in without_runtime["data"]["skill_names"]  # type: ignore[index]
+    assert "newsclaw_search_web" in with_runtime["data"]["skill_names"]  # type: ignore[index]
+    assert "newsclaw_extract_evidence" in with_runtime["data"]["skill_names"]  # type: ignore[index]

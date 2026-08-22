@@ -11680,6 +11680,99 @@ ${cardFeedbackBarHtml()}`;
       }
     }
 
+    async function refreshTavilyCredentialStatus() {
+      const status = $("#newsTavilyApiKeyStatus");
+      if (!status) return null;
+      try {
+        const payload = await requestJsonStrict("/research/providers/tavily", { timeoutMs: 15000 });
+        status.textContent = payload?.configured
+          ? `已配置${payload?.stored_locally ? "（新闻爪本机凭据）" : "（启动环境）"}`
+          : "尚未配置；按需研究不可用";
+        status.dataset.tone = payload?.configured ? "success" : "";
+        return payload;
+      } catch (error) {
+        status.textContent = `读取失败：${error?.message || "请检查本机后端"}`;
+        status.dataset.tone = "error";
+        return null;
+      }
+    }
+
+    async function saveTavilyCredential() {
+      const input = $("#newsTavilyApiKey");
+      const button = $("#newsSaveTavilyApiKeyBtn");
+      const status = $("#newsTavilyApiKeyStatus");
+      const apiKey = String(input?.value || "").trim();
+      if (!apiKey) {
+        if (status) status.textContent = "没有输入新 API Key，现有凭据未改变。";
+        return;
+      }
+      if (button) button.disabled = true;
+      if (status) status.textContent = "正在安全保存…";
+      try {
+        await requestJsonStrict("/research/providers/tavily/credential", {
+          method: "PUT",
+          timeoutMs: 20000,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: apiKey }),
+        });
+        input.value = "";
+        settingsDirtyFields.delete(input.id);
+        renderSettingsDirty();
+        if (status) status.textContent = "已保存到新闻爪本机；页面不会回显原值。";
+        await refreshTavilyCredentialStatus();
+      } catch (error) {
+        if (status) status.textContent = `保存失败：${error?.message || "请检查 API Key 格式"}`;
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
+    async function deleteTavilyCredential() {
+      const button = $("#newsDeleteTavilyApiKeyBtn");
+      const status = $("#newsTavilyApiKeyStatus");
+      if (button) button.disabled = true;
+      if (status) status.textContent = "正在删除本机 Key…";
+      try {
+        const payload = await requestJsonStrict("/research/providers/tavily/credential", {
+          method: "DELETE",
+          timeoutMs: 20000,
+        });
+        if (status) {
+          status.textContent = payload?.configured
+            ? "本机 Key 已删除，启动环境中的 Key 仍在生效。"
+            : "本机 Key 已删除，按需研究已停用。";
+        }
+        await refreshTavilyCredentialStatus();
+      } catch (error) {
+        if (status) status.textContent = `删除失败：${error?.message || "请检查本机后端"}`;
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
+    async function probeTavilyProvider() {
+      const button = $("#newsProbeTavilyBtn");
+      const status = $("#newsTavilyApiKeyStatus");
+      if (button) button.disabled = true;
+      if (status) status.textContent = "正在通过 Tavily 用量接口验证；不会发起搜索…";
+      try {
+        const payload = await requestJsonStrict("/research/providers/tavily/probe", {
+          method: "POST",
+          timeoutMs: 30000,
+        });
+        if (status) {
+          const usage = Number.isFinite(Number(payload?.key_usage)) && Number.isFinite(Number(payload?.key_limit))
+            ? ` Key 用量 ${payload.key_usage}/${payload.key_limit}。`
+            : "";
+          status.textContent = payload?.ok ? `Tavily 连接正常。${usage}` : "Tavily 未返回可用状态。";
+        }
+      } catch (error) {
+        if (status) status.textContent = `验证失败：${error?.message || "请检查 Key 或额度"}`;
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
     async function runNewsRefresh(mode) {
       const status = $("#newsSourceActionStatus");
       const validateButton = $("#newsValidateSourcesBtn");
@@ -11722,6 +11815,9 @@ ${cardFeedbackBarHtml()}`;
     $("#newsValidateSourcesBtn")?.addEventListener("click", () => void runNewsRefresh("validate"));
     $("#newsRefreshNowBtn")?.addEventListener("click", () => void runNewsRefresh("refresh"));
     $("#newsSaveTushareTokenBtn")?.addEventListener("click", () => void saveTushareCredential());
+    $("#newsSaveTavilyApiKeyBtn")?.addEventListener("click", () => void saveTavilyCredential());
+    $("#newsDeleteTavilyApiKeyBtn")?.addEventListener("click", () => void deleteTavilyCredential());
+    $("#newsProbeTavilyBtn")?.addEventListener("click", () => void probeTavilyProvider());
     restoreBackendEndpoint();
     restoreFrontendSettings();
     setSideDrawerOpen(!isMobileViewport() && storageGet(SIDE_DRAWER_OPEN_KEY) !== "0", { persist: false });
@@ -11744,4 +11840,5 @@ ${cardFeedbackBarHtml()}`;
     void startDesktopBackendSession({ forceHydrate: true });
     void refreshNewsSourceContracts();
     void refreshTushareCredentialStatus();
+    void refreshTavilyCredentialStatus();
     })();

@@ -31,6 +31,8 @@ skills = build_agent_skills(adapter)
 - 画像与对话：画像摘要、完整 overlay 编辑状态、确定性编辑、带 durable `turn_id` 的 Socratic chat 和历史读取。
 - 运行态：runtime status、activity feed、平台库存可用量、账号同步。
 - 本地保存：local-first favorite/watch-later membership；native sync 是单独的、必须显式授权的动作。
+- NewsClaw 按需研究：`research-search` 检索少量公开证据，`research-extract` 从 1–3 个
+  显式公开 URL 提取问题相关片段；两者共用本机 TTL 缓存和证据账本。
 - 主动推送：`listen` 默认监听 delight、兴趣和避雷候选及结果事件。
 
 ## 写操作边界
@@ -43,6 +45,12 @@ API 或浏览器扩展 broker 的外部账号写入，只有用户明确授权�
 Agent chat 保留 CLI/OpenClaw 的 `legacy_direct` 学习所有权，以兼容旧宿主；它不会接管 API
 runtime 的 settlement queue 或 worker guard。若数据库支持 `chat_turns`，adapter 会先写
 pending，再完成或失败，并在重试时复用已完成的 `turn_id`。
+
+Research 是只读外部能力：Agent 宿主只把有界 query/URL 参数交给本机后端，不能读取、
+保存或传递 `TAVILY_API_KEY`。研究结果只进入 `newsclaw_research.db`，不得因为一次搜索
+自动修改用户画像、收藏、候选池或推荐池。`refresh` 只表示绕过本地新鲜缓存。
+这两个能力只有运行中 NewsClaw 注入 `NewsRuntime` 时才会出现在 `capabilities`；
+Phase 1 的调用面是 DSH 工具或 `/api/agent-bridge`，不是 cold-start 独立 CLI。
 
 ## 新功能同步清单
 

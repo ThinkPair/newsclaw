@@ -34,6 +34,11 @@ Agent hosts (OpenClaw / Hermes / WorkBuddy)
         → integrations.agent alias / integrations.openclaw compatibility adapter
         → existing runtime / soul / recommendation / saved_sync owners
 
+NewsClaw explicit research (REST / Agent Bridge)
+        → ResearchService → fresh SQLite cache, or Tavily Search / Extract
+        → bounded evidence + source URL → newsclaw_research.db
+        └─ no automatic write to profile / discovery candidates / recommendation pool
+
 migration control plane (real loopback; browser calls also require same origin)
                 ├─ export → config minus api.auth + online SQLite snapshot + portable files → checksummed plaintext .obcbackup
                 ├─ import(request_id) → bounded validation → private pending stage ↔ status / cancel
@@ -140,7 +145,7 @@ candidate evaluation → effective profile view + exact tail-recall pool + negat
 ```
 
 1. **用户交互层** — Chrome / Firefox 插件负责受支持站点的普通行为采集、登录态只读任务与侧边栏；Linux.do / V2EX / 微博使用隔离任务 tab，微博普通页面不做行为采集。插件与移动 Web（`/m`）、桌面 Web（`/web`）共用本地 API；可选密码门禁保护局域网 / 远程访问。
-2. **外部集成层** — OpenClaw adapter / skill wrappers / 本地 API / Codex CLI 凭据导入等对外接入边界
+2. **外部集成层** — OpenClaw adapter / skill wrappers / 本地 API / Codex CLI 凭据导入等对外接入边界；NewsClaw Research 通过同一 Agent Bridge 暴露有界 Search/Extract，但凭据只留在后端私有运行目录
 3. **Agent 核心层** — 自研编排器 + Soul Engine + Discovery Engine + Recommendation Engine + Skill System；抖音手动 discovery 与 daemon 共用正式 producer、统一关键词生命周期和待评估候选链，debug-only `discover-douyin` 才直接调用源服务
 4. **LLM 实例路由层** — `config / Web UI -> [llm.instances.<id>] -> 全局或分模块有序实例链 -> LLMRegistry -> Provider adapter`。实例 ID 是路由、健康与 cooldown 身份，adapter 类型只是协议实现，因此同类型的多个 Base URL / token / model 可以同时存在。模块默认继承全局链；自定义链只在链内降级，耗尽后不越界。配置界面另有两条无写入恢复支路：`draft -> /api/config/probe-service -> temporary registry -> stable total gate` 做目标实例/链真实探测，`draft -> /api/config/discover-models -> exact instance GET /models` 只返回模型 ID 与本地 Effort 建议。两者在 active registry 启动失败的 degraded 状态仍精确放行，但不改变配置、不放开业务 API。
    配置写入的实际切换走独立控制流：`UI -> PUT /api/config -> config.toml + .bak -> 202 queued/apply_revision -> app-owned latest-wins queue -> RuntimeContext rebuild -> apply-status/config_reloaded`；失败从 last-good 同时恢复磁盘、proxy 与内存 runtime，再发 `config_reload_failed`。`data_dir` 是例外：新 canonical 路径只持久化并返回 `restart_required=true`，本进程的 rebuild 与外部凭据写仍绑定已锁住的 active data dir，完整重启取得新目录锁后才切换。
@@ -202,6 +207,16 @@ cookie 补 `Secure`，并把已验证的 Web Origin 做最小 `https→http` 适
 - `agent.py` 提供 Hermes / WorkBuddy 等宿主的稳定 Python 别名，`openclaw/` 保留历史路径
 - `capabilities.py` 输出 `agent-bridge/v2`、宿主兼容名和完整 descriptor manifest
 - 提供 JSON CLI bridge，供仓库内 workspace skill 和其他本地 Agent 宿主调用
+
+### Research (`research/`, NewsClaw only)
+- `ResearchProvider` 隔离外部研究服务；首个实现只调用 Tavily Search / Extract
+- `ResearchService` 统一输入隐私检查、参数上限、provider 装配、TTL 缓存和结果持久化
+- Search 固定 basic、默认 5 条且硬上限 8 条，并关闭 answer / raw content / images / auto parameters
+- Extract 要求研究问题和 1–3 个显式公开 HTTP(S) URL，固定 basic，每来源默认 2、上限 3 个片段
+- `newsclaw_research.db` 保存 `research_runs`、`research_evidence`、`research_run_evidence`；general/news/finance 的新鲜期分别为 24 小时 / 30 分钟 / 15 分钟
+- Research 是外部世界证据，不是用户记忆：不会自动写 Soul、`discovery_candidates`、`content_cache` 或推荐池
+- Phase 1 研究交互仅由 DSH Agent 工具和后端 REST/Agent Bridge 提供；桌面 Web
+  只管理 Key/脱敏状态/真实连接 probe，手机 PWA 与浏览器扩展没有研究按钮且不持有 Key
 
 ### Saved Sync (`saved_sync/`)
 - `NativeSaveRouter` 根据 adapter capability 确定 favorite / watch-later 路由；watch-later 仅在平台不支持原生动作且支持 favorite 时回退
@@ -489,6 +504,8 @@ embedding 和空向量失败留待下轮重试，成功槽位会复用。已有�
 
 ### Storage (`storage/`)
 - SQLite 数据库管理
+- NewsClaw Research 使用同一活动 data directory 下的独立 `newsclaw_research.db`；
+  它保留可追溯 run/证据快照，但不复用画像、新闻来源任务或推荐库存表
 - 可移植数据迁移：SQLite online backup、去除 `[api.auth]` 的配置快照、`.obcbackup` manifest / SHA-256、安全 ZIP 解包、request ID 对账、pending 取消、启动期 runtime lock、journaled replace 与失败回滚；包为未加密敏感文件，明确排除机器证书 / 自启动、日志、派生缓存和 OpenBiliClaw Web / 扩展访问身份
 - `Database` facade 按调用线程分配 WAL connection：初始化/event-loop 线程保留 primary，status、对话锚与其它 worker 不再同时 step 同一条 `check_same_thread=False` 连接；普通 facade 连接保持 legacy foreign-key PRAGMA，只有 `open_connection()` 显式短事务开启外键约束。写锁仍交给 SQLite `busy_timeout` 串行，失败事务 rollback 后才 lock retry；direct DML 即使零行命中也必须 commit，异常必须 rollback，避免永久线程连接遗留 writer lock。关闭时先 drain 自有 worker、再回收全部 thread-affine connections。
 - 冷备份、完整性检查与显式修复
@@ -525,3 +542,7 @@ embedding 和空向量失败留待下轮重试，成功槽位会复用。已有�
    学习、推荐、反馈回流仍由 `runtime/`、`soul/`、`recommendation/` 等模块负责，`integrations/openclaw/skill.py` 只负责对外暴露稳定 handler；新功能必须同时进入 operation、descriptor、CLI（若适合）和 capability manifest。
 3. **宿主发现走能力协商 + 仓库根目录 `skills/`**
    当前仓库通过 `skills/openbiliclaw-adapter/SKILL.md` 提供真实 workspace skill，再由 skill 内部调用 adapter CLI bridge；`capabilities` 是避免宿主继续使用旧能力子集的权威入口。
+4. **外部研究凭据不进入 Agent 层**
+   `research-search` / `research-extract` 只把有界参数交给 NewsClaw 后端；Tavily Key
+   由私有 runtime credential store 或 `TAVILY_API_KEY` 环境变量提供，descriptor、CLI、
+   DSH 插件、run 记录和错误都不返回明文。

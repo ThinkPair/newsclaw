@@ -303,6 +303,11 @@ Agent hosts (OpenClaw / Hermes / WorkBuddy)
         → integrations.agent alias / integrations.openclaw compatibility adapter
         → runtime / soul / recommendation / saved_sync owners
 
+NewsClaw explicit research (REST / Agent Bridge)
+        → ResearchService → fresh newsclaw_research.db cache, or Tavily Search / Extract
+        → evidence fragments + public source URLs → durable research ledger
+        └─ no automatic profile learning, discovery admission, or recommendation write
+
 config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate
                 └─ draft → /api/config/discover-models → exact instance GET /models

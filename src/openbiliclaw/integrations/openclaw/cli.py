@@ -268,6 +268,38 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly authorize native account writes for this command.",
     )
+
+    research_search_parser = subparsers.add_parser(
+        "research-search",
+        help="Run a bounded Tavily Search through the active NewsClaw runtime.",
+    )
+    research_search_parser.add_argument("--query", required=True)
+    research_search_parser.add_argument(
+        "--topic",
+        choices=["general", "news", "finance"],
+        default="general",
+    )
+    research_search_parser.add_argument(
+        "--time-range",
+        choices=["day", "week", "month", "year"],
+        default=None,
+    )
+    research_search_parser.add_argument("--max-results", type=int, default=5)
+    research_search_parser.add_argument("--refresh", action="store_true")
+
+    research_extract_parser = subparsers.add_parser(
+        "research-extract",
+        help="Extract query-relevant evidence from up to three public URLs.",
+    )
+    research_extract_parser.add_argument("--query", required=True)
+    research_extract_parser.add_argument(
+        "--url",
+        dest="urls",
+        action="append",
+        required=True,
+    )
+    research_extract_parser.add_argument("--chunks-per-source", type=int, default=2)
+    research_extract_parser.add_argument("--refresh", action="store_true")
     return parser
 
 
@@ -280,7 +312,13 @@ def _uses_news_contract(args: argparse.Namespace) -> bool:
 
     if os.environ.get("NEWSCLAW_MODE", "").strip() == "1":
         return True
-    if args.command in {"get-spotlight", "respond-spotlight", "source-availability"}:
+    if args.command in {
+        "get-spotlight",
+        "respond-spotlight",
+        "source-availability",
+        "research-search",
+        "research-extract",
+    }:
         return True
     return any(
         bool(getattr(args, name, ""))
@@ -397,9 +435,17 @@ async def _run_command(
             },
         }
     if args.command == "capabilities":
+        data = asdict(build_capabilities(adapter))
+        research_service = getattr(news_runtime, "research_service", None)
+        if research_service is not None:
+            skill_names = list(data.get("skill_names", []))
+            for name in ("newsclaw_search_web", "newsclaw_extract_evidence"):
+                if name not in skill_names:
+                    skill_names.append(name)
+            data["skill_names"] = skill_names
         return {
             "ok": True,
-            "data": asdict(build_capabilities(adapter)),
+            "data": data,
         }
     if args.command == "emit-skill-descriptors":
         skills = build_openclaw_skills(adapter)
@@ -425,6 +471,39 @@ async def _run_command(
             result = await adapter.get_delight()
         elif args.command == "runtime-status":
             result = await adapter.get_runtime_status()
+        elif args.command in {"research-search", "research-extract"}:
+            research_service = getattr(news_runtime, "research_service", None)
+            if research_service is None:
+                raise AdapterOperationError(
+                    "NewsClaw research is available only while the NewsClaw runtime is running."
+                )
+            from openbiliclaw.research.errors import (
+                ResearchConfigurationError,
+                ResearchProviderError,
+                ResearchValidationError,
+            )
+
+            try:
+                if args.command == "research-search":
+                    result = await research_service.search(
+                        query=args.query,
+                        topic=args.topic,
+                        time_range=args.time_range,
+                        max_results=args.max_results,
+                        refresh=bool(args.refresh),
+                    )
+                else:
+                    result = await research_service.extract(
+                        urls=args.urls,
+                        query=args.query,
+                        chunks_per_source=args.chunks_per_source,
+                        refresh=bool(args.refresh),
+                    )
+                result = result.to_dict()
+            except ResearchValidationError as error:
+                raise AdapterValidationError(str(error)) from error
+            except (ResearchConfigurationError, ResearchProviderError) as error:
+                raise AdapterOperationError(str(error)) from error
         elif args.command == "recommend":
             news_contract = _uses_news_contract(args)
             media = str(getattr(args, "media", "") or "")
