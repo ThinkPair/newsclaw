@@ -1,9 +1,8 @@
-"""Desktop web 自动加载预载边距的真实浏览器契约（AUTO_LOAD_ROOT_MARGIN_PX）。
+"""Desktop web 内层推荐队列见底自动加载的真实浏览器契约。
 
-用真实 chromium 驱动 /web/，量测「自动加载触发时哨兵距视口底部的实际距离」，
-证明 50px 的预载边距只在最后一行基本滚进视口后才追加新卡片——即哨兵还在视口下方
-约 150px 时不触发、逼近视口底部(约 20px)时才触发。用于回归 300→50 的 UX 调整，
-避免「最后一行永远看不全就被追加」的强迫症体验回退。
+用真实 Chromium 驱动 /web/，验证只有 #videoGrid 本身产生滚动意图，
+且距自身底部不超过 32px 时才追加。未滚动、外层页面滚动、距内层底部
+150px，或一次追加后仍停在底部，都不得自行连续灌入。
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ sync_playwright = playwright_api.sync_playwright
 pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).resolve().parents[1]
-CARD_COUNT = 30
+CARD_COUNT = 20
 
 
 def _recommendations(prefix: str, count: int) -> list[dict[str, Any]]:
@@ -51,6 +50,8 @@ class MarginStub:
     def __init__(self) -> None:
         self.append_posts: list[dict[str, Any]] = []
         self.append_received = threading.Event()
+        self.append_in_flight = 0
+        self.max_append_in_flight = 0
 
 
 def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -157,9 +158,18 @@ def margin_server() -> tuple[str, MarginStub]:
             except json.JSONDecodeError:
                 payload = {}
             if path == "/api/recommendations/append":
+                state.append_in_flight += 1
+                state.max_append_in_flight = max(state.max_append_in_flight, state.append_in_flight)
                 state.append_posts.append(payload)
                 state.append_received.set()
-                return _json_response(self, {"items": _recommendations("B", 10)})
+                time.sleep(0.15)
+                try:
+                    return _json_response(
+                        self,
+                        {"status": "ok", "items": _recommendations("B", 10)},
+                    )
+                finally:
+                    state.append_in_flight -= 1
             return _json_response(self, {"ok": True})
 
         def _serve_file(self, path: Path, content_type: str | None = None) -> None:
@@ -210,33 +220,24 @@ def chromium_page() -> Page:
         browser.close()
 
 
-def _sentinel_gap(page: Page) -> float:
-    """哨兵顶部距视口底部的距离（正数=还在视口下方）。"""
+def _grid_bottom_gap(page: Page) -> float:
+    """队列当前位置距自身滚动底部的像素。"""
     return page.evaluate(
         """() => {
-          const s = document.getElementById('loadMoreSentinel');
-          const r = s.getBoundingClientRect();
-          return r.top - window.innerHeight;
+          const grid = document.getElementById('videoGrid');
+          return grid.scrollHeight - grid.clientHeight - grid.scrollTop;
         }"""
     )
 
 
-def _scroll_sentinel_to_gap(page: Page, gap: float) -> float:
-    """滚动使哨兵顶部落在视口底部下方约 gap px 处；返回滚动后同步量到的实际 gap
-    （在异步追加/重渲染改变布局之前）。"""
+def _scroll_grid_to_gap(page: Page, gap: float) -> float:
+    """只滚动 #videoGrid，使其距内部底部约 gap px。"""
     return page.evaluate(
         """(gap) => {
-          const s = document.getElementById('loadMoreSentinel');
-          const r = s.getBoundingClientRect();
-          const delta = r.top - window.innerHeight - gap;  // 需要额外下滚的量
-          window.scrollTo({ top: window.scrollY + delta, behavior: 'instant' });
-          // Programmatic instant scrolls can be coalesced by a busy headless
-          // Chromium. Dispatch the same event a real scroll gesture delivers
-          // so this contract deterministically exercises the production
-          // scroll-listener + geometry fallback path.
-          window.dispatchEvent(new Event('scroll'));
-          const after = s.getBoundingClientRect();
-          return after.top - window.innerHeight;
+          const grid = document.getElementById('videoGrid');
+          grid.scrollTop = Math.max(0, grid.scrollHeight - grid.clientHeight - gap);
+          grid.dispatchEvent(new Event('scroll'));
+          return grid.scrollHeight - grid.clientHeight - grid.scrollTop;
         }""",
         gap,
     )
@@ -252,28 +253,44 @@ def test_autoload_fires_only_when_last_row_nearly_in_view(
     grid = chromium_page.locator("#videoGrid .video-card:not(.is-skeleton)")
     expect(grid).to_have_count(CARD_COUNT, timeout=8000)
 
-    # 自动加载默认开启（storageGet(...) !== "0"），后端 pool_available_count>0。
-    # 未滚动：哨兵远在视口下方，不应触发追加。
-    assert _sentinel_gap(chromium_page) > 300
-    time.sleep(0.4)
+    # 自动加载默认开启，但未滚动内层队列时即使等待两个 cooldown 也不得追加。
+    assert _grid_bottom_gap(chromium_page) > 300
+    time.sleep(17.0)
     assert not stub.append_received.is_set(), "首屏未滚动就触发了自动加载"
 
-    # 哨兵停在视口底部下方约 150px：50px 边距不该触发（300px 旧值会触发）。
-    gap_far = _scroll_sentinel_to_gap(chromium_page, 150)
+    # 外层页面滚动不代表读完队列。
+    chromium_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(0.4)
+    assert not stub.append_received.is_set(), "外层页面滚动错误触发了内层队列续页"
+
+    # 内层队列距自身底部约 150px：未进入 32px 见底区间，不得触发。
+    gap_far = _scroll_grid_to_gap(chromium_page, 150)
     assert 110 < gap_far < 190, f"定位失败，实际 gap={gap_far}"
     assert not stub.append_received.wait(timeout=1.2), (
-        f"哨兵在视口下方 {gap_far:.0f}px（>50 边距）时不应自动加载——"
-        "若这里触发说明边距又变回了接近 300px 的大预载"
+        f"内层队列距自身底部 {gap_far:.0f}px 时不应自动加载"
     )
 
-    # 哨兵逼近视口底部（约 20px）：进入 50px 边距，必须触发追加。
-    gap_near = _scroll_sentinel_to_gap(chromium_page, 20)
-    assert gap_near < 50, f"定位失败，实际 gap={gap_near}"
+    # 内层队列距自身底部约 20px：进入 32px 见底区间，必须触发一次追加。
+    gap_near = _scroll_grid_to_gap(chromium_page, 20)
+    assert gap_near < 32, f"定位失败，实际 gap={gap_near}"
     assert stub.append_received.wait(timeout=2.0), (
-        f"哨兵已逼近视口底部 {gap_near:.0f}px（<50 边距）却没有自动加载"
+        f"内层队列已逼近自身底部 {gap_near:.0f}px 却没有自动加载"
     )
 
     # 追加成功后新卡片入列。
     expect(chromium_page.locator("#videoGrid .video-card:not(.is-skeleton)")).to_have_count(
         CARD_COUNT + 10, timeout=4000
     )
+    assert len(stub.append_posts) == 1
+    assert stub.max_append_in_flight == 1
+
+    # 留在底部等待一个 cooldown 也不能连发；必须先离开底部再回来。
+    time.sleep(8.5)
+    assert len(stub.append_posts) == 1
+    stub.append_received.clear()
+    _scroll_grid_to_gap(chromium_page, 150)
+    time.sleep(0.2)
+    _scroll_grid_to_gap(chromium_page, 20)
+    assert stub.append_received.wait(timeout=2.0)
+    assert len(stub.append_posts) == 2
+    assert stub.max_append_in_flight == 1

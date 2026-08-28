@@ -160,7 +160,7 @@ class _RecommendationDatabase:
         limit: int,
         exclude_processed: bool,
     ) -> list[dict[str, object]]:
-        assert limit == 40
+        assert limit == 1000
         assert exclude_processed is True
         legacy = {
             "id": 900,

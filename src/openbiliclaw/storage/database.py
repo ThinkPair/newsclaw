@@ -28,7 +28,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from openbiliclaw.discovery.admission import (
     DEFAULT_ADMISSION_MIN_SCORE,
@@ -980,7 +980,7 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # Schema version for migrations.  V4 adds the atomic temporal-evidence and
 # review lifecycle fields to both discovery candidates and cached content.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 _SCHEMA_SQL = """
 -- Event log (behavioral data from browser extension)
@@ -1212,6 +1212,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     feedback    TEXT,                -- User feedback (like/dislike/comment)
     feedback_type TEXT,
     feedback_note TEXT,
+    presentation_snapshot TEXT NOT NULL DEFAULT '{}',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     presented_at TIMESTAMP,
     feedback_at TIMESTAMP,
@@ -2007,6 +2008,7 @@ class Database:
         self._ensure_event_satisfaction_columns()
         self._ensure_event_ingest_key_column()
         self._ensure_recommendation_feedback_columns()
+        self._ensure_recommendation_presentation_snapshot_column()
         self._ensure_content_cache_runtime_columns()
         self._ensure_content_cache_relevance_columns()
         self._ensure_content_cache_temporal_columns()
@@ -2032,6 +2034,7 @@ class Database:
         self._ensure_favorites_table()
         self._ensure_saved_sync_tables()
         self._ensure_content_history_tables()
+        self._ensure_tracked_observations_table()
         self._ensure_user_visual_clusters_table()
         self._ensure_auth_state_table()
         self._ensure_init_runs_table()
@@ -11215,6 +11218,7 @@ class Database:
                 r.feedback,
                 r.feedback_type,
                 r.feedback_note,
+                COALESCE(r.presentation_snapshot, '{{}}') AS presentation_snapshot,
                 r.created_at,
                 r.presented_at,
                 r.feedback_at,
@@ -11230,6 +11234,7 @@ class Database:
                 COALESCE(c.tags, '[]') AS tags,
                 COALESCE(c.topic_key, '') AS topic_key,
                 COALESCE(c.topic_group, '') AS topic_group,
+                COALESCE(c.style_key, '') AS style_key,
                 COALESCE(c.pool_topic_label, '') AS pool_topic_label,
                 COALESCE(c.published_at, '') AS published_at,
                 COALESCE(c.published_label, '') AS published_label,
@@ -11463,6 +11468,92 @@ class Database:
         if row is None:
             return None
         return dict(row)
+
+    def get_latest_recommendation_for_item(
+        self,
+        *,
+        item_key: str = "",
+        content_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Return the latest recommendation identity row for snapshot fallback."""
+
+        normalized_key = str(item_key or "").strip()
+        normalized_content_id = str(content_id or "").strip()
+        if not normalized_key and not normalized_content_id:
+            return None
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT r.*
+            FROM recommendations AS r
+            WHERE (? != '' AND r.item_key = ?)
+               OR (? != '' AND r.bvid = ?)
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT 1
+            """,
+            (
+                normalized_key,
+                normalized_key,
+                normalized_content_id,
+                normalized_content_id,
+            ),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def store_recommendation_presentation_snapshots(
+        self,
+        snapshots: Sequence[tuple[int, Mapping[str, Any]]],
+    ) -> None:
+        """Persist first-exposure judgments without ever rewriting old truth."""
+
+        rows = [
+            (
+                json.dumps(dict(snapshot), ensure_ascii=False, separators=(",", ":")),
+                int(recommendation_id),
+            )
+            for recommendation_id, snapshot in snapshots
+            if int(recommendation_id) > 0 and snapshot
+        ]
+        if not rows:
+            return
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                """
+                UPDATE recommendations
+                SET presentation_snapshot = ?
+                WHERE id = ?
+                  AND TRIM(COALESCE(presentation_snapshot, '{}')) IN ('', '{}')
+                """,
+                rows,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+
+    def get_recommendation_presentation_snapshot(
+        self,
+        recommendation_id: int,
+    ) -> dict[str, Any] | None:
+        """Load one immutable presentation snapshot, tolerating pre-v6 rows."""
+
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            "SELECT presentation_snapshot FROM recommendations WHERE id = ?",
+            (int(recommendation_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            decoded = json.loads(str(row["presentation_snapshot"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return dict(decoded) if isinstance(decoded, Mapping) and decoded else None
 
     def update_recommendation_feedback(
         self,
@@ -12504,6 +12595,19 @@ class Database:
             if column_name in existing_columns:
                 continue
             self.conn.execute(f"ALTER TABLE recommendations ADD COLUMN {column_name} {column_type}")
+
+    def _ensure_recommendation_presentation_snapshot_column(self) -> None:
+        """Add the immutable judgment snapshot used by history and tracking."""
+
+        existing_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(recommendations)").fetchall()
+        }
+        if "presentation_snapshot" not in existing_columns:
+            self.conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN "
+                "presentation_snapshot TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def _ensure_content_cache_runtime_columns(self) -> None:
         """Backfill content-cache runtime columns for continuous refresh."""
@@ -16496,6 +16600,7 @@ class Database:
                 title           TEXT NOT NULL DEFAULT '',
                 author_name     TEXT NOT NULL DEFAULT '',
                 cover_url       TEXT NOT NULL DEFAULT '',
+                recommendation_snapshot TEXT NOT NULL DEFAULT '{}',
                 removed_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_saved_item_removals_removed
@@ -16507,7 +16612,273 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_recommendations_feedback_created
                 ON recommendations (feedback_type, feedback_at DESC, id DESC);
         """)
+        removal_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(saved_item_removals)").fetchall()
+        }
+        if "recommendation_snapshot" not in removal_columns:
+            self.conn.execute(
+                "ALTER TABLE saved_item_removals ADD COLUMN "
+                "recommendation_snapshot TEXT NOT NULL DEFAULT '{}'"
+            )
         self.prune_content_history()
+
+    def _ensure_tracked_observations_table(self) -> None:
+        """Create local, idempotent NewsClaw observation memory."""
+
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tracked_observations (
+                tracking_id      TEXT PRIMARY KEY,
+                request_id       TEXT NOT NULL UNIQUE,
+                item_key         TEXT NOT NULL,
+                recommendation_id INTEGER,
+                topic_group      TEXT NOT NULL DEFAULT '',
+                story_key        TEXT NOT NULL DEFAULT '',
+                observation_key  TEXT NOT NULL DEFAULT '',
+                observation      TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'archived')),
+                latest_evidence  TEXT NOT NULL DEFAULT '',
+                original_snapshot TEXT NOT NULL DEFAULT '{}',
+                created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_tracked_observations_item_status
+                ON tracked_observations(item_key, status, created_at DESC, tracking_id);
+        """)
+        tracked_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(tracked_observations)").fetchall()
+        }
+        if "observation_key" not in tracked_columns:
+            self.conn.execute(
+                "ALTER TABLE tracked_observations ADD COLUMN "
+                "observation_key TEXT NOT NULL DEFAULT ''"
+            )
+        legacy_rows = self.conn.execute(
+            "SELECT tracking_id, observation FROM tracked_observations WHERE observation_key = ''"
+        ).fetchall()
+        for row in legacy_rows:
+            normalized = " ".join(str(row["observation"] or "").split()).strip().casefold()
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            self.conn.execute(
+                "UPDATE tracked_observations SET observation_key = ? WHERE tracking_id = ?",
+                (digest, str(row["tracking_id"])),
+            )
+        duplicates = self.conn.execute(
+            """
+            SELECT item_key, observation_key, MIN(rowid) AS keep_rowid
+            FROM tracked_observations
+            WHERE status = 'active' AND observation_key != ''
+            GROUP BY item_key, observation_key
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for duplicate in duplicates:
+            self.conn.execute(
+                """
+                UPDATE tracked_observations
+                SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+                WHERE item_key = ? AND observation_key = ? AND status = 'active'
+                  AND rowid != ?
+                """,
+                (
+                    str(duplicate["item_key"]),
+                    str(duplicate["observation_key"]),
+                    int(duplicate["keep_rowid"]),
+                ),
+            )
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_observations_active_key
+            ON tracked_observations(item_key, observation_key)
+            WHERE status = 'active'
+            """
+        )
+
+    @staticmethod
+    def _tracked_observation_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            decoded = json.loads(str(item.get("original_snapshot") or "{}"))
+        except (TypeError, ValueError):
+            decoded = {}
+        item["original_snapshot"] = dict(decoded) if isinstance(decoded, Mapping) else {}
+        return item
+
+    def create_tracked_observation(
+        self,
+        *,
+        request_id: str,
+        item_key: str,
+        recommendation_id: int | None,
+        topic_group: str,
+        story_key: str,
+        observation: str,
+        latest_evidence: str,
+        original_snapshot: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create once per request id or return the exact previous result."""
+
+        normalized_request_id = str(request_id or "").strip()
+        normalized_item_key = str(item_key or "").strip()
+        normalized_observation = " ".join(str(observation or "").split()).strip()
+        observation_key = hashlib.sha256(
+            normalized_observation.casefold().encode("utf-8")
+        ).hexdigest()
+        normalized_evidence = " ".join(str(latest_evidence or "").split()).strip()
+        normalized_recommendation_id = (
+            int(recommendation_id) if recommendation_id is not None else None
+        )
+        if not normalized_request_id or not normalized_item_key or not normalized_observation:
+            raise ValueError("request_id, item_key, and observation are required")
+        snapshot_json = json.dumps(
+            dict(original_snapshot or {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM tracked_observations WHERE request_id = ?",
+                (normalized_request_id,),
+            ).fetchone()
+            if existing is not None:
+                same_payload = (
+                    str(existing["item_key"] or "") == normalized_item_key
+                    and (
+                        int(existing["recommendation_id"])
+                        if existing["recommendation_id"] is not None
+                        else None
+                    )
+                    == normalized_recommendation_id
+                    and str(existing["observation"] or "") == normalized_observation
+                    and str(existing["latest_evidence"] or "") == normalized_evidence
+                )
+                if not same_payload:
+                    raise ValueError("request_id was already used for a different observation")
+                conn.commit()
+                return self._tracked_observation_dict(existing), False
+
+            matching_active = conn.execute(
+                """
+                SELECT * FROM tracked_observations
+                WHERE item_key = ? AND observation_key = ? AND status = 'active'
+                ORDER BY created_at, tracking_id
+                LIMIT 1
+                """,
+                (normalized_item_key, observation_key),
+            ).fetchone()
+            if matching_active is not None:
+                conn.commit()
+                return self._tracked_observation_dict(matching_active), False
+
+            tracking_id = str(uuid4())
+            conn.execute(
+                """
+                INSERT INTO tracked_observations (
+                    tracking_id, request_id, item_key, recommendation_id,
+                    topic_group, story_key, observation_key, observation, latest_evidence,
+                    original_snapshot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tracking_id,
+                    normalized_request_id,
+                    normalized_item_key,
+                    normalized_recommendation_id,
+                    str(topic_group or "").strip(),
+                    str(story_key or "").strip(),
+                    observation_key,
+                    normalized_observation,
+                    normalized_evidence,
+                    snapshot_json,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (tracking_id,),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if row is None:  # pragma: no cover - insert and read share one transaction
+            raise RuntimeError("tracked observation disappeared after insert")
+        self._ensure_fresh_read()
+        return self._tracked_observation_dict(row), True
+
+    def list_tracked_observations(
+        self,
+        item_key: str,
+        *,
+        status: str = "active",
+    ) -> list[dict[str, Any]]:
+        """List active, archived, or all observation rows for one item."""
+
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {"active", "archived", "all"}:
+            raise ValueError("unsupported tracked observation status")
+        status_clause = "" if normalized_status == "all" else "AND status = ?"
+        params: tuple[object, ...] = (
+            (str(item_key or "").strip(),)
+            if normalized_status == "all"
+            else (str(item_key or "").strip(), normalized_status)
+        )
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM tracked_observations
+            WHERE item_key = ? {status_clause}
+            ORDER BY created_at DESC, tracking_id
+            """,
+            params,
+        ).fetchall()
+        return [self._tracked_observation_dict(row) for row in rows]
+
+    def archive_tracked_observation(
+        self,
+        tracking_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Stop following an observation while retaining its audit history."""
+
+        normalized_id = str(tracking_id or "").strip()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            before = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if before is None:
+                conn.commit()
+                return None, False
+            archived = str(before["status"] or "") != "archived"
+            if archived:
+                conn.execute(
+                    """
+                    UPDATE tracked_observations
+                    SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+                    WHERE tracking_id = ?
+                    """,
+                    (normalized_id,),
+                )
+            row = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        return (self._tracked_observation_dict(row) if row is not None else None), archived
 
     def _ensure_saved_sync_tables(self) -> None:
         """Create normalized saved-content tables and import legacy saved rows once."""
@@ -16521,6 +16892,7 @@ class Database:
                 title           TEXT NOT NULL DEFAULT '',
                 author_name     TEXT NOT NULL DEFAULT '',
                 cover_url       TEXT NOT NULL DEFAULT '',
+                recommendation_snapshot TEXT NOT NULL DEFAULT '{}',
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -16623,6 +16995,15 @@ class Database:
                 applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        saved_item_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(saved_items)").fetchall()
+        }
+        if "recommendation_snapshot" not in saved_item_columns:
+            self.conn.execute(
+                "ALTER TABLE saved_items ADD COLUMN "
+                "recommendation_snapshot TEXT NOT NULL DEFAULT '{}'"
+            )
         native_state_columns = {
             str(row["name"])
             for row in self.conn.execute("PRAGMA table_info(native_save_states)").fetchall()
@@ -17257,6 +17638,7 @@ class Database:
                     WHERE cc.bvid = i.content_id OR cc.content_id = i.content_id
                     LIMIT 1
                 ), '') AS cover_url,
+                COALESCE(i.recommendation_snapshot, '{}') AS recommendation_snapshot,
                 i.created_at,
                 i.updated_at,
                 m.note,
@@ -17292,9 +17674,9 @@ class Database:
                 """
                 INSERT INTO saved_items (
                     item_key, source_platform, content_id, content_url, content_type,
-                    title, author_name, cover_url
+                    title, author_name, cover_url, recommendation_snapshot
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_key) DO UPDATE SET
                     source_platform = excluded.source_platform,
                     content_id = excluded.content_id,
@@ -17303,6 +17685,12 @@ class Database:
                     title = excluded.title,
                     author_name = excluded.author_name,
                     cover_url = excluded.cover_url,
+                    recommendation_snapshot = CASE
+                        WHEN TRIM(COALESCE(saved_items.recommendation_snapshot, '{}'))
+                             IN ('', '{}')
+                        THEN excluded.recommendation_snapshot
+                        ELSE saved_items.recommendation_snapshot
+                    END,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -17314,6 +17702,11 @@ class Database:
                     item.title.strip(),
                     item.author_name.strip(),
                     item.cover_url.strip(),
+                    json.dumps(
+                        item.recommendation_snapshot or {},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                 ),
             )
             conn.execute(
@@ -17386,8 +17779,9 @@ class Database:
                     """
                     INSERT INTO saved_item_removals (
                         list_kind, item_key, source_platform, content_id,
-                        content_url, content_type, title, author_name, cover_url
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content_url, content_type, title, author_name, cover_url,
+                        recommendation_snapshot
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_kind,
@@ -17399,6 +17793,7 @@ class Database:
                         str(removed_snapshot["title"] or ""),
                         str(removed_snapshot["author_name"] or ""),
                         str(removed_snapshot["cover_url"] or ""),
+                        str(removed_snapshot["recommendation_snapshot"] or "{}"),
                     ),
                 )
             conn.execute(
@@ -17426,6 +17821,28 @@ class Database:
             conn.close()
         self._ensure_fresh_read()
         return removed
+
+    def get_latest_saved_removal_snapshot(self, item_key: str) -> dict[str, Any] | None:
+        """Return the judgment preserved by the latest saved-list removal."""
+
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT recommendation_snapshot
+            FROM saved_item_removals
+            WHERE item_key = ?
+            ORDER BY removed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (str(item_key or "").strip(),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            decoded = json.loads(str(row["recommendation_snapshot"] or "{}"))
+        except (TypeError, ValueError):
+            return None
+        return dict(decoded) if isinstance(decoded, Mapping) and decoded else None
 
     def get_saved_membership(self, list_kind: str, item_key: str) -> dict[str, Any] | None:
         """Return one normalized membership with its current native-sync state."""

@@ -64,10 +64,11 @@ def test_watch_later_endpoints_round_trip_with_metadata(
 ) -> None:
     client, _db = watch_later_client
 
-    assert client.get("/api/watch-later/BV1WATCH").json() == {
+    expected_empty = {
         "saved": False,
         "total": 0,
         "item_key": "bilibili:BV1WATCH",
+        "article_id": "",
         "sync_status": None,
         "sync_task_id": "",
         "resolved_action": "",
@@ -75,13 +76,15 @@ def test_watch_later_endpoints_round_trip_with_metadata(
         "error_code": "",
         "error_message": "",
     }
+    assert client.get("/api/watch-later/BV1WATCH").json() == expected_empty
 
     response = client.post("/api/watch-later", json={"bvid": " BV1WATCH "})
     assert response.status_code == 200
-    assert response.json() == {
+    expected_saved = {
         "saved": True,
         "total": 1,
         "item_key": "bilibili:BV1WATCH",
+        "article_id": "",
         "sync_status": "pending",
         "sync_task_id": "",
         "resolved_action": "",
@@ -89,39 +92,41 @@ def test_watch_later_endpoints_round_trip_with_metadata(
         "error_code": "",
         "error_message": "",
     }
+    assert response.json() == expected_saved
 
     list_response = client.get("/api/watch-later?limit=20&offset=0")
     assert list_response.status_code == 200
-    assert list_response.json() == {
-        "items": [
-            {
-                "bvid": "BV1WATCH",
-                "item_key": "bilibili:BV1WATCH",
-                "content_id": "BV1WATCH",
-                "title": "稍后再看测试视频",
-                "up_name": "测试 UP",
-                "cover_url": "https://i0.hdslb.com/bfs/archive/watch.jpg",
-                "content_url": "https://www.bilibili.com/video/BV1WATCH",
-                "source_platform": "bilibili",
-                "content_type": "video",
-                "added_at": list_response.json()["items"][0]["added_at"],
-                "sync_status": "pending",
-                "sync_task_id": "",
-                "resolved_action": "",
-                "resolved_target": "",
-                "error_code": "",
-                "error_message": "",
-            }
-        ],
-        "total": 1,
+    expected_list_item = {
+        "bvid": "BV1WATCH",
+        "item_key": "bilibili:BV1WATCH",
+        "content_id": "BV1WATCH",
+        "article_id": "",
+        "original_url": "",
+        "media": "",
+        "publisher_name": "",
+        "title": "稍后再看测试视频",
+        "up_name": "测试 UP",
+        "cover_url": "https://i0.hdslb.com/bfs/archive/watch.jpg",
+        "content_url": "https://www.bilibili.com/video/BV1WATCH",
+        "source_platform": "bilibili",
+        "content_type": "video",
+        "added_at": list_response.json()["items"][0]["added_at"],
+        "sync_status": "pending",
+        "sync_task_id": "",
+        "resolved_action": "",
+        "resolved_target": "",
+        "error_code": "",
+        "error_message": "",
     }
+    assert list_response.json() == {"items": [expected_list_item], "total": 1}
 
     remove_response = client.delete("/api/watch-later/BV1WATCH")
     assert remove_response.status_code == 200
-    assert remove_response.json() == {
+    expected_removed = {
         "saved": False,
         "total": 0,
         "item_key": "bilibili:BV1WATCH",
+        "article_id": "",
         "sync_status": None,
         "sync_task_id": "",
         "resolved_action": "",
@@ -129,6 +134,7 @@ def test_watch_later_endpoints_round_trip_with_metadata(
         "error_code": "",
         "error_message": "",
     }
+    assert remove_response.json() == expected_removed
 
 
 def test_watch_later_list_paginates_newest_first(

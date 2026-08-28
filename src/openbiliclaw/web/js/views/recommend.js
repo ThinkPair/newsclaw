@@ -26,7 +26,9 @@ import {
   getCoverImageAttrs,
   getRecommendationCardKind,
   getRecommendationCoverPreloadUrls,
+  getRecommendationEvidenceLabel,
   getRecommendationImageLoadingAttrs,
+  getRecommendationTagFingerprint,
   normalizeRecommendation,
   reconcileRecommendationReplacement,
   recommendationStats,
@@ -52,6 +54,7 @@ import {
   getPublishedTimeDisplay,
   getMobileChatSession,
   shouldAutoAppendRecommendations,
+  escapeHtmlAttribute,
 } from "../view-models.js";
 import { openContentUrl } from "../app-launch.js";
 import { createSavedMutationRegistry } from "../saved-sync-runtime.js";
@@ -122,12 +125,46 @@ function esc(s) {
 export function publishedTimeHtml(item) {
   const display = getPublishedTimeDisplay(item);
   if (!display) return "";
-  const title = display.title ? ` title="${esc(display.title)}"` : "";
+  const title = display.title ? ` title="${escapeHtmlAttribute(display.title)}"` : "";
   return `<span class="card-published-time"${title}>${esc(display.text)}</span>`;
 }
 
 export function savedIdentity(item = {}) {
   return normalizeSavedIdentity(item);
+}
+
+const DISPLAY_TAG_TYPE_LABELS = {
+  topic: "主题",
+  story: "故事线",
+  temporal: "时效",
+  evidence: "证据",
+};
+
+function recommendationTagChipsHtml(fingerprint) {
+  const chips = fingerprint.tags.map((tag) => {
+    const typeLabel = DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签";
+    return `<span class="card-info-tag" data-tag-type="${escapeHtmlAttribute(tag.type)}" aria-label="${escapeHtmlAttribute(`${typeLabel}：${tag.label}`)}">${esc(tag.label)}</span>`;
+  });
+  if (fingerprint.overflowCount > 0) {
+    chips.push(
+      `<span class="card-info-tag card-info-tag-overflow" aria-label="另有 ${fingerprint.overflowCount} 个标签">+${fingerprint.overflowCount}</span>`,
+    );
+  }
+  return chips.join("");
+}
+
+function recommendationFingerprintHtml(fingerprint, { fallback = false } = {}) {
+  const fallbackClass = fallback ? " is-cover-fallback" : "";
+  return `
+    <div class="card-tag-fingerprint${fallbackClass}" role="group" aria-label="${escapeHtmlAttribute(fingerprint.ariaLabel)}">
+      <span class="card-tag-kicker">信息标签</span>
+      <div class="card-tag-list">${recommendationTagChipsHtml(fingerprint)}</div>
+      <div class="card-tag-status">
+        <span>状态：${esc(fingerprint.temporalLabel)}</span>
+        <span aria-hidden="true">·</span>
+        <span>证据：${esc(fingerprint.evidenceLabel)}</span>
+      </div>
+    </div>`;
 }
 
 function announceSavedAction(message, isError = false) {
@@ -1197,27 +1234,41 @@ function renderCard(rawItem, index = 0) {
   card.className = "card";
   const url = buildContentUrl(item);
   const cardMedia = getRecommendationCardKind(item);
-  if (cardMedia.kind === "text") card.classList.add("is-text-only");
+  const fingerprint = getRecommendationTagFingerprint(item);
+  if (cardMedia.kind === "fingerprint") card.classList.add("is-fingerprint-card");
+  else if (cardMedia.kind === "text") card.classList.add("is-text-only");
+  else card.classList.add("has-real-cover");
   const imageAttrs = getRecommendationImageLoadingAttrs(index);
   const publishedHtml = publishedTimeHtml(item);
 
   let coverHtml;
-  if (cardMedia.kind === "text") {
-    // No-cover text card for text-first sources (X tweet/thread): render
-    // the body text instead of a thumbnail — never an <img> node.
+  if (cardMedia.kind === "fingerprint") {
+    // A no-cover article gets structured classification, not a second copy of
+    // its title/body pretending to be a thumbnail.
+    coverHtml = `<div class="card-cover-frame is-tag-card">${recommendationFingerprintHtml(fingerprint)}</div>`;
+  } else if (cardMedia.kind === "text") {
+    // Non-NewsClaw text-first sources retain their established compact card.
     coverHtml = `<div class="card-cover-frame is-text-card"><p class="card-cover-text">${esc(cardMedia.text)}</p></div>`;
   } else {
     const cover = getCoverImageAttrs(cardMedia.coverUrl);
-    coverHtml = cover
-      ? `<div class="card-cover-frame"><img class="card-cover" src="${esc(cover.src)}" alt="" loading="${esc(imageAttrs.loading)}" fetchpriority="${esc(imageAttrs.fetchPriority)}" decoding="async" onerror="this.parentElement.classList.add('is-error');this.remove()"></div>`
-      : `<div class="card-cover-frame is-error"></div>`;
+    const isNews = item.source_platform === "news";
+    coverHtml = isNews
+      ? (cover
+        ? `<div class="card-cover-frame has-fingerprint-fallback"><img class="card-cover" src="${escapeHtmlAttribute(cover.src)}" alt="" loading="${escapeHtmlAttribute(imageAttrs.loading)}" fetchpriority="${escapeHtmlAttribute(imageAttrs.fetchPriority)}" decoding="async" onerror="this.parentElement.classList.add('is-error');this.remove()">${recommendationFingerprintHtml(fingerprint, { fallback: true })}</div>`
+        : `<div class="card-cover-frame is-error has-fingerprint-fallback">${recommendationFingerprintHtml(fingerprint, { fallback: true })}</div>`)
+      : (cover
+        ? `<div class="card-cover-frame"><img class="card-cover" src="${escapeHtmlAttribute(cover.src)}" alt="" loading="${escapeHtmlAttribute(imageAttrs.loading)}" fetchpriority="${escapeHtmlAttribute(imageAttrs.fetchPriority)}" decoding="async" onerror="this.parentElement.classList.add('is-error');this.remove()"></div>`
+        : `<div class="card-cover-frame is-error"></div>`);
   }
 
-  const scopeLabel = String(item.content_scope || "").toLowerCase().includes("title")
+  const scopeLabel = getRecommendationEvidenceLabel(item);
+  const scopeMetaLabel = scopeLabel === "标题级"
     ? "标题级信息"
-    : String(item.content_scope || "").toLowerCase().includes("full")
-      ? "全文级信息"
-      : item.content_scope;
+    : scopeLabel === "摘要级"
+      ? "摘要级信息"
+      : scopeLabel === "全文级"
+        ? "全文级信息"
+        : "";
   const observationText = Array.isArray(item.observation_points) && item.observation_points.length
     ? `后续观察：${item.observation_points.join("；")}`
     : "";
@@ -1230,13 +1281,14 @@ function renderCard(rawItem, index = 0) {
   card.innerHTML = `
     ${coverHtml}
     <div class="card-body">
+      ${cardMedia.kind === "cover" && item.source_platform === "news" ? `<div class="card-inline-tags" role="group" aria-label="${escapeHtmlAttribute(fingerprint.ariaLabel)}">${recommendationTagChipsHtml(fingerprint)}</div>` : ""}
       <div class="card-title">${esc(item.title)}</div>
       <div class="card-meta">
-        <span class="card-source" data-source="${item.source_platform}">${esc(getSourceLabel(item.source_platform))}</span>
+        <span class="card-source" data-source="${escapeHtmlAttribute(item.source_platform)}">${esc(getSourceLabel(item.source_platform))}</span>
         ${item.up_name ? `<span>${esc(item.up_name)}</span>` : ""}
         ${item.provider ? `<span>技术提供：${esc(item.provider)}</span>` : ""}
-        ${scopeLabel ? `<span class="content-scope">${esc(scopeLabel)}</span>` : ""}
-        ${item.topic_label ? `<span style="color:var(--text-muted)">${esc(item.topic_label)}</span>` : ""}
+        ${scopeMetaLabel ? `<span class="content-scope">${esc(scopeMetaLabel)}</span>` : ""}
+        ${item.topic_label ? `<span class="card-topic-label">${esc(item.topic_label)}</span>` : ""}
         ${publishedHtml}
       </div>
       ${recommendationStats(item) ? `<div class="card-stats">${esc(recommendationStats(item))}</div>` : ""}

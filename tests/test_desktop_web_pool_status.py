@@ -17,7 +17,7 @@ def test_desktop_web_starts_with_empty_recommendation_list() -> None:
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
     match = re.search(
-        r"\n\s+videos:\s*(?P<value>\[[\s\S]*?\])\s*,\n\s+messages:",
+        r"\n\s+videos:\s*(?P<value>\[[\s\S]*?\])\s*,",
         app_js,
     )
     assert match is not None, "desktop initial videos state not found"
@@ -101,8 +101,8 @@ def test_desktop_pool_status_shows_available_count() -> None:
     assert "pool_available_count" in app_js
     assert "还有 ${runtime.pool_available_count} 条可换" in app_js
     assert "暂无可换库存" in app_js
-    assert "当前可换库存" in index_html
-    assert "当前可换" in index_html
+    assert ">可换库存<" in index_html
+    assert 'id="poolAvailable"' in index_html
 
 
 def test_desktop_hydration_refetches_runtime_after_recommendation_bootstrap() -> None:
@@ -130,7 +130,7 @@ def test_desktop_pool_status_labels_pending_signals_as_discovery_context() -> No
     assert "待处理 ${runtime.pending_signal_events} 条行为信号" not in app_js
     assert "已记下 ${runtime.pending_signal_events} 个新动作" in app_js
     assert "待处理行为信号" not in index_html
-    assert "新动作" in index_html
+    assert 'id="poolRefreshState"' in index_html
 
 
 def test_desktop_ignores_extension_transport_wakeup_events() -> None:
@@ -147,7 +147,7 @@ def test_desktop_replenished_label_describes_progress_not_success_history() -> N
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
     index_html = Path("src/openbiliclaw/web/desktop/index.html").read_text(encoding="utf-8")
 
-    assert "补货进展" in index_html
+    assert '<dt>进度</dt><dd id="poolReplenished">' in index_html
     assert "上次成功补货" not in index_html
     assert "另有 ${runtime.pool_pending_count} 条素材" in app_js
     assert "素材已抓到，会按可换库存缺口整理" in app_js
@@ -164,8 +164,8 @@ def test_desktop_source_metric_uses_configured_source_count() -> None:
     assert "currentRecommendationSourceCount" not in app_js
 
 
-def test_desktop_recommendation_filters_use_loaded_news_media() -> None:
-    """News tabs reflect the media actually present in the loaded recommendation set."""
+def test_desktop_recommendation_filters_use_topics_then_loaded_news_media() -> None:
+    """Topic tabs are primary; loaded media remains an independent select filter."""
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
     assert "const sourceFilterDefinitions = [" in app_js
@@ -179,8 +179,8 @@ def test_desktop_recommendation_filters_use_loaded_news_media() -> None:
     )
     assert build_filters is not None, "desktop buildFilters not found"
     body = build_filters.group("body")
-    assert "recommendationMediaCounts()" in body
-    assert 'return ["全部", ...media.map(([label]) => label)];' in body
+    assert "recommendationTopicCounts()" in body
+    assert 'return ["全部", ...topics.map(([label]) => label)];' in body
 
     filtered_videos = re.search(
         r"function filteredVideos\(\) \{(?P<body>.*?)\n    \}",
@@ -188,8 +188,14 @@ def test_desktop_recommendation_filters_use_loaded_news_media() -> None:
         flags=re.S,
     )
     assert filtered_videos is not None, "desktop filteredVideos not found"
-    assert "recommendationMediaLabel(item)" in filtered_videos.group("body")
-    assert "state.query" in filtered_videos.group("body")
+    filtered_body = filtered_videos.group("body")
+    assert "recommendationTopicLabel(item)" in filtered_body
+    assert "recommendationMediaLabel(item)" in filtered_body
+    assert "state.mediaFilter === ALL_MEDIA_FILTER" in filtered_body
+    assert "state.query" in filtered_body
+    assert 'id="mediaFilterSelect"' in Path("src/openbiliclaw/web/desktop/index.html").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_desktop_renders_x_recommendations_as_text_cards() -> None:
@@ -483,15 +489,20 @@ def test_desktop_platform_availability_endpoint_and_snapshot_state() -> None:
     assert "if (!snapshot) return null;" in count_fn
 
 
-def test_desktop_media_tabs_are_loaded_news_only_and_query_independent() -> None:
-    """媒体 Tab 只来自已加载新闻；关键词仅筛卡片，不改 Tab 集合。"""
+def test_desktop_topic_tabs_and_media_select_are_query_independent() -> None:
+    """类别 Tab 只来自已加载新闻；媒体名放在次级 select。"""
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
     body = _function_body(app_js, "buildFilters")
-    assert "recommendationMediaCounts()" in body
+    assert "recommendationTopicCounts()" in body
     assert "state.query" not in body
     assert 'left[0].localeCompare(right[0], "zh-Hans-CN")' in body
-    assert 'return ["全部", ...media.map(([label]) => label)];' in body
+    assert 'return ["全部", ...topics.map(([label]) => label)];' in body
+
+    media = _function_body(app_js, "renderMediaFilter")
+    assert "recommendationMediaCounts()" in media
+    assert "state.query" not in media
+    assert "state.mediaFilter" in media
 
     # 搜索词只过滤已显示的卡片，不影响 Tab 集合 / 库存数字 / 后端平台参数。
     assert "state.query" not in _function_body(app_js, "platformAvailableCount")
@@ -502,8 +513,8 @@ def test_desktop_media_tabs_are_loaded_news_only_and_query_independent() -> None
     assert 'if (!filters.includes(state.filter)) state.filter = "全部";' in render_filters
 
 
-def test_desktop_platform_chips_render_counts_and_accessible_selected_state() -> None:
-    """chip 显示紧凑库存计数，选中态不能只靠颜色表达。"""
+def test_desktop_topic_chips_render_counts_and_accessible_selected_state() -> None:
+    """chip 显示已加载类别计数，选中态不能只靠颜色表达。"""
     app_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
     app_css = Path("src/openbiliclaw/web/desktop/assets/css/app.css").read_text(encoding="utf-8")
     index_html = Path("src/openbiliclaw/web/desktop/index.html").read_text(encoding="utf-8")
@@ -512,11 +523,10 @@ def test_desktop_platform_chips_render_counts_and_accessible_selected_state() ->
     assert 'btn.setAttribute("role", "tab");' in body
     assert 'btn.setAttribute("aria-selected", selected ? "true" : "false");' in body
     assert "chip-count" in body
-    assert "platformAvailableCount(" in body
-    # accessible name 必须带完整平台名 + 库存数。
+    assert "recommendationTopicCounts()" in body
+    # accessible name 必须带完整类别名 + 已加载数。
     assert 'btn.setAttribute("aria-label"' in body
-    assert "PLATFORM_COUNT_UNKNOWN_TEXT" in body
-    assert "PLATFORM_COUNT_UNKNOWN_LABEL" in body
+    assert "当前已加载" in body
     # 切 Tab 只改视图，不发推荐请求。
     assert "ENDPOINTS.reshuffle" not in body
     assert "ENDPOINTS.append" not in body

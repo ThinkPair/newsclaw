@@ -1024,7 +1024,21 @@ async def test_publish_delight_if_available_includes_publication_fields() -> Non
             [],
             delight_candidate={
                 "bvid": "BV1DELIGHT",
+                "content_id": "BV1DELIGHT",
+                "source_platform": "news",
+                "source": "news-test",
                 "title": "惊喜候选",
+                "tags": ["full_text", "fresh"],
+                "topic_group": "产业政策",
+                "franchise_key": "政策跟踪",
+                "temporal_class": "current",
+                "temporal_state": "active",
+                "relevance_score": 0.82,
+                "delight_reason": (
+                    "为什么适合你：连接产业政策关注。"
+                    "可能影响链：政策变化可能影响行业预期。"
+                    "后续观察点：核验正式文件与行业数据。"
+                ),
                 "delight_score": 0.95,
                 "published_at": "2026-07-08T06:30:00Z",
                 "published_label": "3 days ago",
@@ -1042,6 +1056,17 @@ async def test_publish_delight_if_available_includes_publication_fields() -> Non
     assert len(event_hub.events) == 1
     assert_publication(event_hub.events[0])
     assert event_hub.events[0]["share_count"] == 321
+    assert [tag["type"] for tag in event_hub.events[0]["display_tags"]] == [
+        "topic",
+        "story",
+        "temporal",
+        "evidence",
+    ]
+    assert event_hub.events[0]["priority_level"] == "normal"
+    assert event_hub.events[0]["priority_signals"]["evidence"] == 1.0
+    assert event_hub.events[0]["why_recommended"] == "连接产业政策关注。"
+    assert event_hub.events[0]["impact_chain"] == "政策变化可能影响行业预期。"
+    assert event_hub.events[0]["observation_points"] == "核验正式文件与行业数据。"
 
 
 def test_load_disliked_topic_phrases_reads_effective_dislikes() -> None:

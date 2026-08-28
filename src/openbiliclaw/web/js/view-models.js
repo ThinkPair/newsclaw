@@ -458,6 +458,12 @@ export function normalizeRecommendation(item) {
     content_scope: normalizeText(item?.content_scope || item?.body_level),
     content_hash: normalizeText(item?.content_hash),
     freshness: normalizeText(item?.freshness),
+    topic_group: normalizeText(item?.topic_group),
+    franchise_key: normalizeText(item?.franchise_key),
+    style_key: normalizeText(item?.style_key),
+    temporal_class: normalizeText(item?.temporal_class),
+    temporal_state: normalizeText(item?.temporal_state),
+    display_tags: normalizeRecommendationDisplayTags(item?.display_tags),
     impact_chain: normalizeText(item?.impact_chain),
     observation_points: Array.isArray(item?.observation_points)
       ? item.observation_points.map(normalizeText).filter(Boolean)
@@ -556,13 +562,176 @@ const TEXT_CARD_CONTENT_TYPES = new Set([
   "comment",
 ]);
 
-// Decide the media slot for a recommendation card. Text-first sources
-// (X tweet/thread, Zhihu answer/article/question) render a no-cover text card from
-// body_text/title instead of an <img>, so the web UI never paints a
-// broken-image node.
+const DISPLAY_TAG_TYPES = new Set(["topic", "story", "temporal", "evidence"]);
+const DISPLAY_TAG_TYPE_ALIASES = {
+  category: "topic",
+  subject: "topic",
+  franchise: "story",
+  entity: "story",
+  status: "temporal",
+  freshness: "temporal",
+  scope: "evidence",
+};
+
+const EVIDENCE_LABELS = {
+  title: "标题级",
+  title_only: "标题级",
+  summary: "摘要级",
+  full: "全文级",
+  full_text: "全文级",
+};
+
+const TEMPORAL_CLASS_LABELS = {
+  breaking: "突发",
+  current: "近期",
+  versioned: "版本相关",
+  evergreen: "长期有效",
+  historical: "历史资料",
+};
+
+const TEMPORAL_STATE_LABELS = {
+  active: "仍有效",
+  expired: "已过期",
+  superseded: "已被替代",
+};
+
+const FRESHNESS_LABELS = {
+  fresh: "新近",
+  aging: "持续关注",
+  stale: "较早资料",
+  future: "时间待核对",
+};
+
+function normalizeDisplayTagType(value) {
+  const raw = normalizeText(value).toLowerCase();
+  if (DISPLAY_TAG_TYPES.has(raw)) return raw;
+  return DISPLAY_TAG_TYPE_ALIASES[raw] || "topic";
+}
+
+/**
+ * Normalize the backend's small, controlled display-tag contract.
+ *
+ * Canonical entries are ``{type, label, origin}``.  String tags and the older
+ * ``kind``/``key`` type names remain accepted so cached recommendation rows do
+ * not become blank after an upgrade.  Labels are bounded and de-duplicated
+ * before they reach the DOM.
+ */
+export function normalizeRecommendationDisplayTags(raw) {
+  if (!Array.isArray(raw)) return [];
+  const result = [];
+  const seen = new Set();
+
+  for (const entry of raw) {
+    const isObject = entry && typeof entry === "object" && !Array.isArray(entry);
+    const label = normalizeText(isObject ? (entry.label || entry.name || entry.text) : entry)
+      .replace(/\s+/g, " ")
+      .slice(0, 32);
+    if (!label) continue;
+    const type = normalizeDisplayTagType(
+      isObject ? (entry.type || entry.kind || entry.key) : "topic",
+    );
+    const dedupeKey = `${type}\u0000${label.toLocaleLowerCase()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    result.push({
+      type,
+      label,
+      origin: normalizeText(isObject ? entry.origin : "legacy").slice(0, 32),
+    });
+    // The backend currently returns at most four.  A defensive upper bound
+    // prevents old or malformed cache rows from creating an unbounded card.
+    if (result.length >= 12) break;
+  }
+  return result;
+}
+
+/** Escape untrusted text before inserting it into a quoted HTML attribute. */
+export function escapeHtmlAttribute(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export function getRecommendationEvidenceLabel(item) {
+  const raw = normalizeText(item?.content_scope || item?.body_level).toLowerCase();
+  return EVIDENCE_LABELS[raw] || "";
+}
+
+export function getRecommendationTemporalLabel(item) {
+  const state = normalizeText(item?.temporal_state).toLowerCase();
+  if (state === "expired" || state === "superseded") {
+    return TEMPORAL_STATE_LABELS[state];
+  }
+  const temporalClass = normalizeText(item?.temporal_class).toLowerCase();
+  if (TEMPORAL_CLASS_LABELS[temporalClass]) return TEMPORAL_CLASS_LABELS[temporalClass];
+  if (TEMPORAL_STATE_LABELS[state]) return TEMPORAL_STATE_LABELS[state];
+  const freshness = normalizeText(item?.freshness).toLowerCase();
+  return FRESHNESS_LABELS[freshness] || "";
+}
+
+/** Build the compact NewsClaw fingerprint without title/body reuse. */
+export function getRecommendationTagFingerprint(item, { limit = 3 } = {}) {
+  const provided = normalizeRecommendationDisplayTags(item?.display_tags);
+  let allTags = provided;
+
+  // Old recommendation/cache rows do not carry display_tags.  Build a safe,
+  // non-empty fallback from structured fields only; never reuse title or body.
+  if (allTags.length === 0) {
+    const fallback = [];
+    const pushFallback = (type, label, origin = "fallback") => {
+      const cleanLabel = normalizeText(label).replace(/\s+/g, " ").slice(0, 32);
+      if (!cleanLabel) return;
+      if (fallback.some((tag) => tag.label.toLocaleLowerCase() === cleanLabel.toLocaleLowerCase())) {
+        return;
+      }
+      fallback.push({ type, label: cleanLabel, origin });
+    };
+    pushFallback("topic", item?.topic_group || item?.topic_label || "新闻文章");
+    pushFallback("story", item?.franchise_key);
+    pushFallback("temporal", getRecommendationTemporalLabel(item));
+    pushFallback("evidence", getRecommendationEvidenceLabel(item));
+    allTags = fallback;
+  }
+
+  const safeLimit = Math.max(1, Math.min(3, Math.trunc(coerceNumber(limit) ?? 3)));
+  const tags = allTags.slice(0, safeLimit);
+  const temporalTag = allTags.find((tag) => tag.type === "temporal");
+  const evidenceTag = allTags.find((tag) => tag.type === "evidence");
+  const temporalLabel = temporalTag?.label
+    || getRecommendationTemporalLabel(item)
+    || "时效待确认";
+  const evidenceLabel = evidenceTag?.label
+    || getRecommendationEvidenceLabel(item)
+    || "证据待确认";
+  const ariaParts = [
+    ...tags.map((tag) => tag.label),
+    temporalLabel,
+    evidenceLabel,
+  ].filter((label, index, values) => label && values.indexOf(label) === index);
+
+  return {
+    tags,
+    overflowCount: Math.max(0, allTags.length - tags.length),
+    temporalLabel,
+    evidenceLabel,
+    ariaLabel: `新闻信息标签：${ariaParts.join("，")}`,
+  };
+}
+
+// NewsClaw articles preserve a real publisher cover and use a structured
+// fingerprint only when that cover is absent. Other products keep their
+// established text-card behavior unchanged.
 export function getRecommendationCardKind(item) {
+  const sourcePlatform = normalizeSourcePlatform(item);
   const contentType = normalizeText(item?.content_type).toLowerCase();
   const coverUrl = normalizeCoverUrl(item?.cover_url);
+  if (sourcePlatform === "news") {
+    if (coverUrl) return { kind: "cover", coverUrl, text: "" };
+    return { kind: "fingerprint", coverUrl: "", text: "" };
+  }
   const isText = TEXT_CARD_CONTENT_TYPES.has(contentType) || !coverUrl;
   if (isText) {
     return {

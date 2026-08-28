@@ -37,9 +37,9 @@ Tushare news / major_news / cctv_news     Official or custom RSS/Atom
                                 |
        Desktop Web / Mobile PWA / browser side panel / DSH
                                 |
- open / like / dislike / ignore / read-later / save / search / chat
+ open / like / dislike / ignore / read-later / save / track / search / chat
                                 |
-        idempotent events -> profile ledger -> next recommendation
+ idempotent events -> profile ledger; judgment snapshots -> local memory
 ```
 
 The on-demand research lane is deliberately separate:
@@ -157,6 +157,35 @@ NewsClaw remains the owner of reasoning and provenance.
 Manual profile edits are an override layer above model inference. Inferred
 interests, avoidance hypotheses, awareness, and insights retain evidence,
 confidence, lifecycle state, and deletion history.
+
+## Decision workbench and local memory
+
+NewsClaw's desktop home is a decision workbench rather than a dense reading
+wall. The queue carries only priority, topic, title, source, time and evidence
+level; the selected-item pane owns the explanation and actions. Selection is
+local UI state. Only opening the original URL or submitting an explicit action
+creates an event.
+
+Decision priority is a versioned composite, not an alias of personalization
+confidence. `decision-priority-v2` combines match (45%), evidence completeness
+(20%), timeliness (20%) and event impact (15%), with display bands calibrated
+against the real local inventory so full-text current news does not collapse
+into one all-high bucket. Recommendation history,
+reshuffle, append and delight surfaces share the same projection and stable
+descending order. The API also preserves every signal and a human-readable
+reason so a displayed rank remains inspectable.
+
+When a recommendation is saved, opened or removed, NewsClaw can retain an
+immutable `newsclaw-judgment-v1` snapshot containing the identity, publication
+context, tags, priority factors and three-part analysis. A later ranking change
+must not rewrite what the system believed at that moment. Legacy rows without
+a snapshot remain readable and explicitly lack that historical judgment.
+
+An observation point can be promoted into `tracked_observations`. Creation is
+idempotent by request ID and by the active semantic observation key; stopping
+tracking archives the row instead of erasing it. This creates a local memory
+anchor with its original judgment, but Phase 1 does not claim that the point is
+verified, schedule automatic Tavily research, or train the user profile.
 
 ## Client contract
 

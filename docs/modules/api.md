@@ -119,6 +119,30 @@ result，再经过后端身份门禁转换统一事件和账号分区 Node affin
 
 这些边界不阻止 discovery 搜索，也不等待异步语义清池或完整 Soul rebuild。
 
+### NewsClaw 推荐展示投影
+
+`GET /api/recommendations`、`POST /api/recommendations/reshuffle` 与 `append` 对新闻条目统一追加 `topic_group`、`franchise_key`、`style_key`、`content_scope`、`freshness`、`temporal_class`、`temporal_state` 和 `display_tags`。`display_tags` 最多 4 项，每项为 `{type, label, origin}`，类型固定为 `topic | story | temporal | evidence`，并按该顺序去重输出。投影只读取已有结构化字段和标签，不分析标题或正文，也不触发新的 LLM 调用；非新闻条目不输出这些可选字段。
+
+同一投影还输出可解释的决策优先级：`priority_level`、`priority_label`、`priority_score`、`priority_signals`、`priority_reason` 与 `priority_version`。`decision-priority-v2` 按用户匹配 45%、证据完整度 20%、时效 20%、事件影响 15% 合成，不再把 `priority_score` 当成推荐置信度的别名；分档固定为 `>=0.90` 优先关注、`>=0.88` 值得关注、`>=0.78` 常规参考，否则为探索观察。V2 的分档来自真实本机库存校准，避免全文级近期新闻全部挤成“优先关注”。历史推荐先读取最多 1000 条当前可处理候选，完成投影并按该分数稳定降序，再应用 20 条接口上限；这覆盖正常本机库存，同时避免异常长历史让单次读取无界。换批、追加和今日首选也按同一分数稳定排序。`priority_label` 回答“先看还是后看”，证据标签回答“来源给了标题、摘要还是正文”，两者不能混为一谈。
+
+新闻推荐表达继续以一段持久化 `expression` 为兼容真值；后端按生成合同中的固定段落标记投影出可选 `why_recommended`、`impact_chain` 与 `observation_points`。客户端不自行解析中文文案；旧记录缺少完整标记时保留整段 `expression` 作为诚实降级。惊喜推荐的单条与批量接口复用同一新闻展示投影，显式非新闻平台不输出新闻专属字段。
+
+桌面和移动端把这组字段当作展示合同：有真实封面时保留封面；无封面新闻显示信息标签，不再把标题或正文复制进媒体位。旧缓存没有 `display_tags` 时，客户端只用现有结构化字段生成安全回退，不从标题或正文猜分类。桌面首页打开右侧分析详情只是只读界面状态，不写 click、feedback 或画像事件；只有阅读原文和明确反馈继续使用既有幂等写入口。
+
+`POST /api/recommendations/reshuffle` 与 `POST /api/recommendations/append` 在兼容的 `items` 之外固定返回 `status=ok|exhausted|degraded|error`、`reason` 和 `retryable`。库存确实见底与推荐服务、画像读取或筛选故障因此不会再都伪装成 `200 + items=[]`；客户端在故障时保留当前队列并提供可重试状态。
+
+新闻收藏、稍后读、点击和移除历史可以携带不可变的 `recommendation_snapshot`。快照包含 `snapshot_version`、`captured_at`、标题/来源/发布时间、标签、复合优先级及其分项、为什么推荐、影响链和观察点；后续算法或原内容改变时，旧历史仍回放当时判断。旧库中没有快照的行继续可读，只是不伪造历史判断。
+
+### NewsClaw 观察点跟踪
+
+| 方法与路径 | 契约 |
+| --- | --- |
+| `GET /api/news/tracked-observations?item_key=<news:key>&status=active|archived|all` | 查询某条新闻的本地观察点；默认只返回 active。 |
+| `POST /api/news/tracked-observations` | 提交 `request_id`、`item_key`、可选 `recommendation_id`、`observation` 和可选 `latest_evidence`。同一请求 ID，或同一新闻上语义相同且仍 active 的观察点，均幂等返回原记录。 |
+| `DELETE /api/news/tracked-observations/{tracking_id}` | 把观察点归档而非物理删除；重复归档返回 `archived=false`，未知 ID 返回 404。 |
+
+观察点只接受 canonical `news:` 条目，并保存创建时的判断快照、主题与故事键。它是本机研究/记忆线索，不自动改变画像，也不等于已经查证或已经建立后台抓取任务。
+
 ### 30 天内容历史（issue #112）
 
 | 方法与路径 | 状态 | 契约 |

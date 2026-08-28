@@ -282,6 +282,11 @@ def test_content_history_api_paginates_and_normalizes_fallback_url() -> None:
                 "source_platform": "bilibili",
                 "content_id": "BV1API",
                 "content_url": "https://www.bilibili.com/video/BV1API",
+                "article_id": "",
+                "original_url": "",
+                "media": "",
+                "publisher_name": "",
+                "technical_provider": "",
                 "content_type": "video",
                 "title": "API 历史",
                 "author_name": "",
@@ -1083,7 +1088,6 @@ def test_all_browser_surfaces_expose_lazy_paginated_history() -> None:
     desktop_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
     popup_html = Path("extension/popup/popup.html").read_text(encoding="utf-8")
     popup_js = Path("extension/popup/popup.js").read_text(encoding="utf-8")
-    popup_api = Path("extension/popup/popup-api.js").read_text(encoding="utf-8")
 
     assert 'id: "library"' in mobile_app
     assert '{ id: "history", slug: "history"' in mobile_library
@@ -1099,10 +1103,9 @@ def test_all_browser_surfaces_expose_lazy_paginated_history() -> None:
     assert 'loading="lazy" fetchpriority="low"' in desktop_js
     assert "restoreContentHistoryItem" in desktop_js
 
-    assert 'id="tabHistory"' in popup_html
-    assert 'id="viewHistory"' in popup_html
-    assert "requestJson(`/content-history?${params}`" in popup_api
-    assert 'params.set("cursor", cursor)' in popup_api
-    assert 'image.setAttribute("loading", "lazy")' in popup_js
-    assert 'image.setAttribute("fetchpriority", "low")' in popup_js
-    assert "loadContentHistoryCategory" in popup_js
+    # The thin extension deliberately embeds the canonical mobile client, so
+    # its content library/history contract is inherited instead of copied into
+    # a second popup implementation.
+    assert 'id="clientFrame"' in popup_html
+    assert "clientFrame.src = `${candidate}/m/?surface=extension`" in popup_js
+    assert 'id="tabHistory"' not in popup_html

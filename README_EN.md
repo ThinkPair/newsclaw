@@ -26,6 +26,8 @@ not require another product at runtime.
 - Preserve the five-layer Event → Preference → Awareness → Insight →
   Soul memory loop, evidence, confidence, probes, and manual overrides.
 - Learn from opening recommendations, likes, dislikes, ignores, comments, and chat. Saved and read-later items remain local library actions and do not automatically alter the profile.
+- Use a priority queue → single structured judgment → action/memory workbench;
+  rank by user fit, evidence, timeliness, and event impact instead of repeating article text across the screen.
 - Explain why an item fits, its possible impact chain, and what to watch next;
   never emit buy/sell advice.
 - Respect title-, summary-, and full-text evidence levels.
@@ -50,8 +52,10 @@ buttons and never hold the key.
 ## Data flow
 
 ```text
-Tushare / RSS → news evidence → evaluation and recommendation → four clients
-                                                          → explicit feedback → profile
+Tushare / RSS → news evidence → evaluation and composite ranking → judgment workbench / four clients
+                                                                  ├→ explicit feedback → profile
+                                                                  ├→ save/click/feedback → immutable judgment snapshot → local history
+                                                                  └→ observation → local tracking ledger (no automatic web research)
 
 DSH Agent / REST research request → fresh local cache or Tavily Search/Extract
                                   → cited evidence + separate research history

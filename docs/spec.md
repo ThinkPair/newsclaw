@@ -308,6 +308,13 @@ NewsClaw explicit research (REST / Agent Bridge)
         → evidence fragments + public source URLs → durable research ledger
         └─ no automatic profile learning, discovery admission, or recommendation write
 
+NewsClaw judgment workbench
+        → recommendation_tags projection (tags + decision-priority-v2 + why / impact / observations)
+        → bounded stable sort → desktop priority queue / Today Pick → one selected detail
+        ├─ explicit feedback → durable event → profile learning
+        ├─ save / click / feedback / removal → immutable judgment snapshot → local history
+        └─ observation → tracked_observations active / archived ledger (no automatic Tavily call)
+
 config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate
                 └─ draft → /api/config/discover-models → exact instance GET /models

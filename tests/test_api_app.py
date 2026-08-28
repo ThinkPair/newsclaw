@@ -21,7 +21,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from openbiliclaw import __version__
-from openbiliclaw.api.app import _recommendation_snapshot_rows_and_expiry, create_app
+from openbiliclaw.api.app import (
+    _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT,
+    _recommendation_snapshot_rows_and_expiry,
+    create_app,
+)
 from openbiliclaw.llm.service import LLMResponseContentError
 
 
@@ -433,7 +437,12 @@ def test_injected_runtime_initializes_inventory_from_database_and_controller_tar
     assert gate.inventory_priority_state is InventoryPriorityState.EMPTY
     response = TestClient(app).post("/api/recommendations/append", json={"excluded_bvids": []})
     assert response.status_code == 200
-    assert response.json() == {"items": []}
+    assert response.json() == {
+        "items": [],
+        "status": "exhausted",
+        "reason": "inventory_exhausted",
+        "retryable": True,
+    }
     assert gate.inventory_priority_state is InventoryPriorityState.EMPTY
 
 
@@ -5776,10 +5785,9 @@ class TestBackendAPI:
             def get_recommendations(
                 self, limit: int = 20, *, exclude_processed: bool = False
             ) -> list[dict[str, object]]:
-                # v0.3.18: the endpoint pulls 2x the visible window so
-                # the per-franchise cap still has 20 survivors after
-                # dropping over-represented IPs.
-                assert limit == 40
+                # NewsClaw compares a bounded pool before returning the
+                # visible window so decision priority can actually sort it.
+                assert limit == _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT
                 return [
                     {
                         "id": 7,
@@ -5829,7 +5837,7 @@ class TestBackendAPI:
             def get_recommendations(
                 self, limit: int = 20, *, exclude_processed: bool = False
             ) -> list[dict[str, object]]:
-                assert limit == 40
+                assert limit == _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT
                 assert exclude_processed is True
                 self.reads += 1
                 return []
@@ -5927,7 +5935,7 @@ class TestBackendAPI:
             def get_recommendations(
                 self, limit: int = 20, *, exclude_processed: bool = False
             ) -> list[dict[str, object]]:
-                assert limit == 40
+                assert limit == _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT
                 assert exclude_processed is True
                 self.reads += 1
                 return [
@@ -6028,7 +6036,7 @@ class TestBackendAPI:
             def get_recommendations(
                 self, limit: int = 20, *, exclude_processed: bool = False
             ) -> list[dict[str, object]]:
-                assert limit == 40
+                assert limit == _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT
                 return [
                     {
                         "id": 1,
@@ -7132,7 +7140,10 @@ class TestBackendAPI:
                     "published_at": "",
                     "published_label": "",
                 },
-            ]
+            ],
+            "status": "ok",
+            "reason": "",
+            "retryable": False,
         }
         assert_publication(response.json()["items"][0])
         assert hub.events[-1]["type"] == "refresh.pool_updated"
@@ -7235,7 +7246,12 @@ class TestBackendAPI:
         response = client.post("/api/recommendations/reshuffle")
 
         assert response.status_code == 200
-        assert response.json() == {"items": []}
+        assert response.json() == {
+            "items": [],
+            "status": "exhausted",
+            "reason": "scope_exhausted",
+            "retryable": True,
+        }
         assert database.count_calls == count_calls_after_construction
         assert any(
             event.get("pool_available_count") == 4
@@ -7431,7 +7447,10 @@ class TestBackendAPI:
                     "published_at": "",
                     "published_label": "",
                 }
-            ]
+            ],
+            "status": "ok",
+            "reason": "",
+            "retryable": False,
         }
         assert hub.events[-1]["type"] == "refresh.pool_updated"
         assert hub.events[-1]["message"] == "推荐池已同步"
@@ -7518,9 +7537,19 @@ class TestBackendAPI:
         )
 
         assert reshuffle.status_code == 200
-        assert reshuffle.json() == {"items": []}
+        assert reshuffle.json() == {
+            "items": [],
+            "status": "exhausted",
+            "reason": "inventory_exhausted",
+            "retryable": True,
+        }
         assert append.status_code == 200
-        assert append.json() == {"items": []}
+        assert append.json() == {
+            "items": [],
+            "status": "exhausted",
+            "reason": "inventory_exhausted",
+            "retryable": True,
+        }
         assert soul.profile_calls == 0
         assert rec.calls == 0
         assert runtime.requests == [("pool_empty", True)]
@@ -21102,7 +21131,12 @@ def test_scoped_short_batch_wakes_existing_replenishment_path() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {"items": []}
+    assert response.json() == {
+        "items": [],
+        "status": "exhausted",
+        "reason": "scope_exhausted",
+        "retryable": True,
+    }
     # Pool-wide inventory is healthy, so only the scoped shortfall can explain
     # this; it must wake the existing forced replenishment path.
     assert runtime.requests and runtime.requests[0][1] is True

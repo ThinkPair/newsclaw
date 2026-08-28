@@ -138,6 +138,7 @@ from openbiliclaw.api.models import (
     RecommendationRefreshResponse,
     RecommendationReshuffleIn,
     RecommendationReshuffleResponse,
+    RecommendationSnapshotOut,
     RedditCookieIn,
     RedditCookieResponse,
     RedditSourceConfigOut,
@@ -166,6 +167,11 @@ from openbiliclaw.api.models import (
     SourceVerifyResponse,
     SpotlightResponseIn,
     StorageConfigOut,
+    TrackedObservationArchiveResponse,
+    TrackedObservationCreateIn,
+    TrackedObservationCreateResponse,
+    TrackedObservationListResponse,
+    TrackedObservationOut,
     TwitterSourceConfigOut,
     UpdateApplyIn,
     UpdateCheckIn,
@@ -189,6 +195,10 @@ from openbiliclaw.api.models import (
     ZhihuLoginStateResponse,
     ZhihuSourceConfigOut,
     validate_saved_item_key,
+)
+from openbiliclaw.api.recommendation_tags import (
+    build_recommendation_presentation_fields,
+    is_news_content,
 )
 from openbiliclaw.discovery.temporal import (
     evaluate_temporal_eligibility,
@@ -460,6 +470,10 @@ _FIRST_PAGE_TOPUP_FLOOR = 10
 # polling clients must not re-run it every few seconds. An empty history
 # (fresh install) bypasses the debounce — matching the original bootstrap.
 _FIRST_PAGE_TOPUP_DEBOUNCE_SECONDS = 30.0
+# Decision priority is meaningful only when it can compare beyond the first
+# visible page. Keep the comparison bounded for pathological long-lived
+# histories, while covering a normal NewsClaw actionable inventory in full.
+_RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT = 1000
 # Collapse simultaneous boot reads from restored/stale browser tabs. The cache
 # is intentionally tiny: it is a load-shedding single-flight window, not a
 # user-visible freshness policy. Mutating recommendation routes invalidate it.
@@ -6730,14 +6744,7 @@ def create_app(
             )
             media = media or str(raw_payload.get("media") or "")
         source_strategy = str(value("source_strategy") or value("source") or "")
-        source_platform = str(value("source_platform") or "").strip().casefold()
-        is_news = bool(
-            source_platform == "news"
-            or source_strategy.startswith("news-")
-            or value("article_id")
-            or (isinstance(raw_payload, Mapping) and raw_payload.get("article_id"))
-        )
-        if not is_news:
+        if not is_news_content(content):
             return {}
         if not provider and source_strategy.startswith("news-"):
             provider = source_strategy.removeprefix("news-")
@@ -6748,6 +6755,197 @@ def create_app(
             "publisher_name": media,
             "technical_provider": provider,
         }
+
+    def _delight_presentation_fields(content: Mapping[str, Any]) -> dict[str, object]:
+        confidence: object | None = None
+        if "relevance_score" in content:
+            confidence = content.get("relevance_score")
+        elif "delight_score" in content:
+            # Delight scoring reuses relevance confidence; the optional visual
+            # nudge can only raise already-qualified candidates and is the best
+            # available compatibility fallback for older runtime payloads.
+            confidence = content.get("delight_score")
+        return build_recommendation_presentation_fields(
+            content,
+            expression=(
+                content.get("delight_reason")
+                or content.get("pool_expression")
+                or content.get("expression")
+                or ""
+            ),
+            confidence=confidence,
+        )
+
+    def _content_field(content: object, name: str, default: object = "") -> object:
+        if isinstance(content, Mapping):
+            return content.get(name, default)
+        return getattr(content, name, default)
+
+    def _judgment_snapshot(
+        content: object,
+        *,
+        expression: object,
+        confidence: object | None,
+        captured_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Capture the complete, versioned judgment shown at first exposure."""
+
+        fields = build_recommendation_presentation_fields(
+            content,
+            expression=expression,
+            confidence=confidence,
+        )
+        if not fields:
+            return None
+        raw_priority_signals = fields.get("priority_signals")
+        priority_signals = raw_priority_signals if isinstance(raw_priority_signals, Mapping) else {}
+        aliases = _news_presentation_fields(content)
+        source_platform = str(_content_field(content, "source_platform", "") or "news")
+        content_id = str(
+            aliases.get("article_id")
+            or _content_field(content, "content_id", "")
+            or _content_field(content, "bvid", "")
+            or ""
+        )
+        snapshot = RecommendationSnapshotOut(
+            snapshot_version="newsclaw-judgment-v1",
+            captured_at=captured_at or datetime.now(UTC).isoformat(),
+            source_platform=source_platform,
+            content_id=content_id,
+            content_url=str(
+                aliases.get("original_url") or _content_field(content, "content_url", "") or ""
+            ),
+            title=str(_content_field(content, "title", "") or ""),
+            media=str(
+                aliases.get("media")
+                or _content_field(content, "author_name", "")
+                or _content_field(content, "up_name", "")
+                or ""
+            ),
+            published_at=str(_content_field(content, "published_at", "") or ""),
+            published_label=str(_content_field(content, "published_label", "") or ""),
+            topic_group=str(fields.get("topic_group") or ""),
+            franchise_key=str(fields.get("franchise_key") or ""),
+            content_scope=str(fields.get("content_scope") or ""),
+            freshness=str(fields.get("freshness") or ""),
+            temporal_class=str(fields.get("temporal_class") or ""),
+            temporal_state=str(fields.get("temporal_state") or ""),
+            display_tags=cast("Any", fields.get("display_tags") or []),
+            priority_level=cast("Any", fields.get("priority_level")),
+            priority_label=str(fields.get("priority_label") or ""),
+            priority_score=(
+                float(str(fields["priority_score"]))
+                if fields.get("priority_score") is not None
+                else None
+            ),
+            priority_signals={
+                str(name): float(str(value)) for name, value in priority_signals.items()
+            },
+            priority_reason=str(fields.get("priority_reason") or ""),
+            priority_version=str(fields.get("priority_version") or ""),
+            why_recommended=str(fields.get("why_recommended") or ""),
+            impact_chain=str(fields.get("impact_chain") or ""),
+            observation_points=str(fields.get("observation_points") or ""),
+        )
+        return snapshot.model_dump(exclude_none=True)
+
+    def _snapshot_model(raw: object) -> RecommendationSnapshotOut | None:
+        decoded = raw
+        if isinstance(raw, str):
+            with suppress(TypeError, ValueError):
+                decoded = json.loads(raw)
+        if not isinstance(decoded, Mapping) or not decoded:
+            return None
+        with suppress(Exception):
+            return RecommendationSnapshotOut.model_validate(dict(decoded))
+        return None
+
+    def _persist_recommendation_snapshots(
+        rows: list[tuple[int, Mapping[str, Any]]],
+    ) -> None:
+        persist = getattr(ctx.database, "store_recommendation_presentation_snapshots", None)
+        if callable(persist) and rows:
+            persist(rows)
+
+    def _snapshot_for_recommendation(
+        recommendation: Mapping[str, Any],
+    ) -> RecommendationSnapshotOut | None:
+        recommendation_id_raw = recommendation.get("id")
+        recommendation_id = (
+            int(recommendation_id_raw) if recommendation_id_raw is not None else None
+        )
+        load_snapshot = getattr(ctx.database, "get_recommendation_presentation_snapshot", None)
+        if recommendation_id is not None and callable(load_snapshot):
+            stored = _snapshot_model(load_snapshot(recommendation_id))
+            if stored is not None:
+                return stored
+        identity = str(
+            recommendation.get("item_key")
+            or recommendation.get("content_id")
+            or recommendation.get("bvid")
+            or ""
+        ).strip()
+        load_content = getattr(ctx.database, "get_content", None)
+        content = load_content(identity) if identity and callable(load_content) else None
+        combined: dict[str, Any] = {
+            **(dict(content) if isinstance(content, Mapping) else {}),
+            **dict(recommendation),
+        }
+        snapshot = _judgment_snapshot(
+            combined,
+            expression=recommendation.get("expression", ""),
+            confidence=recommendation.get("confidence"),
+        )
+        model = _snapshot_model(snapshot)
+        if recommendation_id is not None and snapshot is not None:
+            _persist_recommendation_snapshots([(recommendation_id, snapshot)])
+        return model
+
+    def _snapshot_for_saved_item(
+        *,
+        item_key: str,
+        content_id: str,
+        supplied: RecommendationSnapshotOut | None,
+    ) -> dict[str, Any] | None:
+        if supplied is not None:
+            expected_source = normalize_source_platform(item_key.partition(":")[0])
+            supplied_source = normalize_source_platform(supplied.source_platform)
+            expected_content_id = str(content_id or item_key.partition(":")[2]).strip()
+            supplied_content_id = str(supplied.content_id or "").strip()
+            # A client-provided snapshot is only a convenience copy of what was
+            # displayed.  Never let it bind another article's judgment to this
+            # saved item; mismatches fall through to the trusted local record.
+            if (
+                supplied_source == expected_source
+                and supplied_content_id
+                and supplied_content_id == expected_content_id
+            ):
+                payload = supplied.model_dump(exclude_none=True)
+                if not payload.get("captured_at"):
+                    payload["captured_at"] = datetime.now(UTC).isoformat()
+                return payload
+        latest = getattr(ctx.database, "get_latest_recommendation_for_item", None)
+        recommendation = (
+            latest(item_key=item_key, content_id=content_id) if callable(latest) else None
+        )
+        if isinstance(recommendation, Mapping):
+            snapshot = _snapshot_for_recommendation(recommendation)
+            return snapshot.model_dump(exclude_none=True) if snapshot is not None else None
+        load_content = getattr(ctx.database, "get_content", None)
+        content = load_content(item_key or content_id) if callable(load_content) else None
+        return (
+            _judgment_snapshot(content, expression="", confidence=None)
+            if isinstance(content, Mapping)
+            else None
+        )
+
+    def _sort_recommendation_outputs(items: list[RecommendationOut]) -> list[RecommendationOut]:
+        # Python sort is stable, so equal decision scores preserve the engine's
+        # deterministic order (created_at/id for history, rank order for live batches).
+        return sorted(
+            items,
+            key=lambda item: -(item.priority_score if item.priority_score is not None else -1.0),
+        )
 
     def _serialize_recommendation_items(items: list[Any]) -> list[RecommendationOut]:
         def item_key_for(content: Any) -> str:
@@ -6762,8 +6960,15 @@ def create_app(
             )
 
         serialized: list[RecommendationOut] = []
+        snapshot_rows: list[tuple[int, Mapping[str, Any]]] = []
         for item in items:
             aliases = _news_presentation_fields(item.content)
+            confidence = getattr(item, "confidence", None)
+            presentation_fields = build_recommendation_presentation_fields(
+                item.content,
+                expression=item.expression,
+                confidence=confidence,
+            )
             serialized.append(
                 RecommendationOut(
                     id=int(item.recommendation_id),
@@ -6779,7 +6984,8 @@ def create_app(
                     content_id=str(getattr(item.content, "content_id", "") or item.content.bvid),
                     content_url=str(getattr(item.content, "content_url", "") or ""),
                     source_platform=str(getattr(item.content, "source_platform", "") or "bilibili"),
-                    **aliases,
+                    **cast("Any", aliases),
+                    **cast("Any", presentation_fields),
                     published_at=str(getattr(item.content, "published_at", "") or ""),
                     published_label=str(getattr(item.content, "published_label", "") or ""),
                     content_type=str(getattr(item.content, "content_type", "") or "video"),
@@ -6801,7 +7007,15 @@ def create_app(
                     up_mid=int(getattr(item.content, "up_mid", 0) or 0),
                 )
             )
-        return serialized
+            snapshot = _judgment_snapshot(
+                item.content,
+                expression=item.expression,
+                confidence=confidence,
+            )
+            if snapshot is not None:
+                snapshot_rows.append((int(item.recommendation_id), snapshot))
+        _persist_recommendation_snapshots(snapshot_rows)
+        return _sort_recommendation_outputs(serialized)
 
     def _filter_recommendation_objects_for_latest_dislikes(items: list[Any]) -> list[Any]:
         """Recheck an in-flight serve batch at the final HTTP boundary."""
@@ -7705,14 +7919,17 @@ def create_app(
                 row for row in rows if str(row.get("source_platform", "")).strip().lower() == "news"
             ]
 
-        # Pull a 2x window so the per-franchise cap below still has 20
-        # survivors to return after dropping over-represented IPs.
-        # Without the wider pool, capping 原神 at 2 in a 20-row request
-        # would leave gaps that other items further back in time would
-        # have filled.
+        # Pull a broad, bounded actionable window before projecting decision
+        # priority. A 40-row recency window made the priority label cosmetic:
+        # an older high-impact item could never outrank a newer low-value one.
+        # The 1000-row bound covers normal local inventory without letting a
+        # pathological long-lived history make every GET unbounded.
         rows = _filter_newsclaw_rows(
             _filter_low_confidence(
-                ctx.database.get_recommendations(limit=40, exclude_processed=True)
+                ctx.database.get_recommendations(
+                    limit=_RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT,
+                    exclude_processed=True,
+                )
             )
         )
 
@@ -7761,7 +7978,10 @@ def create_app(
                         await ctx.recommendation_engine.serve(profile, limit=10)
                     rows = _filter_newsclaw_rows(
                         _filter_low_confidence(
-                            ctx.database.get_recommendations(limit=40, exclude_processed=True)
+                            ctx.database.get_recommendations(
+                                limit=_RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT,
+                                exclude_processed=True,
+                            )
                         )
                     )
                     await _publish_pool_status_snapshot()
@@ -7778,9 +7998,25 @@ def create_app(
 
             rows = filter_recommendation_rows(rows, disliked_topics)
         rows, snapshot_expires_at = _recommendation_snapshot_rows_and_expiry(rows)
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                -float(
+                    str(
+                        build_recommendation_presentation_fields(
+                            row,
+                            expression=row.get("expression", ""),
+                            confidence=row.get("confidence"),
+                        ).get("priority_score", -1.0)
+                    )
+                )
+            ),
+        )
         rows = _cap_by_franchise(rows, max_per_franchise=2)[:20]
-        return RecommendationListResponse(
-            items=[
+        response_items: list[RecommendationOut] = []
+        snapshot_rows: list[tuple[int, Mapping[str, Any]]] = []
+        for row in rows:
+            response_items.append(
                 RecommendationOut(
                     id=int(row["id"]),
                     bvid=str(row.get("bvid", "")),
@@ -7795,7 +8031,15 @@ def create_app(
                     content_id=str(row.get("content_id", "") or row.get("bvid", "")),
                     content_url=str(row.get("content_url", "") or ""),
                     source_platform=str(row.get("source_platform", "") or "bilibili"),
-                    **_news_presentation_fields(row),
+                    **cast("Any", _news_presentation_fields(row)),
+                    **cast(
+                        "Any",
+                        build_recommendation_presentation_fields(
+                            row,
+                            expression=row.get("expression", ""),
+                            confidence=(row.get("confidence") if "confidence" in row else None),
+                        ),
+                    ),
                     published_at=str(row.get("published_at", "") or ""),
                     published_label=str(row.get("published_label", "") or ""),
                     content_type=str(row.get("content_type", "") or "video"),
@@ -7814,9 +8058,16 @@ def create_app(
                     source_rank=int(row.get("source_rank", 0) or 0),
                     up_mid=int(row.get("up_mid", 0) or 0),
                 )
-                for row in rows
-            ]
-        ), snapshot_expires_at
+            )
+            snapshot = _judgment_snapshot(
+                row,
+                expression=row.get("expression", ""),
+                confidence=row.get("confidence"),
+            )
+            if snapshot is not None:
+                snapshot_rows.append((int(row["id"]), snapshot))
+        _persist_recommendation_snapshots(snapshot_rows)
+        return RecommendationListResponse(items=response_items), snapshot_expires_at
 
     @app.get(
         "/api/recommendations",
@@ -7912,6 +8163,30 @@ def create_app(
                     )
                 )
         recommendation_id = row.get("recommendation_id")
+        recommendation_snapshot: RecommendationSnapshotOut | None = None
+        if recommendation_id is not None:
+            load_snapshot = getattr(ctx.database, "get_recommendation_presentation_snapshot", None)
+            if callable(load_snapshot):
+                recommendation_snapshot = _snapshot_model(load_snapshot(int(recommendation_id)))
+            if recommendation_snapshot is None:
+                load_recommendation = getattr(ctx.database, "get_recommendation_by_id", None)
+                recommendation = (
+                    load_recommendation(int(recommendation_id))
+                    if callable(load_recommendation)
+                    else None
+                )
+                if isinstance(recommendation, Mapping):
+                    recommendation_snapshot = _snapshot_for_recommendation(recommendation)
+        if recommendation_snapshot is None:
+            load_removed_snapshot = getattr(
+                ctx.database,
+                "get_latest_saved_removal_snapshot",
+                None,
+            )
+            if callable(load_removed_snapshot):
+                recommendation_snapshot = _snapshot_model(
+                    load_removed_snapshot(str(row.get("item_key", "") or ""))
+                )
         is_news = source_platform == "news"
         author_name = str(row.get("author_name", "") or "")
         media = news_aliases.get("media", "") or author_name
@@ -7935,9 +8210,13 @@ def create_app(
             context=str(row.get("context", "") or ""),
             restored=bool(row.get("restored", False)),
             contexts=contexts,
+            recommendation_snapshot=recommendation_snapshot,
         )
 
-    @app.get("/api/content-history", response_model=ContentHistoryResponse)
+    @app.get(
+        "/api/content-history",
+        response_model=ContentHistoryResponse,
+    )
     async def content_history(
         category: Literal["clicked", "shown", "removed"] = Query(...),
         limit: int = Query(default=12, ge=1, le=50),
@@ -8086,6 +8365,7 @@ def create_app(
             resolved_target=_safe_result_text(row.get("resolved_target", ""), limit=256),
             error_code=_safe_result_text(row.get("last_error_code", ""), limit=128),
             error_message=_safe_result_text(row.get("last_error_message", "")),
+            recommendation_snapshot=_snapshot_model(row.get("recommendation_snapshot")),
         )
 
     def _sync_item_response(result: NativeSaveResult) -> SavedSyncItemResponse:
@@ -8114,6 +8394,11 @@ def create_app(
                 status_code=422,
                 detail="NewsClaw only saves news articles.",
             )
+        item_key = make_item_key(
+            payload.source_platform,
+            payload.content_id,
+            payload.content_url,
+        )
         item = SavedItemInput(
             source_platform=payload.source_platform,
             content_id=payload.content_id,
@@ -8122,6 +8407,11 @@ def create_app(
             title=payload.title,
             author_name=payload.author_name,
             cover_url=payload.cover_url,
+            recommendation_snapshot=_snapshot_for_saved_item(
+                item_key=item_key,
+                content_id=payload.content_id,
+                supplied=payload.recommendation_snapshot,
+            ),
         )
         saved_sync = getattr(getattr(ctx, "config", None), "saved_sync", None)
         auto_sync = bool(getattr(saved_sync, "auto_sync_enabled", False))
@@ -8196,7 +8486,10 @@ def create_app(
             return SavedItemStateResponse(saved=False, item_key=normalized_key)
         return _saved_state_response(list_kind, normalized_key)
 
-    @app.get("/api/saved/{list_kind}", response_model=SavedListResponse)
+    @app.get(
+        "/api/saved/{list_kind}",
+        response_model=SavedListResponse,
+    )
     async def saved_list(
         list_kind: SavedListKind,
         limit: int = Query(default=50, ge=1, le=200),
@@ -8214,6 +8507,135 @@ def create_app(
         return SavedListResponse(
             items=[_saved_list_item(row) for row in rows],
             total=_saved_count(list_kind),
+        )
+
+    def _tracked_observation_out(row: Mapping[str, Any]) -> TrackedObservationOut:
+        return TrackedObservationOut(
+            tracking_id=str(row.get("tracking_id", "")),
+            request_id=str(row.get("request_id", "")),
+            item_key=str(row.get("item_key", "")),
+            recommendation_id=(
+                int(row["recommendation_id"]) if row.get("recommendation_id") is not None else None
+            ),
+            topic_group=str(row.get("topic_group", "")),
+            story_key=str(row.get("story_key", "")),
+            observation_key=str(row.get("observation_key", "")),
+            observation=str(row.get("observation", "")),
+            status=cast("Any", str(row.get("status", "active"))),
+            latest_evidence=str(row.get("latest_evidence", "")),
+            original_snapshot=_snapshot_model(row.get("original_snapshot")),
+            created_at=str(row.get("created_at", "")),
+            updated_at=str(row.get("updated_at", "")),
+        )
+
+    @app.get(
+        "/api/news/tracked-observations",
+        response_model=TrackedObservationListResponse,
+    )
+    async def tracked_observations(
+        item_key: str = Query(..., min_length=1, max_length=2048),
+        status: Literal["active", "archived", "all"] = Query(default="active"),
+    ) -> TrackedObservationListResponse:
+        try:
+            normalized_key = validate_saved_item_key(item_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid item_key") from exc
+        if not _news_saved_item_key(normalized_key):
+            raise HTTPException(
+                status_code=422,
+                detail="tracked observations only accept NewsClaw news items",
+            )
+        rows = ctx.database.list_tracked_observations(normalized_key, status=status)
+        return TrackedObservationListResponse(items=[_tracked_observation_out(row) for row in rows])
+
+    @app.post(
+        "/api/news/tracked-observations",
+        response_model=TrackedObservationCreateResponse,
+    )
+    async def track_observation(
+        payload: TrackedObservationCreateIn,
+    ) -> TrackedObservationCreateResponse:
+        content = ctx.database.get_content(payload.item_key)
+        if (
+            not isinstance(content, Mapping)
+            or str(content.get("source_platform", "")).strip().lower() != "news"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="tracked observation item is not a stored NewsClaw article",
+            )
+
+        recommendation: Mapping[str, Any] | None = None
+        if payload.recommendation_id is not None:
+            candidate = ctx.database.get_recommendation_by_id(payload.recommendation_id)
+            if not isinstance(candidate, Mapping):
+                raise HTTPException(status_code=404, detail="recommendation not found")
+            candidate_key = str(candidate.get("item_key", "") or "").strip()
+            candidate_platform = str(candidate.get("source_platform", "") or "").strip().lower()
+            if candidate_key != payload.item_key or candidate_platform != "news":
+                raise HTTPException(
+                    status_code=422,
+                    detail="recommendation does not belong to the NewsClaw item",
+                )
+            recommendation = candidate
+        else:
+            load_latest = getattr(ctx.database, "get_latest_recommendation_for_item", None)
+            latest = (
+                load_latest(
+                    item_key=payload.item_key,
+                    content_id=str(content.get("content_id") or content.get("bvid") or ""),
+                )
+                if callable(load_latest)
+                else None
+            )
+            recommendation = latest if isinstance(latest, Mapping) else None
+
+        snapshot = (
+            _snapshot_for_recommendation(recommendation)
+            if recommendation is not None
+            else _snapshot_model(_judgment_snapshot(content, expression="", confidence=None))
+        )
+        snapshot_payload = snapshot.model_dump(exclude_none=True) if snapshot is not None else None
+        topic_group = (
+            snapshot.topic_group if snapshot is not None else str(content.get("topic_group", ""))
+        )
+        story_key = (
+            snapshot.franchise_key
+            if snapshot is not None
+            else str(content.get("franchise_key", ""))
+        )
+        try:
+            row, created = ctx.database.create_tracked_observation(
+                request_id=payload.request_id,
+                item_key=payload.item_key,
+                recommendation_id=payload.recommendation_id,
+                topic_group=topic_group,
+                story_key=story_key,
+                observation=payload.observation,
+                latest_evidence=payload.latest_evidence,
+                original_snapshot=snapshot_payload,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return TrackedObservationCreateResponse(
+            item=_tracked_observation_out(row),
+            created=created,
+            duplicate=not created,
+        )
+
+    @app.delete(
+        "/api/news/tracked-observations/{tracking_id}",
+        response_model=TrackedObservationArchiveResponse,
+    )
+    async def archive_tracked_observation(
+        tracking_id: UUID,
+    ) -> TrackedObservationArchiveResponse:
+        row, archived = ctx.database.archive_tracked_observation(str(tracking_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        return TrackedObservationArchiveResponse(
+            item=_tracked_observation_out(row),
+            archived=archived,
         )
 
     @app.post("/api/saved/{list_kind}/sync", response_model=SavedSyncBatchResponse)
@@ -8302,7 +8724,7 @@ def create_app(
     @app.post("/api/watch-later", response_model=WatchLaterStateResponse)
     async def watch_later_add(payload: WatchLaterAddIn) -> WatchLaterStateResponse:
         bvid = (payload.article_id or payload.bvid).strip()
-        platform, identifier, _item_key = _compat_saved_identity(bvid)
+        platform, identifier, item_key = _compat_saved_identity(bvid)
         _saved_service().save_local(
             "watch_later",
             SavedItemInput(
@@ -8312,6 +8734,11 @@ def create_app(
                 content_type="article" if platform == "news" else "video",
                 title=payload.title.strip(),
                 author_name=payload.media.strip(),
+                recommendation_snapshot=_snapshot_for_saved_item(
+                    item_key=item_key,
+                    content_id=identifier,
+                    supplied=payload.recommendation_snapshot,
+                ),
             ),
             note=payload.note.strip(),
             auto_sync=False,
@@ -8388,6 +8815,7 @@ def create_app(
                     resolved_target=_safe_result_text(row.get("resolved_target", ""), limit=256),
                     error_code=_safe_result_text(row.get("last_error_code", ""), limit=128),
                     error_message=_safe_result_text(row.get("last_error_message", "")),
+                    recommendation_snapshot=_snapshot_model(row.get("recommendation_snapshot")),
                 )
                 for row in rows
             ],
@@ -8423,7 +8851,7 @@ def create_app(
     @app.post("/api/favorites", response_model=FavoriteStateResponse)
     async def favorite_add(payload: FavoriteAddIn) -> FavoriteStateResponse:
         bvid = (payload.article_id or payload.bvid).strip()
-        platform, identifier, _item_key = _compat_saved_identity(bvid)
+        platform, identifier, item_key = _compat_saved_identity(bvid)
         _saved_service().save_local(
             "favorite",
             SavedItemInput(
@@ -8433,6 +8861,11 @@ def create_app(
                 content_type="article" if platform == "news" else "video",
                 title=payload.title.strip(),
                 author_name=payload.media.strip(),
+                recommendation_snapshot=_snapshot_for_saved_item(
+                    item_key=item_key,
+                    content_id=identifier,
+                    supplied=payload.recommendation_snapshot,
+                ),
             ),
             note=payload.note.strip(),
             auto_sync=False,
@@ -8509,6 +8942,7 @@ def create_app(
                     resolved_target=_safe_result_text(row.get("resolved_target", ""), limit=256),
                     error_code=_safe_result_text(row.get("last_error_code", ""), limit=128),
                     error_message=_safe_result_text(row.get("last_error_message", "")),
+                    recommendation_snapshot=_snapshot_model(row.get("recommendation_snapshot")),
                 )
                 for row in rows
             ],
@@ -8972,7 +9406,12 @@ def create_app(
         request_started = time.perf_counter()
         precheck_ms = 0.0
         if ctx.recommendation_engine is None or ctx.soul_engine is None:
-            return RecommendationReshuffleResponse(items=[])
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="degraded",
+                reason="recommendation_service_unavailable",
+                retryable=True,
+            )
         result_fn = getattr(
             ctx.recommendation_engine,
             "reshuffle_recommendations_with_result",
@@ -8982,37 +9421,57 @@ def create_app(
             precheck_started = time.perf_counter()
             if await asyncio.to_thread(_pool_available_count) == 0:
                 await _trigger_replenishment_if_needed(force=True)
-                return RecommendationReshuffleResponse(items=[])
+                return RecommendationReshuffleResponse(
+                    items=[],
+                    status="exhausted",
+                    reason="inventory_exhausted",
+                    retryable=True,
+                )
             precheck_ms = (time.perf_counter() - precheck_started) * 1000.0
         profile_started = time.perf_counter()
         try:
             profile = await ctx.soul_engine.get_profile()
         except Exception:
-            return RecommendationReshuffleResponse(items=[])
+            logger.exception("Failed to load profile for recommendation reshuffle")
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="error",
+                reason="profile_unavailable",
+                retryable=True,
+            )
         profile_ms = (time.perf_counter() - profile_started) * 1000.0
         excluded_bvids, source_platform, media, selection_limit = _recommendation_news_scope(
             payload
         )
         scope_kwargs = _platform_scope_kwargs(source_platform)
-        if callable(result_fn):
-            serve_result = await result_fn(
-                profile=profile,
-                excluded_bvids=excluded_bvids,
-                limit=selection_limit,
-                **scope_kwargs,
+        try:
+            if callable(result_fn):
+                serve_result = await result_fn(
+                    profile=profile,
+                    excluded_bvids=excluded_bvids,
+                    limit=selection_limit,
+                    **scope_kwargs,
+                )
+                items = serve_result.items
+                counts_after = dict(serve_result.pool_counts_after)
+                timings = serve_result.timings
+            else:
+                items = await ctx.recommendation_engine.reshuffle_recommendations(
+                    profile=profile,
+                    excluded_bvids=excluded_bvids,
+                    limit=selection_limit,
+                    **scope_kwargs,
+                )
+                counts_after = {}
+                timings = None
+        except Exception:
+            logger.exception("Recommendation reshuffle selection failed")
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="error",
+                reason="selection_failed",
+                retryable=True,
             )
-            items = serve_result.items
-            counts_after = dict(serve_result.pool_counts_after)
-            timings = serve_result.timings
-        else:
-            items = await ctx.recommendation_engine.reshuffle_recommendations(
-                profile=profile,
-                excluded_bvids=excluded_bvids,
-                limit=selection_limit,
-                **scope_kwargs,
-            )
-            counts_after = {}
-            timings = None
         items = _filter_recommendation_objects_for_latest_dislikes(items)
         items = _filter_recommendation_media(items, media)
         if items:
@@ -9064,7 +9523,19 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        return RecommendationReshuffleResponse(items=_serialize_recommendation_items(items))
+        serialized = _serialize_recommendation_items(items)
+        if not serialized:
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="exhausted",
+                reason=(
+                    "inventory_exhausted"
+                    if counts_after.get("available") == 0
+                    else "scope_exhausted"
+                ),
+                retryable=True,
+            )
+        return RecommendationReshuffleResponse(items=serialized)
 
     @app.post(
         "/api/recommendations/append",
@@ -9078,7 +9549,12 @@ def create_app(
         request_started = time.perf_counter()
         precheck_ms = 0.0
         if ctx.recommendation_engine is None or ctx.soul_engine is None:
-            return RecommendationReshuffleResponse(items=[])
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="degraded",
+                reason="recommendation_service_unavailable",
+                retryable=True,
+            )
         result_fn = getattr(
             ctx.recommendation_engine,
             "append_recommendations_with_result",
@@ -9088,37 +9564,57 @@ def create_app(
             precheck_started = time.perf_counter()
             if await asyncio.to_thread(_pool_available_count) == 0:
                 await _trigger_replenishment_if_needed(force=True)
-                return RecommendationReshuffleResponse(items=[])
+                return RecommendationReshuffleResponse(
+                    items=[],
+                    status="exhausted",
+                    reason="inventory_exhausted",
+                    retryable=True,
+                )
             precheck_ms = (time.perf_counter() - precheck_started) * 1000.0
         profile_started = time.perf_counter()
         try:
             profile = await ctx.soul_engine.get_profile()
         except Exception:
-            return RecommendationReshuffleResponse(items=[])
+            logger.exception("Failed to load profile for recommendation append")
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="error",
+                reason="profile_unavailable",
+                retryable=True,
+            )
         profile_ms = (time.perf_counter() - profile_started) * 1000.0
         excluded_bvids, source_platform, media, selection_limit = _recommendation_news_scope(
             payload
         )
         scope_kwargs = _platform_scope_kwargs(source_platform)
-        if callable(result_fn):
-            serve_result = await result_fn(
-                profile=profile,
-                excluded_bvids=excluded_bvids,
-                limit=selection_limit,
-                **scope_kwargs,
+        try:
+            if callable(result_fn):
+                serve_result = await result_fn(
+                    profile=profile,
+                    excluded_bvids=excluded_bvids,
+                    limit=selection_limit,
+                    **scope_kwargs,
+                )
+                items = serve_result.items
+                counts_after = dict(serve_result.pool_counts_after)
+                timings = serve_result.timings
+            else:
+                items = await ctx.recommendation_engine.append_recommendations(
+                    profile=profile,
+                    excluded_bvids=excluded_bvids,
+                    limit=selection_limit,
+                    **scope_kwargs,
+                )
+                counts_after = {}
+                timings = None
+        except Exception:
+            logger.exception("Recommendation append selection failed")
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="error",
+                reason="selection_failed",
+                retryable=True,
             )
-            items = serve_result.items
-            counts_after = dict(serve_result.pool_counts_after)
-            timings = serve_result.timings
-        else:
-            items = await ctx.recommendation_engine.append_recommendations(
-                profile=profile,
-                excluded_bvids=excluded_bvids,
-                limit=selection_limit,
-                **scope_kwargs,
-            )
-            counts_after = {}
-            timings = None
         items = _filter_recommendation_objects_for_latest_dislikes(items)
         items = _filter_recommendation_media(items, media)
         _schedule_exact_pool_status_snapshot()
@@ -9141,7 +9637,19 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        return RecommendationReshuffleResponse(items=_serialize_recommendation_items(items))
+        serialized = _serialize_recommendation_items(items)
+        if not serialized:
+            return RecommendationReshuffleResponse(
+                items=[],
+                status="exhausted",
+                reason=(
+                    "inventory_exhausted"
+                    if counts_after.get("available") == 0
+                    else "scope_exhausted"
+                ),
+                retryable=True,
+            )
+        return RecommendationReshuffleResponse(items=serialized)
 
     @app.post("/api/recommendations/refresh", response_model=RecommendationRefreshResponse)
     async def refresh_recommendations() -> RecommendationRefreshResponse:
@@ -9553,13 +10061,17 @@ def create_app(
     @app.get(
         "/api/delight/pending",
         response_model=PendingDelightResponse,
+        response_model_exclude_none=True,
     )
-    async def pending_delight() -> PendingDelightResponse:
+    async def pending_delight() -> PendingDelightResponse | Response:
         get_pending_delight = getattr(ctx.runtime_controller, "get_pending_delight", None)
         item = get_pending_delight() if callable(get_pending_delight) else None
         if item is None or not _delight_source_allowed(item):
-            return PendingDelightResponse(item=None)
+            # Keep the established wrapper contract while excluding nested
+            # optional fields for real items below.
+            return JSONResponse(content={"item": None})
         presentation = _news_presentation_fields(item)
+        recommendation_presentation = _delight_presentation_fields(item)
         spotlight = (
             {
                 "spotlight_reason": str(item.get("delight_reason", "")),
@@ -9570,7 +10082,14 @@ def create_app(
             else {}
         )
         return PendingDelightResponse(
-            item=PendingDelightOut(**{**item, **presentation, **spotlight})
+            item=PendingDelightOut(
+                **{
+                    **item,
+                    **presentation,
+                    **recommendation_presentation,
+                    **spotlight,
+                }
+            )
         )
 
     @app.get("/api/delight/pending-batch")
@@ -9622,8 +10141,9 @@ def create_app(
             haystack = f"{str(row.get('title', '')).lower()} {str(row.get('tags', '')).lower()}"
             return not any(p and p in haystack for p in disliked_phrases)
 
-        items = [
-            {
+        def serialize_delight(row: dict[str, Any]) -> dict[str, Any]:
+            aliases = _news_presentation_fields(row)
+            return {
                 "bvid": str(row.get("bvid", "")),
                 "item_key": str(row.get("item_key", "")),
                 "content_id": str(row.get("content_id", "") or row.get("bvid", "")),
@@ -9640,14 +10160,15 @@ def create_app(
                 # readable title for legacy rows still holding answer_<id> (#79).
                 "content_type": str(row.get("content_type", "") or ""),
                 "body_text": str(row.get("body_text", "") or ""),
-                **_news_presentation_fields(row),
+                **aliases,
+                **_delight_presentation_fields(row),
                 **(
                     {
                         "spotlight_reason": str(row.get("delight_reason", "")),
                         "spotlight_score": float(row.get("delight_score", 0.0) or 0.0),
                         "spotlight_hook": str(row.get("delight_hook", "")),
                     }
-                    if _news_presentation_fields(row)
+                    if aliases
                     else {}
                 ),
                 # Engagement stats so the delight card shows the same ▶/👍/💬/🔁 row
@@ -9664,9 +10185,12 @@ def create_app(
                     "liked" if str(row.get("feedback_type", "") or "") == "like" else "pending"
                 ),
             }
-            for row in rows
-            if passes_filter(row)
-        ][:response_limit]
+
+        items = [serialize_delight(row) for row in rows if passes_filter(row)]
+        items = sorted(
+            items,
+            key=lambda item: -float(item.get("priority_score", -1.0)),
+        )[:response_limit]
         return {"items": items}
 
     @app.get("/api/spotlight/pending-batch")
@@ -12503,6 +13027,7 @@ def create_app(
         recommendation = ctx.database.get_recommendation_by_id(payload.recommendation_id)
         if recommendation is None:
             raise HTTPException(status_code=404, detail="Recommendation not found.")
+        _snapshot_for_recommendation(recommendation)
 
         from openbiliclaw.sources.event_format import (
             SOURCE_BILIBILI,
@@ -12673,6 +13198,8 @@ def create_app(
             recommendation = ctx.database.get_recommendation_by_id(
                 payload.recommendation_id,
             )
+            if recommendation is not None:
+                _snapshot_for_recommendation(recommendation)
 
         article_id = (payload.article_id or "").strip()
         bvid = (payload.bvid or "").strip()

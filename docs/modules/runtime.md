@@ -76,7 +76,7 @@ gate 属于 `RuntimeContext` 的稳定部分：热重载构造成功后在同一
 | 推荐/惊喜发布时间出口 | ✅ | `RecommendationOut`、`PendingDelightOut`、推荐列表/换批、pending delight 单条/批量、手动 delight 与 proactive runtime 事件均增量返回 `published_at` / `published_label`（默认空字符串）。API 不把发现时间或推荐生成时间改写为发布时间；桌面 Web 与移动 Web 精确时间优先、相对标签兜底、缺失隐藏，精确时间按本地时区显示并提供完整时间 tooltip。 |
 | 桌面 Web 推荐列表增量渲染 | ✅ | `renderVideos` 不再整表 `grid.replaceChildren(...)`，改由 `syncRecommendationCards` 按 recommendation key 做增量对账：markup 未变且节点仍在网格上就原样复用 DOM，只对差集增删并用 `insertBefore` 就地调整顺序，骨架占位始终留在真实卡片之后。整表重建会让浏览器丢掉滚动锚点（列表跳动）、首屏之外的懒加载封面回落成占位、展开的推荐理由与收藏 / 稍后再看的 `aria-pressed` 复位，因此这条渲染路径必须对「列表没变」保持幂等。配套：`refreshInitStatus` 的重绘统一经 `initStatusRenderOptions()` 判定，网格已装真实卡片且不需要退回引导门时传 `renderAll({ preserveVideos: true })`——补货一轮会连发多次 `refresh.pool_updated`，而该事件经 init-status 支路会拽起重绘。 |
 | 桌面 Web 再水合不换列表 | ✅ | `hydrateFromBackend({ replaceRecommendations })` 默认 `false`：`/api/recommendations` 只返回最新 top 窗口，后台再水合（切回标签页、`config_reloaded`、保存配置、初始化完成）整表覆盖会把用户滚动加载出来的卡片丢掉并按后端最新排序重排。只有首屏引导（`startDesktopBackendSession({ forceHydrate: true })`）与手动刷新会传 `true`；`replace=false` 时 `applyDesktopRecommendationSnapshot` 仅在列表为空时装填。 |
-| 桌面 Web 滚动自动加载 | ✅ | 首页推荐列表底部 sentinel 通过 `IntersectionObserver` 触发 `/api/recommendations/append`，默认开启并保留手动“继续追加”按钮。触发判定收敛在 `autoLoadBlockReason`（`shouldAutoLoadMore` 为其布尔包装）：需满足单飞、首页可见、列表有非骨架卡、加载按钮可见，并且当前 Tab 有可推库存——“全部”读取 `platform-availability.total_available`，具体平台读取同一 snapshot 的 `by_platform[slug]`；首次快照仍未知时才回退到兼容的全局 `pool_available_count`。最后才校验距上次自动加载至少 8 秒。当前平台见底时自动续页暂停但手动按钮仍可用，避免全局尚有其它平台库存时在零库存 Tab 上反复空请求。**冷却自愈（issue #115）**：当唯一拦路项是冷却且哨兵仍在视口（用户停在底部、无更多滚动/相交事件）时，`armAutoLoadCooldownRecheck` 安排一次冷却到点后的一次性复查，避免停在底部时明明有货却卡到手动滚动/点按钮才继续；页面被新内容撑高、哨兵移出视口后自然停下。设置页开关写入 `openbiliclaw.webui.autoLoadOnScroll`，关闭或重建 observer 时断开并 `clearAutoLoadCooldownRecheck`。 |
+| 桌面 Web 滚动自动加载 | ✅ | 自动追加只监听首页工作台内部的 `#videoGrid` 滚动，不再依据外层 viewport 或常驻 sentinel。用户必须先真实滚动，且队列距自身底部不超过 32px；同时满足推荐 Tab、无本地主题/媒体/搜索筛选、单飞、按钮可见及当前平台有库存时，才调用 `/api/recommendations/append`。一次触发会消耗底部 gate，新增卡片后即使冷却结束也不会自行连载；必须先离开底部、再由用户滚回底部才能重武装。8 秒冷却只延迟这次已经发生的真实见底动作，不能制造新的滚动意图。手动“继续追加”仍保留，设置键仍为 `openbiliclaw.webui.autoLoadOnScroll`。 |
 | 桌面 Web 画像编辑即时反馈 | ✅ | 画像编辑的 chip 删除和添加按钮在请求 `/api/profile/edit` 前立即禁用并标记 `.is-pending`，让慢后端下也有置灰反馈；`state.profileEditState` 仍只接受服务端响应，成功 / 失败都通过重新渲染清除 pending 或恢复 chip，避免为低频编辑面引入复杂乐观回滚。 |
 | 桌面 Web 可撤销即时反馈 | ✅ | 普通推荐卡和正向/避雷探针的非聊天动作先更新本地 UI，再由共享 pending-action coordinator 保留 10 秒提交屏障；点击撤销会取消定时器且不发 API 写请求，提交失败恢复原状态，`pagehide` 会以 keepalive 立即结清未提交动作。探针聊天和推荐评论需要服务端回复或文本语义，保持直接提交，不伪装成可撤销动作。 |
 | 桌面 Web 探针反馈文案 | ✅ | 消息抽屉与画像页的正向/避雷探针共用一个 domain-aware feedback helper；inline 结果与 toast 使用同一条文本，明确显示经折叠空白且最长 24 字符的探针主题（超长以省略号收束），并通过 `textContent` / `showToast(text)` 写入，避免把主题插入 HTML。 |
@@ -116,8 +116,9 @@ gate 属于 `RuntimeContext` 的稳定部分：热重载构造成功后在同一
   宽栏操作行贴正文列下方；`@container desktop-main` ≤940px 时缩略图与正文仍并排、操作行下沉为跨整卡
   宽度独立一行（去看看/聊一聊靠右、反馈图标靠左，issue #115 修复标题与按钮被裁）；≤560px 整卡竖直堆叠，
   ≤430px 保留窄屏内联输入框。操作行与状态行是 `.delight` 直接子节点，能脱离正文列约束跨整卡展开。
-- Delight 拖拽 10px 才进入拖动态，50px 才切换卡片；滚动自动加载仍使用 50px
-  root margin。前者避免点击抖动，后两者分别控制明确切换与接近视口时加载。
+- Delight 拖拽 10px 才进入拖动态，50px 才切换卡片；前者避免点击抖动，后者要求明确切换。
+  推荐队列自动追加不再使用 viewport root margin，而是严格遵守上表的 `#videoGrid` 内层真实滚动、
+  距底 32px 与离底重武装合同。
 
 ### Visual prewarm wiring API
 
@@ -181,6 +182,11 @@ status_code, apply_payload = await service.request_apply(tag="backend-v0.3.92")
 - `get_runtime_status()`：返回 `/api/runtime-status` 合并用的自动更新摘要，包含当前版本、最新远端版本、上次检查、错误、状态原因和 `install_mode`。
 
 ### ContinuousRefreshController
+
+NewsClaw 模式下，runtime 的 `delight.candidate` 事件与 REST 今日首选共用
+`api.recommendation_tags` 投影：统一携带最多四个标签、`decision-priority-v2` 复合优先级、
+为什么值得看、可能影响链和后续观察点。runtime 不在事件层重复解析或重算这些字段，桌面队列与
+Today Pick 因而使用同一判断合同；非新闻模式保持旧事件形状。
 
 ```python
 controller.candidate_eval_coordinator.notify("candidate_enqueued:bilibili")

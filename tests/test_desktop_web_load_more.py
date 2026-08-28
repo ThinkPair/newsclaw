@@ -42,13 +42,14 @@ def test_append_more_reports_short_batches_honestly() -> None:
     assert "候选池暂时见底" in body
     assert "候选池暂时没有新内容" in body
     # 自动加载开关决定重试文案，不许对关掉自动加载的用户许诺“会自动加载”。
-    assert 'state.autoLoadOnScroll ? "补上后会自动加载" : "稍后可再点一次"' in body
+    assert 'state.autoLoadOnScroll ? "补上后再次滚到底即可加载" : "稍后可再点一次"' in body
 
 
 def test_initial_grid_ships_static_skeletons() -> None:
     index_html = _read(INDEX_HTML)
     grid = re.search(
-        r'<div class="card-grid" id="videoGrid">(?P<body>.*?)<div id="loadMoreSentinel"',
+        r'<div class="card-grid recommendation-queue" id="videoGrid"[^>]*>'
+        r'(?P<body>.*?)</div>\s*<div id="loadMoreSentinel"',
         index_html,
         flags=re.S,
     )
@@ -69,16 +70,18 @@ def test_css_defines_skeleton_shimmer_with_reduced_motion_guard() -> None:
 def test_pool_status_update_rechecks_auto_load_when_parked_at_bottom() -> None:
     app_js = _read(APP_JS)
     body = _function_body(app_js, "maybeAutoLoadAfterPoolRefill")
-    # 哨兵可能已经相交但当时被库存 / 渲染 guard 拦住；状态更新后要补一次几何重检。
+    # 内层队列可能已见底但当时被库存 / 渲染 guard 拦住；状态更新后要补一次几何重检。
     assert "scheduleAutoLoadCheck();" in body
     apply_body = _function_body(app_js, "applyRuntimeStatus")
     assert "maybeAutoLoadAfterPoolRefill();" in apply_body
 
 
-def test_intersect_handler_tracks_sentinel_visibility() -> None:
+def test_autoload_no_longer_depends_on_a_viewport_intersection_handler() -> None:
     app_js = _read(APP_JS)
-    body = _function_body(app_js, "handleAutoLoadIntersect")
-    assert "sentinelInView = entries.some((entry) => entry.isIntersecting);" in body
+    assert "handleAutoLoadIntersect" not in app_js
+    behavior = _function_body(app_js, "syncAutoLoadBehavior")
+    assert "IntersectionObserver" not in behavior
+    assert "refreshRecommendationGridBottomReady()" in app_js
 
 
 def test_should_auto_load_ignores_skeleton_cards() -> None:
@@ -98,9 +101,10 @@ def test_auto_load_gate_uses_active_platform_inventory() -> None:
     """0 库存平台不能靠全局库存把自动续页放行，否则会在该 Tab 上反复空请求。"""
     app_js = _read(APP_JS)
     body = _function_body(app_js, "autoLoadBlockReason")
+    context = _function_body(app_js, "recommendationAutoLoadContextReason")
 
     assert "activePlatformAvailableCount()" in body
-    assert 'return "pool-empty";' in body
+    assert 'return "pool-empty";' in context
     # 平台库存未知（首次快照未成功 / 旧后端没有该接口）回退到全局库存，保持既有行为。
     assert "state.runtimeStatus?.pool_available_count > 0" in body
 

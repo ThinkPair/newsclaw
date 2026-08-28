@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from .identity import canonical_source_platform, make_item_key
 
@@ -44,6 +44,7 @@ class SavedItemInput:
     title: str = ""
     author_name: str = ""
     cover_url: str = ""
+    recommendation_snapshot: dict[str, Any] | None = None
 
     @property
     def item_key(self) -> str:

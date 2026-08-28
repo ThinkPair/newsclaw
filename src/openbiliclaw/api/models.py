@@ -229,6 +229,14 @@ class InitStatusOut(BaseModel):
     progress_sequence: int = 0
 
 
+class RecommendationDisplayTagOut(BaseModel):
+    """One bounded tag rendered on a NewsClaw recommendation card."""
+
+    type: Literal["topic", "story", "temporal", "evidence"]
+    label: str
+    origin: str
+
+
 class RecommendationOut(BaseModel):
     """Recommendation payload exposed to the popup."""
 
@@ -253,6 +261,28 @@ class RecommendationOut(BaseModel):
     media: str | None = None
     publisher_name: str | None = None
     technical_provider: str | None = None
+    # NewsClaw's first deterministic card-tag projection.  Optional fields are
+    # omitted for non-news items so older multi-source clients retain the same
+    # response shape.
+    topic_group: str | None = None
+    franchise_key: str | None = None
+    style_key: str | None = None
+    content_scope: str | None = None
+    freshness: str | None = None
+    temporal_class: str | None = None
+    temporal_state: str | None = None
+    display_tags: list[RecommendationDisplayTagOut] | None = None
+    # NewsClaw analysis and ranking projection.  All fields are optional and
+    # omitted for legacy/non-news rows by response_model_exclude_none.
+    priority_level: Literal["high", "medium", "normal", "low"] | None = None
+    priority_label: str | None = None
+    priority_score: float | None = None
+    priority_signals: dict[str, float] | None = None
+    priority_reason: str | None = None
+    priority_version: str | None = None
+    why_recommended: str | None = None
+    impact_chain: str | None = None
+    observation_points: str | None = None
     published_at: str = ""
     published_label: str = ""
     # Text-first sources (X tweet/thread): the popup renders a no-cover
@@ -295,6 +325,36 @@ class ContentHistoryContextOut(BaseModel):
     restored: bool = False
 
 
+class RecommendationSnapshotOut(BaseModel):
+    """Immutable NewsClaw judgment captured when an item was first exposed."""
+
+    snapshot_version: str = "newsclaw-judgment-v1"
+    captured_at: str = ""
+    source_platform: str = "news"
+    content_id: str = ""
+    content_url: str = ""
+    title: str = ""
+    media: str = ""
+    published_at: str = ""
+    published_label: str = ""
+    topic_group: str = ""
+    franchise_key: str = ""
+    content_scope: str = ""
+    freshness: str = ""
+    temporal_class: str = ""
+    temporal_state: str = ""
+    display_tags: list[RecommendationDisplayTagOut] = Field(default_factory=list, max_length=4)
+    priority_level: Literal["high", "medium", "normal", "low"] | None = None
+    priority_label: str = ""
+    priority_score: float | None = None
+    priority_signals: dict[str, float] = Field(default_factory=dict)
+    priority_reason: str = ""
+    priority_version: str = ""
+    why_recommended: str = ""
+    impact_chain: str = ""
+    observation_points: str = ""
+
+
 class ContentHistoryItemOut(BaseModel):
     """One canonical item in a bounded content-history category."""
 
@@ -317,6 +377,10 @@ class ContentHistoryItemOut(BaseModel):
     context: str = ""
     restored: bool = False
     contexts: list[ContentHistoryContextOut] = Field(default_factory=list)
+    recommendation_snapshot: RecommendationSnapshotOut | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class ContentHistoryResponse(BaseModel):
@@ -334,6 +398,85 @@ class RecommendationReshuffleResponse(BaseModel):
     """Immediate recommendation reshuffle result."""
 
     items: list[RecommendationOut]
+    status: Literal["ok", "exhausted", "degraded", "error"] = "ok"
+    reason: str = ""
+    retryable: bool = False
+
+
+class TrackedObservationCreateIn(BaseModel):
+    """Idempotently turn one explicit NewsClaw observation into local memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: IdempotencyKey
+    item_key: Annotated[StrictStr, Field(min_length=1, max_length=2048)]
+    recommendation_id: int | None = Field(default=None, ge=1)
+    observation: Annotated[StrictStr, Field(min_length=1, max_length=2000)]
+    latest_evidence: Annotated[StrictStr, Field(max_length=4000)] = ""
+
+    @field_validator("item_key")
+    @classmethod
+    def _validate_news_item_key(cls, value: str) -> str:
+        normalized = validate_saved_item_key(value)
+        if not normalized.startswith("news:"):
+            raise ValueError("tracked observations require a canonical NewsClaw item_key")
+        return normalized
+
+    @field_validator("observation")
+    @classmethod
+    def _normalize_observation(cls, value: str) -> str:
+        if _has_unicode_control(value):
+            raise ValueError("tracked observation text must not contain control characters")
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("tracked observation must not be blank")
+        return normalized
+
+    @field_validator("latest_evidence")
+    @classmethod
+    def _normalize_latest_evidence(cls, value: str) -> str:
+        if _has_unicode_control(value):
+            raise ValueError("tracked observation text must not contain control characters")
+        return " ".join(value.split()).strip()
+
+
+class TrackedObservationOut(BaseModel):
+    """One durable observation that can be stopped without erasing history."""
+
+    tracking_id: str
+    request_id: str
+    item_key: str
+    recommendation_id: int | None = None
+    topic_group: str = ""
+    story_key: str = ""
+    observation_key: str = ""
+    observation: str
+    status: Literal["active", "archived"] = "active"
+    latest_evidence: str = ""
+    original_snapshot: RecommendationSnapshotOut | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class TrackedObservationCreateResponse(BaseModel):
+    """Idempotent creation result."""
+
+    item: TrackedObservationOut
+    created: bool
+    duplicate: bool = False
+
+
+class TrackedObservationListResponse(BaseModel):
+    """Tracked observations for one canonical NewsClaw item."""
+
+    items: list[TrackedObservationOut]
+
+
+class TrackedObservationArchiveResponse(BaseModel):
+    """Archive result; the row remains queryable for local memory."""
+
+    item: TrackedObservationOut
+    archived: bool
 
 
 class _PlatformScopedRecommendationIn(BaseModel):
@@ -556,6 +699,23 @@ class PendingDelightOut(BaseModel):
     media: str | None = None
     publisher_name: str | None = None
     technical_provider: str | None = None
+    topic_group: str | None = None
+    franchise_key: str | None = None
+    style_key: str | None = None
+    content_scope: str | None = None
+    freshness: str | None = None
+    temporal_class: str | None = None
+    temporal_state: str | None = None
+    display_tags: list[RecommendationDisplayTagOut] | None = None
+    priority_level: Literal["high", "medium", "normal", "low"] | None = None
+    priority_label: str | None = None
+    priority_score: float | None = None
+    priority_signals: dict[str, float] | None = None
+    priority_reason: str | None = None
+    priority_version: str | None = None
+    why_recommended: str | None = None
+    impact_chain: str | None = None
+    observation_points: str | None = None
     spotlight_reason: str | None = None
     spotlight_score: float | None = None
     spotlight_hook: str | None = None
@@ -1595,6 +1755,7 @@ class WatchLaterAddIn(BaseModel):
     title: str = ""
     media: str = ""
     note: str = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = None
 
     @model_validator(mode="after")
     def require_content_identity(self) -> Self:
@@ -1643,6 +1804,10 @@ class WatchLaterItem(BaseModel):
     resolved_target: str = ""
     error_code: str = ""
     error_message: str = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class WatchLaterListResponse(BaseModel):
@@ -1661,6 +1826,7 @@ class FavoriteAddIn(BaseModel):
     title: str = ""
     media: str = ""
     note: str = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = None
 
     @model_validator(mode="after")
     def require_content_identity(self) -> Self:
@@ -1709,6 +1875,10 @@ class FavoriteItem(BaseModel):
     resolved_target: str = ""
     error_code: str = ""
     error_message: str = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class FavoriteListResponse(BaseModel):
@@ -1770,6 +1940,7 @@ class SavedItemIn(BaseModel):
     author_name: _SavedIdentityString = ""
     cover_url: _SavedIdentityString = ""
     note: _SavedIdentityString = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = None
 
     @field_validator(
         "source_platform",
@@ -1923,6 +2094,10 @@ class SavedListItem(BaseModel):
     resolved_target: str = ""
     error_code: str = ""
     error_message: str = ""
+    recommendation_snapshot: RecommendationSnapshotOut | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class SavedListResponse(BaseModel):

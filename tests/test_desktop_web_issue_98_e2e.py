@@ -33,14 +33,24 @@ def _recommendations(
     return [
         {
             "id": index,
-            "bvid": f"BV1ISSUE98{index}",
-            "content_id": f"BV1ISSUE98{index}",
-            "content_url": f"https://www.bilibili.com/video/BV1ISSUE98{index}",
-            "source_platform": "bilibili",
-            "title": f"稳定卡片 {index}",
-            "up_name": f"UP {index}",
+            "bvid": f"news:issue98-{index}",
+            "item_key": f"news:issue98-{index}",
+            "content_id": f"issue98-{index}",
+            "article_id": f"issue98-{index}",
+            "content_url": f"https://example.com/news/issue-98-{index}",
+            "original_url": f"https://example.com/news/issue-98-{index}",
+            "source_platform": "news",
+            "content_type": "article",
+            "title": f"稳定新闻 {index}",
+            "up_name": f"测试媒体 {index}",
+            "media": f"测试媒体 {index}",
+            "publisher_name": f"测试媒体 {index}",
             "topic_label": "交互测试",
-            "expression": f"第 {index} 张卡片的推荐理由。",
+            "topic_group": "交互测试",
+            "content_scope": "full_text",
+            "temporal_class": "current",
+            "expression": f"第 {index} 条新闻的推荐理由。",
+            "body_text": f"第 {index} 条新闻的已采集正文。",
             "cover_url": (
                 f"https://synthetic.invalid/covers/issue-98-{index}.png" if image_backed else ""
             ),
@@ -52,12 +62,28 @@ def _recommendations(
 def _delights() -> list[dict[str, Any]]:
     return [
         {
-            "bvid": f"BV1DELIGHT{index}",
-            "content_id": f"BV1DELIGHT{index}",
-            "content_url": f"https://www.bilibili.com/video/BV1DELIGHT{index}",
-            "source_platform": "bilibili",
-            "title": f"惊喜卡片 {index}",
-            "delight_reason": f"第 {index} 张惊喜卡片的推荐理由。",
+            "id": 100 + index,
+            "bvid": f"news:delight-{index}",
+            "item_key": f"news:delight-{index}",
+            "content_id": f"delight-{index}",
+            "article_id": f"delight-{index}",
+            "content_url": f"https://example.com/news/delight-{index}",
+            "original_url": f"https://example.com/news/delight-{index}",
+            "source_platform": "news",
+            "content_type": "article",
+            "title": f"首选新闻 {index}",
+            "up_name": "测试媒体",
+            "media": "测试媒体",
+            "publisher_name": "测试媒体",
+            "topic_group": "首选测试",
+            "franchise_key": "首选故事",
+            "content_scope": "full_text",
+            "temporal_class": "current",
+            "body_text": f"第 {index} 条首选新闻的已采集正文。",
+            "delight_reason": f"第 {index} 条首选新闻的推荐理由。",
+            "why_recommended": f"第 {index} 条首选新闻与当前方向相关。",
+            "impact_chain": "这是用于浏览器合同的待验证影响链。",
+            "observation_points": "继续观察后续公开信息。",
             "delight_score": 0.9,
             "state": "pending",
         }
@@ -412,7 +438,17 @@ def _load_desktop_with_closed_drawer(
     page.set_viewport_size({"width": width, "height": 900})
     page.add_init_script("window.localStorage.setItem('openbiliclaw.sideDrawerOpen', '0')")
     page.goto(f"{base_url}/web/")
-    expect(page.locator("#delightCount")).to_have_text("1/2")
+    expect(page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(3)
+
+
+def _open_today_pick(page: Page, *, expected: str = "1/2") -> None:
+    tab = page.locator("#workbenchDelightTab")
+    tab.click()
+    expect(tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#delightWorkbenchPanel")).to_be_visible()
+    expect(page.locator("#recommendationWorkbenchPanel")).to_be_hidden()
+    expect(page.locator("#delightCount")).to_have_text(expected)
+    expect(page.locator("#delightBanner")).to_be_visible()
 
 
 def _delight_geometry(page: Page) -> dict[str, Any]:
@@ -420,12 +456,22 @@ def _delight_geometry(page: Page) -> dict[str, Any]:
         """() => {
           const layout = document.querySelector('.layout').getBoundingClientRect();
           const delight = document.querySelector('#delightBanner').getBoundingClientRect();
+          const thumb = document.querySelector('#delightThumb').getBoundingClientRect();
+          const body = document
+            .querySelector('#delightBanner .delight-body')
+            .getBoundingClientRect();
           return {
             layoutRight: layout.right,
             delightRight: delight.right,
             docClient: document.documentElement.clientWidth,
             docScroll: document.documentElement.scrollWidth,
             columns: getComputedStyle(document.querySelector('#delightBanner')).gridTemplateColumns,
+            thumbLeft: thumb.left,
+            thumbTop: thumb.top,
+            thumbRight: thumb.right,
+            thumbBottom: thumb.bottom,
+            bodyLeft: body.left,
+            bodyTop: body.top,
           };
         }"""
     )
@@ -475,7 +521,9 @@ def test_saved_badge_hydration_failure_does_not_block_home(
     chromium_page.route("**/api/saved/**", fail_saved_list)
     chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
 
-    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=3000)
+    cards = chromium_page.locator("#videoGrid .video-card[data-item-key]")
+    expect(cards).to_have_count(3, timeout=3000)
+    expect(chromium_page.locator("#videoGrid .video-card.is-skeleton")).to_have_count(0)
     chromium_page.wait_for_timeout(1000)
     expect(chromium_page.locator("#watchLaterCountBadge")).to_be_hidden()
     expect(chromium_page.locator("#favoritesCountBadge")).to_be_hidden()
@@ -515,7 +563,9 @@ def test_opening_saved_page_prevents_older_badge_hydration_from_winning(
         "() => window.__obcWatchLaterListReads === 1 "
         "&& typeof window.__obcResolveInitialWatchLater === 'function'"
     )
-    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=3000)
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(
+        3, timeout=3000
+    )
 
     chromium_page.locator("#contentLibraryBtn").click()
     expect(chromium_page.locator("#watchLaterCountBadge")).to_have_text("4", timeout=3000)
@@ -626,7 +676,7 @@ def test_liked_delight_keeps_nonduplicate_desktop_actions_available(
     ]
 
     chromium_page.goto(f"{base_url}/web/")
-    expect(chromium_page.locator("#delightCount")).to_have_text("1/1")
+    _open_today_pick(chromium_page, expected="1/1")
     expect(chromium_page.locator("#delightStatus")).to_contain_text("好，这类多来点。")
     like = chromium_page.locator('[data-delight="like"]')
     expect(like).to_have_attribute("aria-pressed", "true")
@@ -642,6 +692,7 @@ def test_failed_desktop_delight_like_restores_unselected_action(
     base_url, stub = issue_98_server
     stub.delight_response_status = 500
     chromium_page.goto(f"{base_url}/web/")
+    _open_today_pick(chromium_page)
     like = chromium_page.locator('[data-delight="like"]')
 
     like.click()
@@ -679,6 +730,7 @@ def test_delight_drag_and_switch_thresholds_in_chromium(
 ) -> None:
     base_url, _ = issue_98_server
     _load_desktop_with_closed_drawer(chromium_page, base_url, width=1440)
+    _open_today_pick(chromium_page)
     banner = chromium_page.locator("#delightBanner")
     count = chromium_page.locator("#delightCount")
 
@@ -705,6 +757,7 @@ def test_delight_uses_available_layout_width_without_horizontal_overflow(
 ) -> None:
     base_url, _ = issue_98_server
     _load_desktop_with_closed_drawer(chromium_page, base_url, width=860)
+    _open_today_pick(chromium_page)
 
     closed_geometry = _delight_geometry(chromium_page)
     _assert_delight_fits_available_width(closed_geometry)
@@ -713,7 +766,8 @@ def test_delight_uses_available_layout_width_without_horizontal_overflow(
     chromium_page.wait_for_timeout(400)
     open_geometry = _delight_geometry(chromium_page)
     _assert_delight_fits_available_width(open_geometry)
-    assert len(str(open_geometry["columns"]).split()) == 1
+    assert abs(open_geometry["thumbLeft"] - open_geometry["bodyLeft"]) <= 2
+    assert open_geometry["bodyTop"] >= open_geometry["thumbBottom"] - 2
 
 
 def test_delight_keeps_two_columns_when_wide_and_drawer_is_closed(
@@ -722,21 +776,21 @@ def test_delight_keeps_two_columns_when_wide_and_drawer_is_closed(
 ) -> None:
     base_url, _ = issue_98_server
     _load_desktop_with_closed_drawer(chromium_page, base_url, width=1440)
+    _open_today_pick(chromium_page)
 
     geometry = _delight_geometry(chromium_page)
     _assert_delight_fits_available_width(geometry)
-    tracks = str(geometry["columns"]).split()
-    assert len(tracks) == 2
-    assert all(track.endswith("px") for track in tracks)
+    assert geometry["bodyLeft"] >= geometry["thumbRight"] - 2
+    assert geometry["bodyTop"] < geometry["thumbBottom"] - 2
 
 
-def test_recommendation_feedback_is_immediate_stable_and_undoable(
+def test_recommendation_detail_feedback_is_immediate_stable_and_undoable(
     issue_98_server: tuple[str, Issue98Stub],
     chromium_page: Page,
 ) -> None:
     base_url, stub = issue_98_server
     chromium_page.goto(f"{base_url}/web/")
-    cards = chromium_page.locator("#videoGrid .video-card")
+    cards = chromium_page.locator("#videoGrid .video-card[data-item-key]")
     expect(cards).to_have_count(3)
     chromium_page.evaluate("() => document.fonts.ready")
     chromium_page.wait_for_timeout(500)
@@ -745,48 +799,95 @@ def test_recommendation_feedback_is_immediate_stable_and_undoable(
     second_position = _card_position(second)
 
     first = cards.first
-    first.locator('[data-action="like"]').click()
+    first.locator("[data-select-recommendation]").click()
+    pane = chromium_page.locator("#recommendationDetailPane")
+    like = pane.locator('[data-detail-action="like"]')
+    undo = pane.locator("[data-detail-undo]")
+    status = pane.locator("#recommendationDetailStatus")
+    like.click()
 
-    expect(first.locator(".status-line")).to_contain_text("撤销")
+    expect(status).to_contain_text("撤销")
+    expect(like).to_be_disabled()
+    expect(undo).to_be_visible()
     assert stub.feedback_posts == []
     assert second.get_attribute("data-bvid") == second_identity
     _assert_position_stable(_card_position(second), second_position)
 
-    first.locator("[data-feedback-undo]").click()
+    undo.click()
     chromium_page.wait_for_timeout(500)
     assert stub.feedback_posts == []
-    expect(first.locator('[data-action="like"]')).to_be_enabled()
-    expect(first.locator(".status-line")).to_have_text("")
+    expect(like).to_be_enabled()
+    expect(like).to_have_attribute("aria-pressed", "false")
+    expect(undo).to_be_hidden()
+    expect(status).to_have_text("")
 
     stub.feedback_delay_seconds = 0.8
-    first.locator('[data-action="dislike"]').click()
+    like.click()
     assert stub.feedback_received.wait(timeout=8)
-    expect(first.locator(".status-line")).to_contain_text("正在保存")
-    second.locator('[data-action="like"]').click()
-    expect(second.locator(".status-line")).to_contain_text("撤销")
-    assert second.get_attribute("data-bvid") == second_identity
-    _assert_position_stable(_card_position(second), second_position)
-    second.locator("[data-feedback-undo]").click()
+    expect(status).to_contain_text("正在保存喜欢")
+    expect(like).to_be_disabled()
+    expect(status).to_contain_text("已记录喜欢", timeout=3000)
+    expect(like).to_be_disabled()
     assert len(stub.feedback_posts) == 1
 
+    # 成功后喜欢按钮保持禁用，即使脚本再调用 click 也不应二次提交。
+    like.evaluate("button => button.click()")
+    chromium_page.wait_for_timeout(300)
+    assert len(stub.feedback_posts) == 1
+    assert second.get_attribute("data-bvid") == second_identity
+    _assert_position_stable(_card_position(second), second_position)
 
-def test_recommendation_feedback_failure_rolls_back_current_card(
+
+def test_recommendation_detail_feedback_failure_rolls_back_current_card(
     issue_98_server: tuple[str, Issue98Stub],
     chromium_page: Page,
 ) -> None:
     base_url, stub = issue_98_server
     stub.feedback_status = 500
     chromium_page.goto(f"{base_url}/web/")
-    first = chromium_page.locator("#videoGrid .video-card").first
-    like = first.locator('[data-action="like"]')
+    first = chromium_page.locator("#videoGrid .video-card[data-item-key]").first
+    first.locator("[data-select-recommendation]").click()
+    pane = chromium_page.locator("#recommendationDetailPane")
+    like = pane.locator('[data-detail-action="like"]')
+    status = pane.locator("#recommendationDetailStatus")
 
     like.click()
     assert stub.feedback_received.wait(timeout=8)
 
     expect(like).to_be_enabled(timeout=3000)
     expect(like).not_to_have_class("is-active")
-    expect(first.locator(".status-line")).to_have_text("")
+    expect(like).to_have_attribute("aria-pressed", "false")
+    expect(status).to_have_text("")
     expect(chromium_page.locator("#toastContainer .toast-item").first).to_contain_text("已恢复")
+
+
+def test_recommendation_detail_negative_feedback_removes_committed_item(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, stub = issue_98_server
+    chromium_page.goto(f"{base_url}/web/")
+    cards = chromium_page.locator("#videoGrid .video-card[data-item-key]")
+    expect(cards).to_have_count(3)
+    removed_bvid = cards.first.get_attribute("data-bvid")
+    cards.first.locator("[data-select-recommendation]").click()
+    pane = chromium_page.locator("#recommendationDetailPane")
+    dislike = pane.locator('[data-detail-action="dislike"]')
+
+    dislike.click()
+    expect(pane.locator("#recommendationDetailStatus")).to_contain_text("撤销")
+    expect(dislike).to_be_disabled()
+    assert stub.feedback_received.wait(timeout=8)
+
+    expect(cards).to_have_count(2, timeout=3000)
+    expect(
+        chromium_page.locator(f'#videoGrid .video-card[data-bvid="{removed_bvid}"]')
+    ).to_have_count(0)
+    assert len(stub.feedback_posts) == 1
+    assert stub.feedback_posts[0]["recommendation_id"] == 1
+    assert stub.feedback_posts[0]["feedback_type"] == "dislike"
+    assert stub.feedback_posts[0]["note"] == ""
+    assert stub.feedback_posts[0]["request_id"]
 
 
 def test_recommendations_and_runtime_recover_without_leaving_init_gate(
@@ -814,7 +915,9 @@ def test_recommendations_and_runtime_recover_without_leaving_init_gate(
     chromium_page.route("**/api/runtime-status", fail_initial_runtime_reads)
     chromium_page.goto(f"{base_url}/web/")
 
-    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=5000)
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(
+        3, timeout=5000
+    )
     expect(chromium_page.locator("#videoGrid .init-onboarding")).to_have_count(0)
     expect(chromium_page.locator("#poolAvailable")).to_contain_text("30")
     assert request_counts["recommendations"] >= 2
@@ -829,7 +932,9 @@ def test_fast_recommendations_render_before_slow_health_and_runtime_reconciles(
     stub.health_delay_seconds = 4.0
     chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
 
-    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=1500)
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(
+        3, timeout=1500
+    )
     expect(chromium_page.locator("#poolAvailable")).to_contain_text("27", timeout=3000)
     assert stub.recommendation_reads == 1
     assert stub.runtime_reads >= 2
@@ -847,12 +952,14 @@ def test_runtime_reread_does_not_wait_for_slow_initial_runtime(
         f"runtime reread did not start: recommendations={stub.recommendation_reads}, "
         f"runtime={stub.runtime_reads}"
     )
-    expect(chromium_page.locator("#videoGrid .video-card")).to_have_count(3, timeout=500)
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(
+        3, timeout=500
+    )
     expect(chromium_page.locator("#poolAvailable")).to_contain_text("27", timeout=3000)
     assert stub.runtime_reads >= 2
 
 
-def test_delayed_recommendations_schedule_autoload_after_failed_runtime_reread(
+def test_delayed_recommendations_do_not_autoload_without_inner_scroll_after_failed_runtime_reread(
     issue_98_server: tuple[str, Issue98Stub],
     chromium_page: Page,
 ) -> None:
@@ -862,21 +969,13 @@ def test_delayed_recommendations_schedule_autoload_after_failed_runtime_reread(
     chromium_page.set_viewport_size({"width": 1440, "height": 2200})
     chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
 
-    cards = chromium_page.locator("#videoGrid .video-card")
+    cards = chromium_page.locator("#videoGrid .video-card[data-item-key]")
     expect(cards).to_have_count(3, timeout=3000)
     assert stub.runtime_reread_received.wait(timeout=1.5)
-    assert chromium_page.evaluate(
-        """() => {
-          const sentinel = document.getElementById('loadMoreSentinel');
-          const rect = sentinel.getBoundingClientRect();
-          return rect.top <= window.innerHeight + 50 && rect.bottom >= -50;
-        }"""
+    assert not stub.append_received.wait(timeout=1.5), (
+        "delayed recommendation render auto-loaded without a real #videoGrid scroll"
     )
-
-    assert stub.append_received.wait(timeout=1.5), (
-        "recommendation render did not re-check auto-load geometry"
-    )
-    assert stub.append_posts == [{"excluded_bvids": ["BV1ISSUE981", "BV1ISSUE982", "BV1ISSUE983"]}]
+    assert stub.append_posts == []
 
 
 def test_recommendation_cover_requests_are_bounded_before_scroll(
@@ -894,7 +993,7 @@ def test_recommendation_cover_requests_are_bounded_before_scroll(
     chromium_page.route("https://synthetic.invalid/**", block_synthetic_upstream)
     chromium_page.goto(f"{base_url}/web/", wait_until="domcontentloaded")
 
-    cards = chromium_page.locator("#videoGrid .video-card")
+    cards = chromium_page.locator("#videoGrid .video-card[data-item-key]")
     expect(cards).to_have_count(80)
     for index in range(4):
         expect(cards.nth(index).locator("img")).to_have_attribute("loading", "eager")

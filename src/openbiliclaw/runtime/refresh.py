@@ -1254,9 +1254,13 @@ class ContinuousRefreshController:
             hours=self.notification_cooldown_hours
         ):
             return None
-        candidate = self.database.get_notification_candidate(
-            min_confidence=0.82,
-            source_platform=source_platform,
+        candidate = (
+            self.database.get_notification_candidate(
+                min_confidence=0.82,
+                source_platform=source_platform,
+            )
+            if source_platform
+            else self.database.get_notification_candidate(min_confidence=0.82)
         )
         if candidate is None:
             return None
@@ -1322,7 +1326,7 @@ class ContinuousRefreshController:
             break
         if candidate is None:
             return None
-        return {
+        result: dict[str, object] = {
             "bvid": str(candidate.get("bvid", "")),
             "item_key": str(candidate.get("item_key", "")),
             "content_id": str(candidate.get("content_id", "") or candidate.get("bvid", "")),
@@ -1333,6 +1337,21 @@ class ContinuousRefreshController:
             "cover_url": str(candidate.get("cover_url", "")),
             "content_url": str(candidate.get("content_url", "")),
             "source_platform": str(candidate.get("source_platform", "") or "bilibili"),
+            # Preserve the canonical fields needed by the API's shared
+            # NewsClaw projection.  Pending delight is an API view of the same
+            # candidate, not a second classification pipeline.
+            "source_strategy": str(candidate.get("source", "") or ""),
+            "up_name": str(candidate.get("up_name", "") or ""),
+            "tags": candidate.get("tags", []),
+            "raw_payload": candidate.get("raw_payload", {}),
+            "topic_group": str(candidate.get("topic_group", "") or ""),
+            "franchise_key": str(candidate.get("franchise_key", "") or ""),
+            "style_key": str(candidate.get("style_key", "") or ""),
+            "content_scope": str(candidate.get("content_scope", "") or ""),
+            "freshness": str(candidate.get("freshness", "") or ""),
+            "temporal_class": str(candidate.get("temporal_class", "") or ""),
+            "temporal_state": str(candidate.get("temporal_state", "") or ""),
+            "relevance_score": float(candidate.get("relevance_score", 0.0) or 0.0),
             "published_at": str(candidate.get("published_at", "") or ""),
             "published_label": str(candidate.get("published_label", "") or ""),
             "content_type": str(candidate.get("content_type", "") or "video"),
@@ -1346,6 +1365,21 @@ class ContinuousRefreshController:
                 candidate.get("favorite_count", 0) or candidate.get("collect_count", 0) or 0
             ),
         }
+        # Use the exact same projection as REST batches.  Keeping the import
+        # local avoids making the scheduler's module-import graph depend on the
+        # FastAPI application while still preventing WebSocket drift.
+        from openbiliclaw.api.recommendation_tags import (
+            build_recommendation_presentation_fields,
+        )
+
+        result.update(
+            build_recommendation_presentation_fields(
+                result,
+                expression=result.get("delight_reason", ""),
+                confidence=result.get("relevance_score"),
+            )
+        )
+        return result
 
     def _load_disliked_topic_phrases(self) -> list[str]:
         """Return lowercased *effective* disliked-topic substrings.
@@ -3097,6 +3131,25 @@ class ContinuousRefreshController:
         candidate = self.get_pending_delight()
         if candidate is None:
             return
+        presentation_keys = (
+            "topic_group",
+            "franchise_key",
+            "style_key",
+            "content_scope",
+            "freshness",
+            "temporal_class",
+            "temporal_state",
+            "display_tags",
+            "priority_level",
+            "priority_label",
+            "priority_score",
+            "priority_signals",
+            "priority_reason",
+            "priority_version",
+            "why_recommended",
+            "impact_chain",
+            "observation_points",
+        )
         await self._publish_event(
             {
                 "type": "delight.candidate",
@@ -3126,6 +3179,7 @@ class ContinuousRefreshController:
                 "danmaku_count": candidate.get("danmaku_count", 0),
                 "favorite_count": candidate.get("favorite_count", 0)
                 or candidate.get("collect_count", 0),
+                **{key: candidate[key] for key in presentation_keys if key in candidate},
             }
         )
 

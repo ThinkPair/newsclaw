@@ -18,7 +18,7 @@ def test_delight_view_model_keeps_decoded_body_text() -> None:
     assert "body_text: delightBody" in normalize
 
 
-def test_delight_excerpt_has_accessible_expand_controls() -> None:
+def test_delight_excerpt_has_accessible_collapsed_raw_content_controls() -> None:
     assert 'id="delightExcerpt"' in INDEX_HTML
     assert 'id="delightExcerptText"' in INDEX_HTML
     assert 'id="delightExcerptToggle"' in INDEX_HTML
@@ -27,9 +27,10 @@ def test_delight_excerpt_has_accessible_expand_controls() -> None:
 
     sync = _function_body("syncDelightExcerpt")
     assert ".textContent = bodyText" in sync
-    assert "excerpt.scrollHeight > excerpt.clientHeight + 1" in sync
-    assert "toggle.hidden = !overflows" in sync
+    assert "excerpt.hidden = true" in sync
+    assert "toggle.hidden = false" in sync
     assert 'toggle.setAttribute("aria-expanded", "false")' in sync
+    assert "查看已采集的原始内容" in INDEX_HTML
 
 
 def test_delight_excerpt_css_clamps_five_lines_until_expanded() -> None:
@@ -39,7 +40,7 @@ def test_delight_excerpt_css_clamps_five_lines_until_expanded() -> None:
     assert "-webkit-line-clamp: unset" in APP_CSS
 
 
-def test_missing_or_failed_delight_cover_uses_text_media_fallback() -> None:
+def test_missing_or_failed_delight_cover_uses_news_tags_or_non_news_text() -> None:
     render_cover = _function_body("renderDelightCover")
     render_text = _function_body("renderDelightTextMedia")
     render_fallback = _function_body("renderDelightFallbackMedia")
@@ -47,6 +48,8 @@ def test_missing_or_failed_delight_cover_uses_text_media_fallback() -> None:
     assert 'image.addEventListener("error"' in render_cover
     assert "image.parentElement !== thumb" in render_cover
     assert "renderDelightTextMedia(thumb, delight)" in render_fallback
+    assert 'recommendationPlatformSlug(delight) === "news"' in render_fallback
+    assert "renderDelightTagMedia(thumb, delight)" in render_fallback
     assert 'String(delight?.body_text || "").trim()' in render_fallback
     assert 'text.className = "delight-text-media-copy"' in render_text
     assert "text.textContent = bodyText" in render_text

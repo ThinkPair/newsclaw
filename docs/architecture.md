@@ -39,6 +39,13 @@ NewsClaw explicit research (REST / Agent Bridge)
         → bounded evidence + source URL → newsclaw_research.db
         └─ no automatic write to profile / discovery candidates / recommendation pool
 
+NewsClaw judgment workbench
+        → recommendation_tags projection (tags + decision-priority-v2 + why / impact / observations)
+        → bounded stable sort → desktop priority queue / Today Pick → one selected detail
+        ├─ explicit feedback → durable event → profile learning
+        ├─ save / click / feedback / removal → immutable judgment snapshot → local history
+        └─ observation → tracked_observations active / archived ledger (no automatic Tavily call)
+
 migration control plane (real loopback; browser calls also require same origin)
                 ├─ export → config minus api.auth + online SQLite snapshot + portable files → checksummed plaintext .obcbackup
                 ├─ import(request_id) → bounded validation → private pending stage ↔ status / cancel

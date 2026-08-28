@@ -99,117 +99,148 @@
           <button class="nav-action" id="chatBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span>聊聊口味</span><span class="nav-count-badge" id="chatPendingCountBadge" hidden></span></button>
           <button class="nav-action" id="settingsBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span><span>设置</span></button>
         </nav>
-        <section class="side-section side-runtime-panel" aria-label="实时运行摘要">
-          <p class="eyebrow">Runtime</p>
-          <h3>推荐池实时看板</h3>
-          <p id="runtimeSummary">连接 FastAPI 后，这里会显示候选池、补货和新动作记录。</p>
-          <div class="hero-status-grid" aria-label="推荐池实时状态">
-            <div><span>当前可换库存</span><strong id="poolAvailable">—</strong></div>
-            <div><span>补货进展</span><strong id="poolReplenished">—</strong></div>
-            <div><span>补货状态</span><strong id="poolRefreshState">—</strong></div>
+        <section class="side-section side-runtime-panel side-health-summary" aria-label="系统健康摘要">
+          <div class="side-health-head">
+            <div>
+              <p class="eyebrow">Health</p>
+              <h3>系统健康</h3>
+            </div>
+            <span class="side-health-state"><span class="side-health-dot" aria-hidden="true"></span><span id="sideHealthState">连接中</span></span>
           </div>
-          <div class="metric-row">
-            <div class="metric"><strong id="metricPool">—</strong><span>当前可换</span></div>
-            <div class="metric"><strong id="metricUnread">—</strong><span>通知数</span></div>
-            <div class="metric"><strong id="metricSources">—</strong><span>内容源</span></div>
+          <p id="runtimeSummary">正在连接本地后端并读取推荐池状态。</p>
+          <div class="side-health-kpis" aria-label="推荐池健康指标">
+            <div><span>可换库存</span><strong id="poolAvailable">—</strong><strong id="metricPool" class="sr-only">—</strong></div>
+            <div><span>通知</span><strong id="metricUnread">—</strong></div>
+            <div><span>来源</span><strong id="metricSources">—</strong></div>
           </div>
-          <p class="hero-topics">最近主题：<span id="poolTopics">等待后端同步</span></p>
+          <dl class="side-health-details">
+            <div><dt>补货</dt><dd id="poolRefreshState">—</dd></div>
+            <div><dt>进度</dt><dd id="poolReplenished">—</dd></div>
+            <div><dt>主题</dt><dd id="poolTopics">等待同步</dd></div>
+          </dl>
           <p id="accountSyncStatus" class="account-sync-status" hidden></p>
         </section>
-        <section class="side-section side-activity-section" data-od-id="activity-rail" aria-label="后台动态摘要">
-          <p class="eyebrow">Activity</p>
-          <h3>后台刚记住的事</h3>
+        <section class="side-section side-activity-section side-activity-summary" data-od-id="activity-rail" aria-label="最近后台动态">
+          <div class="side-health-head">
+            <div><p class="eyebrow">Latest</p><h3>最近动态</h3></div>
+            <button class="side-text-link" id="activityBtn" type="button">全部</button>
+          </div>
           <div class="activity-list" id="activityList"></div>
-          <div class="drawer-actions"><button class="small-btn" id="activityBtn" type="button">查看全部动态</button></div>
         </section>
       </div>
     </aside>
 
     <main class="layout" id="home">
       <section class="main-col" id="homePage" aria-label="推荐首页" data-od-id="recommendation-home">
-        <section class="delight" id="delightBanner" data-od-id="delight-banner">
-          <div class="thumb" id="delightThumb" role="button" tabindex="0" aria-label="打开当前惊喜推荐"></div>
-          <div class="delight-body">
-            <div class="delight-meta">
-              <p class="eyebrow">惊喜推荐</p>
-              <div class="delight-queue-tools" aria-label="惊喜推荐队列管理">
-                <div class="delight-nav" aria-label="惊喜推荐队列导航">
-                  <button class="icon-btn" data-delight="prev" type="button" aria-label="上一条惊喜推荐">‹</button>
-                  <span id="delightCount">1/1</span>
-                  <button class="icon-btn" data-delight="next" type="button" aria-label="下一条惊喜推荐">›</button>
-                </div>
-                <button class="delight-dismiss-btn" data-delight="dismiss" type="button" aria-label="看过了，不再推荐" title="看过了，不再推荐">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                </button>
-              </div>
-            </div>
-            <div class="delight-copy">
-              <h3 id="delightTitle">你可能会意外喜欢：县域经济的债务齿轮</h3>
-              <p id="delightStats" class="video-stats" hidden></p>
-              <p id="delightPublished" class="published-time" hidden></p>
-              <div id="delightExcerpt" class="delight-excerpt" hidden>
-                <p id="delightExcerptText" class="delight-excerpt-text"></p>
-                <button id="delightExcerptToggle" class="delight-excerpt-toggle" type="button" aria-expanded="false" aria-controls="delightExcerptText" hidden>展开正文</button>
-              </div>
-              <p id="delightReason">你最近的轨迹同时出现了宏观债务、地方财政和长叙事内容，这条把它们咬合得很清楚。</p>
-              <div class="delight-chat-turns" id="delightTurns" hidden></div>
-            </div>
-          </div>
-          <div class="delight-actions" aria-label="惊喜推荐操作">
-            <div class="delight-main-actions" aria-label="打开或讨论这条推荐">
-                <button class="small-btn" data-delight="view" type="button">阅读原文</button>
-                <div class="comment-field"><input id="delightCommentInput" placeholder="想围绕这条聊什么？" aria-label="想围绕这条聊什么？"></div>
-                <button class="small-btn composer-cancel" data-delight="cancel-comment" type="button" aria-label="返回" title="返回">‹</button>
-                <button class="small-btn chat-action" data-delight="chat" type="button">聊一聊</button>
-              </div>
-              <div class="delight-feedback-actions card-feedback-icons" aria-label="反馈这条推荐">
-                <button class="feedback-icon-btn" data-delight="like" type="button" aria-label="喜欢" title="喜欢" aria-pressed="false">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M7 10v10"/><path d="M15 5.2 14 10h5.4a1.8 1.8 0 0 1 1.7 2.2l-1.5 6A2.4 2.4 0 0 1 17.3 20H7"/><path d="M7 10l4.5-5.3A2 2 0 0 1 15 6v4"/></svg>
-                </button>
-                <span class="feedback-separator" aria-hidden="true">/</span>
-                <button class="feedback-icon-btn" data-delight="dislike" type="button" aria-label="不感兴趣" title="不感兴趣">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M17 14V4"/><path d="M9 18.8 10 14H4.6a1.8 1.8 0 0 1-1.7-2.2l1.5-6A2.4 2.4 0 0 1 6.7 4H17"/><path d="M17 14l-4.5 5.3A2 2 0 0 1 9 18v-4"/></svg>
-                </button>
-                <span class="feedback-separator" aria-hidden="true">/</span>
-                <button class="feedback-icon-btn watch-later-btn" data-delight="watch-later" type="button" aria-label="稍后读" title="稍后读" aria-pressed="false">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3.2 1.9"/></svg>
-                </button>
-                <span class="feedback-separator" aria-hidden="true">/</span>
-                <button class="feedback-icon-btn favorite-btn" data-delight="favorite" type="button" aria-label="收藏" title="收藏" aria-pressed="false">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.65 5.37 5.93.86-4.29 4.18 1.01 5.9L12 17.1l-5.31 2.8 1.01-5.9L3.41 9.83l5.93-.86z"/></svg>
-                </button>
-              </div>
-          </div>
-          <p class="status-line" id="delightStatus" aria-live="polite"></p>
-        </section>
-
-        <section data-od-id="recommendations">
-          <div class="section-head">
+        <section class="judgment-workbench" data-od-id="recommendations" aria-labelledby="workbenchTitle">
+          <header class="workbench-head">
             <div>
-              <p class="eyebrow">Recommendations</p>
-              <h2>为你推荐的内容</h2>
-              <p>新闻爪根据你的近期兴趣筛选真实新闻，有任何意见尽管和我聊。</p>
+              <p class="eyebrow">Daily intelligence desk</p>
+              <h2 id="workbenchTitle">今日判断工作台</h2>
+              <p>先扫优先级与主题，再在右侧核对推荐依据和原始信息。</p>
             </div>
-            <div class="drawer-actions recommendation-actions">
-              <button class="icon-btn" id="reshuffleBtn" type="button" aria-label="换一批" title="换一批">↻</button>
-              <button class="pill-btn" id="resetFiltersBtn" type="button" hidden="">重置筛选</button>
+            <div class="workbench-toolbar">
+              <div class="workbench-view-tabs" role="tablist" aria-label="工作台内容">
+                <button id="workbenchQueueTab" type="button" role="tab" aria-selected="true" aria-controls="recommendationWorkbenchPanel">推荐队列</button>
+                <button id="workbenchDelightTab" type="button" role="tab" aria-selected="false" aria-controls="delightWorkbenchPanel" tabindex="-1">今日首选</button>
+              </div>
+              <div class="drawer-actions recommendation-actions">
+                <button class="icon-btn" id="reshuffleBtn" type="button" aria-label="换一批" title="换一批">↻</button>
+                <button class="pill-btn" id="resetFiltersBtn" type="button" hidden>重置筛选</button>
+              </div>
+            </div>
+          </header>
+
+          <div class="workbench-panel" id="recommendationWorkbenchPanel" role="tabpanel" aria-labelledby="workbenchQueueTab">
+            <div class="recommendation-filter-controls" aria-label="筛选当前已加载的推荐">
+              <div class="filter-row" id="filterRow" role="tablist" aria-label="推荐类别"></div>
+              <label class="media-filter" for="mediaFilterSelect">
+                <span>媒体来源</span>
+                <select id="mediaFilterSelect" aria-label="按媒体来源筛选"><option value="全部来源">全部来源</option></select>
+              </label>
+            </div>
+            <div class="judgment-workbench-body">
+              <section class="recommendation-queue-pane" aria-labelledby="queuePaneTitle">
+                <div class="queue-pane-head">
+                  <div><p class="eyebrow">Priority queue</p><h3 id="queuePaneTitle">优先阅读队列</h3></div>
+                  <p id="queueResultSummary" class="queue-result-summary" role="status" aria-live="polite">正在读取推荐…</p>
+                </div>
+                <div class="card-grid recommendation-queue" id="videoGrid" role="list">
+                  <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div></article>
+                  <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div></article>
+                  <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div></article>
+                  <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div></article>
+                </div>
+                <div id="loadMoreSentinel" aria-hidden="true"></div>
+                <div class="load-row"><button class="pill-btn dark" id="loadMoreBtn" type="button">加载更多推荐</button></div>
+              </section>
+
+              <button class="recommendation-detail-scrim" id="recommendationDetailScrim" type="button" aria-label="关闭新闻详情" hidden></button>
+              <section class="recommendation-detail-pane" id="recommendationDetailPane" aria-labelledby="recommendationDetailTitle" aria-live="polite">
+                <div class="detail-pane-empty">
+                  <p class="eyebrow">Analysis</p>
+                  <h3 id="recommendationDetailTitle">等待推荐</h3>
+                  <p>推荐加载完成后，左侧第一条会自动成为当前判断对象。</p>
+                </div>
+              </section>
             </div>
           </div>
-          <!-- chip 由 renderFilters 渲染成 role=tab（含 aria-selected 与库存计数） -->
-          <div class="filter-row" id="filterRow" role="tablist" aria-label="推荐来源与库存"></div>
-          <!-- 首屏骨架占位：后端推荐取回前先撑住版面，renderVideos 首次渲染时整体替换 -->
-          <div class="card-grid" id="videoGrid">
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
-            <article class="video-card is-skeleton" aria-hidden="true"><div class="cover skeleton-shimmer"></div><div><p class="video-title skeleton-line skeleton-shimmer"></p><p class="video-meta skeleton-line skeleton-shimmer short"></p></div><p class="reason skeleton-line skeleton-shimmer"></p></article>
+
+          <div class="workbench-panel delight-workbench-panel" id="delightWorkbenchPanel" role="tabpanel" aria-labelledby="workbenchDelightTab" hidden>
+            <section class="delight" id="delightBanner" data-od-id="delight-banner">
+              <div class="thumb" id="delightThumb" role="button" tabindex="0" aria-label="打开当前今日首选"></div>
+              <div class="delight-body">
+                <div class="delight-meta">
+                  <div><p class="eyebrow">今日首选</p><span class="delight-mode-note">高惊喜度候选</span></div>
+                  <div class="delight-queue-tools" aria-label="今日首选队列管理">
+                    <div class="delight-nav" aria-label="今日首选队列导航">
+                      <button class="icon-btn" data-delight="prev" type="button" aria-label="上一条今日首选">‹</button>
+                      <span id="delightCount">1/1</span>
+                      <button class="icon-btn" data-delight="next" type="button" aria-label="下一条今日首选">›</button>
+                    </div>
+                    <button class="delight-dismiss-btn" data-delight="dismiss" type="button" aria-label="看过了，不再推荐" title="看过了，不再推荐">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                    </button>
+                  </div>
+                </div>
+                <div class="delight-copy">
+                  <h3 id="delightTitle">正在读取今日首选</h3>
+                  <p id="delightStats" class="video-stats" hidden></p>
+                  <p id="delightPublished" class="published-time" hidden></p>
+                  <div class="delight-decision-meta" id="delightDecisionMeta" hidden>
+                    <div class="queue-card-flags" id="delightPriorityFlags"></div>
+                    <p class="detail-priority-reason" id="delightPriorityReason" hidden></p>
+                    <div class="recommendation-detail-tags" id="delightDecisionTags" aria-label="今日首选标签"></div>
+                  </div>
+                  <div class="detail-analysis-stack delight-analysis-stack" id="delightAnalysis" hidden></div>
+                  <div id="delightExcerpt" class="delight-excerpt" hidden>
+                    <p id="delightExcerptText" class="delight-excerpt-text"></p>
+                    <button id="delightExcerptToggle" class="delight-excerpt-toggle" type="button" aria-expanded="false" aria-controls="delightExcerptText" hidden>查看已采集的原始内容</button>
+                  </div>
+                  <p id="delightReason" class="delight-reason-fallback">后端返回惊喜推荐后，这里会说明为什么它值得跳出日常偏好看一眼。</p>
+                  <div class="delight-chat-turns" id="delightTurns" hidden></div>
+                </div>
+              </div>
+              <div class="delight-actions" aria-label="今日首选操作">
+                <div class="delight-main-actions" aria-label="打开或讨论今日首选">
+                  <button class="small-btn" data-delight="view" type="button">阅读原文</button>
+                  <div class="comment-field"><input id="delightCommentInput" placeholder="想围绕这条聊什么？" aria-label="想围绕这条聊什么？"></div>
+                  <button class="small-btn composer-cancel" data-delight="cancel-comment" type="button" aria-label="返回" title="返回">‹</button>
+                  <button class="small-btn chat-action" data-delight="chat" type="button">聊一聊</button>
+                </div>
+                <div class="delight-feedback-actions card-feedback-icons" aria-label="反馈今日首选">
+                  <button class="feedback-icon-btn" data-delight="like" type="button" aria-label="喜欢" title="喜欢" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M7 10v10"/><path d="M15 5.2 14 10h5.4a1.8 1.8 0 0 1 1.7 2.2l-1.5 6A2.4 2.4 0 0 1 17.3 20H7"/><path d="M7 10l4.5-5.3A2 2 0 0 1 15 6v4"/></svg></button>
+                  <span class="feedback-separator" aria-hidden="true">/</span>
+                  <button class="feedback-icon-btn" data-delight="dislike" type="button" aria-label="不感兴趣" title="不感兴趣"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M17 14V4"/><path d="M9 18.8 10 14H4.6a1.8 1.8 0 0 1-1.7-2.2l1.5-6A2.4 2.4 0 0 1 6.7 4H17"/><path d="M17 14l-4.5 5.3A2 2 0 0 1 9 18v-4"/></svg></button>
+                  <span class="feedback-separator" aria-hidden="true">/</span>
+                  <button class="feedback-icon-btn watch-later-btn" data-delight="watch-later" type="button" aria-label="稍后读" title="稍后读" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3.2 1.9"/></svg></button>
+                  <span class="feedback-separator" aria-hidden="true">/</span>
+                  <button class="feedback-icon-btn favorite-btn" data-delight="favorite" type="button" aria-label="收藏" title="收藏" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.65 5.37 5.93.86-4.29 4.18 1.01 5.9L12 17.1l-5.31 2.8 1.01-5.9L3.41 9.83l5.93-.86z"/></svg></button>
+                </div>
+              </div>
+              <div class="delight-state-row"><p class="status-line" id="delightStatus" aria-live="polite"></p><button class="small-btn" id="delightRetryBtn" data-delight="retry" type="button" hidden>重新读取</button></div>
+            </section>
           </div>
-          <div id="loadMoreSentinel" aria-hidden="true"></div>
-          <div class="load-row"><button class="pill-btn dark" id="loadMoreBtn" type="button">加载更多推荐</button></div>
         </section>
       </section>
 

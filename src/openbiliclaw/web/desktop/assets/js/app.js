@@ -41,6 +41,7 @@
       migrationStatus: "/migration/status",
       watchLater: "/watch-later",
       favorites: "/favorites",
+      trackedObservations: "/news/tracked-observations",
       profileEdit: "/profile/edit",
       profileEditState: "/profile/edit-state"
     };
@@ -87,6 +88,7 @@
     const state = {
       query: "",
       filter: "全部",
+      mediaFilter: "全部来源",
       activeFeedback: null,
       profile: null,
       editingProfile: false,
@@ -108,6 +110,8 @@
       delights: [],
       delightIndex: 0,
       delight: null,
+      delightLoadState: "loading",
+      delightLoadError: "",
       degraded: false,
       config: null,
       llmDraft: null,
@@ -121,6 +125,9 @@
       // null = 尚未成功读取过（未知态）；读取失败绝不把它改写成 0。
       platformAvailability: null,
       videos: [],
+      selectedRecommendationKey: "",
+      recommendationDetailSheetOpen: false,
+      workbenchView: "recommendations",
       messages: [],
       messageListSnapshot: null,
       messageListDomLocked: false,
@@ -137,6 +144,8 @@
       ],
       pendingConfirmations: { count: 0, items: [], expanded: false }
     };
+    let recommendationDetailOpener = null;
+    let recommendationSyncChannel = null;
 
     const $ = (selector) => document.querySelector(selector);
 
@@ -206,6 +215,9 @@
     const platformLabel = { cls: "财联社", wallstreetcn: "华尔街见闻", yicai: "第一财经", sina: "新浪财经", eastmoney: "东方财富", tenjqka: "同花顺", xinhua: "新华网", caixin: "财新网", cs: "中证网", cctv: "央视新闻", tushare: "Tushare", rss: "RSS" };
     const platformAliases = { cls: "cls", "财联社": "cls", wallstreetcn: "wallstreetcn", "华尔街见闻": "wallstreetcn", yicai: "yicai", "第一财经": "yicai", sina: "sina", "新浪财经": "sina", eastmoney: "eastmoney", "东方财富": "eastmoney", tenjqka: "tenjqka", "同花顺": "tenjqka", xinhua: "xinhua", "新华网": "xinhua", caixin: "caixin", "财新网": "caixin", cs: "cs", "中证网": "cs", cctv: "cctv", "央视新闻": "cctv", tushare: "tushare", rss: "rss" };
     const textCardContentTypes = new Set(["tweet", "thread", "answer", "article", "question", "post", "comment"]);
+    const DISPLAY_TAG_TYPES = new Set(["topic", "story", "temporal", "evidence"]);
+    const DISPLAY_TAG_TYPE_LABELS = { topic: "主题", story: "故事", temporal: "时效", evidence: "证据" };
+    const ALL_MEDIA_FILTER = "全部来源";
     // v0.3.118+: bilibili is selectable like every other source — default
     // checked (recommended) but no longer forced. At least one source must
     // stay checked to start.
@@ -279,7 +291,7 @@
     let activityPageRefreshInFlight = false;
     let activityPageRefreshPending = false;
     const DESKTOP_RECOVERY_DELAYS_MS = [1000, 2000, 4000, 8000];
-    let desktopRecommendationLoadState = "idle";
+    let desktopRecommendationLoadState = "loading";
     let desktopRuntimeLoadState = "idle";
     let desktopRecommendationRecoveryAttempt = 0;
     let desktopRuntimeRecoveryAttempt = 0;
@@ -517,6 +529,7 @@
     function renderDesktopRuntimeFailure() {
       if (desktopRuntimeLoadState !== "failed" && desktopRuntimeLoadState !== "failed-exhausted") return;
       const exhausted = desktopRuntimeLoadState === "failed-exhausted";
+      setSideHealthState(state.runtimeStatus ? "degraded" : "offline", state.runtimeStatus ? "状态过期" : "离线");
       if (!state.runtimeStatus) {
         $("#metricPool").textContent = "—";
         $("#poolAvailable").textContent = exhausted ? "同步失败，点击重试" : "同步失败，正在重试";
@@ -948,11 +961,6 @@
 
     const AUTO_LOAD_ON_SCROLL_KEY = "openbiliclaw.webui.autoLoadOnScroll";
     const AUTO_LOAD_COOLDOWN_MS = 8000;
-    // 校准：一行卡片(16:9 封面 + 文案)高约 250–350px，若预载边距接近一行高度，
-    // 自动加载会在最后一行(最多 4 张)还没滚进视口时就追加新卡片，用户永远看不全
-    // 当前批次、也到不了「已看完」的干净状态。收到 50px：哨兵几乎贴到视口底部才触发，
-    // 最后一行基本看全后再加载下一批。（2026-07-12，用户反馈强迫症体验）
-    const AUTO_LOAD_ROOT_MARGIN_PX = 50;
     const DESKTOP_EAGER_COVER_COUNT = 4;
     state.autoLoadOnScroll = storageGet(AUTO_LOAD_ON_SCROLL_KEY) !== "0";
     const THEME_STORAGE_KEY = "obc.theme";
@@ -985,13 +993,15 @@
     // 返回少于这个数说明候选池当轮见底，据此切换文案并等待补货重试。
     const APPEND_BATCH_SIZE = 10;
     const APPEND_SKELETON_COUNT = 4;
-    let autoLoadObserver = null;
     let autoLoadCheckRaf = 0;
     let autoLoadCheckFallbackTimer = 0;
     let autoLoadCooldownTimer = 0;
     let appendMoreInFlight = false;
+    let reshuffleInFlight = false;
     let lastAutoLoadAt = 0;
-    let sentinelInView = false;
+    let recommendationGridBottomReady = false;
+    let recommendationGridScrollIntent = false;
+    let recommendationGridBottomArmed = true;
     let _cachedLanIp = "";
     // 惊喜卡自动轮播间隔。原值 4s 是初版占位，实测太快：一张卡的标题 + 推荐理由 + 正文
     // 摘录读下来就要十几秒，还没看清就被换走。60s 给足阅读时间，想快进有拖拽和上一条 /
@@ -1000,6 +1010,10 @@
     let _delightAutoTimer = null;
     let _delightSwipeStartX = 0;
     const _delightStatusCache = new Map();
+    const trackedObservationRecords = new Map();
+    const trackedObservationHydratedItems = new Set();
+    const trackedObservationEpochs = new Map();
+    let delightFeedbackInFlight = false;
 
     function bindAboutButton() {
       const button = $("#aboutButton");
@@ -1080,7 +1094,7 @@
       applyAccentStyle(state.accentStyle);
       renderThemeHueControls();
       renderAutoLoadOnScrollToggle();
-      syncAutoLoadObserver();
+      syncAutoLoadBehavior();
     }
 
     function persistFrontendSettings() {
@@ -1096,7 +1110,7 @@
       applyAccentStyle(state.accentStyle);
       renderThemeHueControls();
       renderAutoLoadOnScrollToggle();
-      syncAutoLoadObserver();
+      syncAutoLoadBehavior();
       return { delightQueueLimit: limit, themeMode: state.themeMode, accentStyle: state.accentStyle, autoLoadOnScroll: state.autoLoadOnScroll };
     }
 
@@ -1376,6 +1390,81 @@
       return ZHIHU_TITLE_PLACEHOLDERS[contentType] || (title || "未命名内容");
     }
 
+    function normalizeDisplayTags(value) {
+      if (!Array.isArray(value)) return [];
+      const seen = new Set();
+      const tags = [];
+      for (const raw of value) {
+        const type = String(raw?.type || "").trim().toLowerCase();
+        const label = decodeHtmlEntities(raw?.label ?? "").replace(/\s+/g, " ").trim().slice(0, 28);
+        if (!DISPLAY_TAG_TYPES.has(type) || !label) continue;
+        const key = `${type}\u0000${label.toLocaleLowerCase("zh-Hans-CN")}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        tags.push({
+          type,
+          label,
+          origin: String(raw?.origin || "").trim().slice(0, 32)
+        });
+        if (tags.length === 4) break;
+      }
+      return tags;
+    }
+
+    const RECOMMENDATION_PRIORITY_LEVEL_WEIGHT = {
+      urgent: 4,
+      high: 3,
+      normal: 2,
+      low: 1,
+    };
+
+    function normalizeRecommendationPriority(item) {
+      const decision = item?.decision_priority && typeof item.decision_priority === "object"
+        ? item.decision_priority
+        : {};
+      const priority = item?.priority && typeof item.priority === "object"
+        ? item.priority
+        : {};
+      const level = String(
+        decision.level ?? priority.level ?? item?.priority_level ?? "normal"
+      ).trim().toLowerCase() || "normal";
+      const scoreValue = decision.score ?? priority.score ?? item?.priority_score;
+      const declaredHasScore = decision.has_score ?? priority.has_score;
+      const hasScore = declaredHasScore == null
+        ? scoreValue != null && scoreValue !== "" && Number.isFinite(Number(scoreValue))
+        : Boolean(declaredHasScore);
+      const rawScore = Number(scoreValue ?? 0);
+      const score = Number.isFinite(rawScore) ? Math.max(0, Math.min(1, rawScore)) : 0;
+      const label = decodeHtmlEntities(
+        decision.label ?? priority.label ?? item?.priority_label ?? ""
+      ).replace(/\s+/g, " ").trim();
+      const reason = decodeHtmlEntities(
+        decision.reason ?? priority.reason ?? item?.priority_reason ?? ""
+      ).replace(/\s+/g, " ").trim();
+      const signals = decision.signals && typeof decision.signals === "object"
+        ? decision.signals
+        : priority.signals && typeof priority.signals === "object"
+          ? priority.signals
+          : item?.priority_signals && typeof item.priority_signals === "object"
+            ? item.priority_signals
+            : {};
+      return { level, score, has_score: hasScore, label, reason, signals };
+    }
+
+    function recommendationPriorityScore(item) {
+      const priority = normalizeRecommendationPriority(item);
+      return priority.has_score
+        ? priority.score
+        : (RECOMMENDATION_PRIORITY_LEVEL_WEIGHT[priority.level] || 0) / 10;
+    }
+
+    function sortRecommendationsByPriority(items) {
+      return asArray(items)
+        .map((item, index) => ({ item, index, score: recommendationPriorityScore(item) }))
+        .sort((left, right) => right.score - left.score || left.index - right.index)
+        .map(({ item }) => item);
+    }
+
     function normalizeRecommendation(item) {
       const canonical = window.NewsClawSavedSync.normalizeSavedItem(item);
       const contentId = String(canonical.content_id || item?.article_id || "");
@@ -1383,6 +1472,7 @@
       const bodyText = decodeHtmlEntities(item?.body_text ?? item?.body ?? "");
       const media = decodeHtmlEntities(item?.media ?? item?.source_name ?? item?.publisher ?? item?.up_name ?? "");
       const reporter = decodeHtmlEntities(item?.reporter ?? item?.author_name ?? item?.up ?? "");
+      const priority = normalizeRecommendationPriority(item);
       return {
         id: Number(item?.id ?? Date.now()),
         bvid: String(item?.bvid ?? contentId),
@@ -1417,20 +1507,45 @@
         provider: String(item?.provider ?? item?.technical_provider ?? ""),
         content_scope: String(item?.content_scope ?? item?.body_level ?? ""),
         freshness: String(item?.freshness ?? ""),
+        topic_group: decodeHtmlEntities(item?.topic_group ?? "").replace(/\s+/g, " ").trim(),
+        franchise_key: decodeHtmlEntities(item?.franchise_key ?? "").replace(/\s+/g, " ").trim(),
+        style_key: String(item?.style_key ?? "").trim(),
+        temporal_class: String(item?.temporal_class ?? "unknown").trim().toLowerCase(),
+        temporal_state: String(item?.temporal_state ?? "unknown").trim().toLowerCase(),
+        display_tags: normalizeDisplayTags(item?.display_tags),
         retrieved_at: String(item?.retrieved_at ?? ""),
+        priority,
+        priority_level: priority.level,
+        priority_label: priority.label,
+        priority_score: priority.score,
+        priority_reason: priority.reason,
+        priority_signals: priority.signals,
+        why_recommended: decodeHtmlEntities(item?.why_recommended ?? ""),
         impact_chain: decodeHtmlEntities(item?.impact_chain ?? ""),
-        observation_points: Array.isArray(item?.observation_points) ? item.observation_points : [],
+        observation_points: (Array.isArray(item?.observation_points)
+          ? item.observation_points
+          : String(item?.observation_points || "").trim()
+            ? [item.observation_points]
+            : [])
+          .map((point) => decodeHtmlEntities(point).replace(/\s+/g, " ").trim())
+          .filter(Boolean),
+        expression: decodeHtmlEntities(item?.expression ?? item?.reason ?? item?.why_for_you ?? ""),
         reason: decodeHtmlEntities(item?.expression ?? item?.reason ?? item?.why_for_you ?? "后端暂未返回解释。")
       };
     }
 
     function recommendationKey(item) {
-      return String(item?.bvid || item?.content_id || item?.id || "");
+      return String(item?.item_key || item?.bvid || item?.content_id || item?.id || "");
     }
 
     function shouldRemoveRecommendationAfterFeedback(feedbackType) {
       const normalized = String(feedbackType || "").trim().toLowerCase();
       return normalized === "dislike" || normalized === "dismiss";
+    }
+
+    function recommendationFeedbackAlreadyCommitted(item, action) {
+      return String(action || "").toLowerCase() === "like"
+        && String(item?.feedback_type || item?.feedback || "").toLowerCase() === "like";
     }
 
     function isFeedbackedRecommendation(item) {
@@ -1440,7 +1555,9 @@
     }
 
     function normalizeRecommendationList(items) {
-      return asArray(items).map(normalizeRecommendation).filter((item) => !isFeedbackedRecommendation(item));
+      return sortRecommendationsByPriority(
+        asArray(items).map(normalizeRecommendation).filter((item) => !isFeedbackedRecommendation(item))
+      );
     }
 
     async function requestJson(path, options = {}) {
@@ -1902,6 +2019,7 @@
     function presentDegradedConfigRecovery(snapshot) {
       if (snapshot?.degraded !== true) return;
       state.degraded = true;
+      setSideHealthState("degraded");
       const guidance = "LLM 配置不可用：当前没有可用的模型 Provider。请补全默认 Provider 的 API Key、模型与所需 Base URL；保存成功后后端会原地恢复。";
       const diagnostic = configErrorMessage(snapshot);
       const configStatus = $("#configStatus");
@@ -2043,6 +2161,19 @@
       }
     });
     window.addEventListener("pagehide", () => { void pendingActions.flushAll(); });
+    if (typeof BroadcastChannel !== "undefined") {
+      recommendationSyncChannel = new BroadcastChannel("newsclaw-desktop-recommendations");
+      recommendationSyncChannel.addEventListener("message", (event) => {
+        if (event.data?.type === "recommendation-removed") {
+          const key = String(event.data.item_key || "");
+          const item = state.videos.find((candidate) => recommendationKey(candidate) === key);
+          if (item) removeRecommendationFromWorkspace(item);
+          return;
+        }
+        if (event.data?.type === "saved-changed") applySavedChangeAcrossSurfaces(event.data);
+      });
+      window.addEventListener("pagehide", () => recommendationSyncChannel?.close(), { once: true });
+    }
 
     function describeInitReason(reason) {
       if (!reason || reason === "none") return "";
@@ -3073,6 +3204,7 @@
 
     const desktopSavedApi = window.NewsClawSavedSync.createStrictSavedApi(requestJsonStrict);
     const desktopSavedMutations = window.NewsClawSavedSync.createSavedMutationRegistry();
+    const desktopSavedChangeEpochs = new Map();
     const desktopSavedListStates = {
       watch_later: window.NewsClawSavedSync.createRetainedSavedListState(),
       favorite: window.NewsClawSavedSync.createRetainedSavedListState()
@@ -3134,6 +3266,100 @@
       return desktopSavedApi.sync(listKind, itemKeys);
     }
 
+    function normalizeDesktopSavedKind(value) {
+      const kind = String(value || "").trim().toLowerCase();
+      return kind === "favorite" || kind === "watch_later" ? kind : "";
+    }
+
+    function desktopSavedChangeKey(listKind, itemKey) {
+      return `${listKind}:${itemKey}`;
+    }
+
+    function bumpDesktopSavedChangeEpoch(listKind, itemKey) {
+      const key = desktopSavedChangeKey(listKind, itemKey);
+      const next = (desktopSavedChangeEpochs.get(key) || 0) + 1;
+      desktopSavedChangeEpochs.set(key, next);
+      return next;
+    }
+
+    function reconcileSavedChangeAfterBusy(listKind, itemKey, attempt = 0) {
+      if (desktopSavedMutations.isBusy(listKind, itemKey)) {
+        if (attempt < 20) {
+          window.setTimeout(() => reconcileSavedChangeAfterBusy(listKind, itemKey, attempt + 1), 150);
+        } else {
+          void (listKind === "favorite" ? syncFavoriteButtons() : syncWatchLaterButtons());
+        }
+        return;
+      }
+      const expectedEpoch = desktopSavedChangeEpochs.get(desktopSavedChangeKey(listKind, itemKey)) || 0;
+      void fetchDesktopSaved(listKind).then((data) => {
+        if (desktopSavedMutations.isBusy(listKind, itemKey)) {
+          reconcileSavedChangeAfterBusy(listKind, itemKey);
+          return;
+        }
+        const currentEpoch = desktopSavedChangeEpochs.get(desktopSavedChangeKey(listKind, itemKey)) || 0;
+        if (currentEpoch !== expectedEpoch) return;
+        const savedKeys = new Set((data?.items || []).map((item) => desktopSavedItem(item).item_key));
+        applySavedChangeAcrossSurfaces({
+          type: "saved-changed",
+          kind: listKind,
+          item_key: itemKey,
+          saved: savedKeys.has(itemKey),
+        });
+      }).catch(() => {});
+    }
+
+    function applySavedChangeAcrossSurfaces(payload) {
+      const listKind = normalizeDesktopSavedKind(payload?.kind);
+      const itemKey = safeSavedText(payload?.item_key, 2048);
+      if (!listKind || !itemKey || typeof payload?.saved !== "boolean") return;
+      bumpDesktopSavedChangeEpoch(listKind, itemKey);
+      if (desktopSavedMutations.isBusy(listKind, itemKey)) {
+        reconcileSavedChangeAfterBusy(listKind, itemKey);
+        return;
+      }
+
+      const saved = payload.saved;
+      desktopSavedMutations.setSaved(listKind, itemKey, saved);
+      for (const item of state.videos) {
+        if (desktopSavedItem(item).item_key === itemKey) syncSavedControlsForRecommendation(item);
+      }
+
+      const delightField = listKind === "favorite" ? "favorite" : "watchLater";
+      for (const delight of state.delights || []) {
+        if (desktopSavedItem(delight).item_key !== itemKey) continue;
+        _delightStatusCache.set(itemKey, {
+          ...(_delightStatusCache.get(itemKey) || {}),
+          [delightField]: saved,
+        });
+      }
+      if (state.delight && desktopSavedItem(state.delight).item_key === itemKey) {
+        _syncDelightStatusButtons(itemKey);
+      }
+
+      const visibleList = listKind === "favorite" ? "favorites" : "watchLater";
+      if (desktopContentLibraryVisible && desktopContentLibraryTab === visibleList) {
+        void (listKind === "favorite" ? refreshFavorites() : refreshWatchLater());
+      } else {
+        void (listKind === "favorite" ? syncFavoriteButtons() : syncWatchLaterButtons());
+      }
+      if (desktopContentLibraryVisible && desktopContentLibraryTab === "history") {
+        void refreshContentHistory(true);
+      }
+    }
+
+    function publishSavedChange(listKind, itemKey, saved) {
+      const payload = {
+        type: "saved-changed",
+        kind: normalizeDesktopSavedKind(listKind),
+        item_key: safeSavedText(itemKey, 2048),
+        saved: Boolean(saved),
+      };
+      if (!payload.kind || !payload.item_key) return;
+      applySavedChangeAcrossSurfaces(payload);
+      recommendationSyncChannel?.postMessage(payload);
+    }
+
     function summarizeDesktopSavedTask(items) {
       const groups = new Map();
       for (const item of items) {
@@ -3172,6 +3398,8 @@
 
     function bindSavedCoverFallback(cover) {
       if (!cover) return;
+      // 无图新闻故意使用标签信息板，不是图片加载失败。
+      if (cover.querySelector(".tag-fingerprint")) return;
       const image = cover.querySelector("img");
       let fallbackShown = false;
       const showFallback = () => {
@@ -3225,7 +3453,7 @@
         const savedCoverClass = recommendationCoverClass(item);
         const coverContent = `
             ${recommendationMediaHtml(item)}
-            <span class="platform" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}">${escapeHtml(platformName(item.source_platform || item.platform || "news"))}</span>
+            <span class="platform" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || platformName(item.source_platform || item.platform || "news"))}</span>
           `;
         card.innerHTML = `
           ${url
@@ -3259,6 +3487,7 @@ ${savedCardFeedbackBarHtml(listKind)}
           btn.disabled = true;
           try {
             await removeDesktopSavedItem(listKind, item.item_key);
+            publishSavedChange(listKind, item.item_key, false);
             await reload();
           } catch (error) {
             btn.disabled = false;
@@ -3427,6 +3656,15 @@ ${savedCardFeedbackBarHtml(listKind)}
       updateSavedBadge("favoritesCountBadge", total);
     }
 
+    function reconcileRecommendationSavedRegistry(listKind, savedKeys) {
+      for (const item of state.videos) {
+        const itemKey = desktopSavedItem(item).item_key;
+        if (!itemKey || desktopSavedMutations.isBusy(listKind, itemKey)) continue;
+        desktopSavedMutations.setSaved(listKind, itemKey, savedKeys.has(itemKey));
+        syncSavedControlsForRecommendation(item);
+      }
+    }
+
     // Re-sync the pressed state + count badge for all visible ☆/♥ toggles.
     function syncWatchLaterButtons() {
       const generation = desktopSavedBadgeSyncGenerations.watch_later;
@@ -3440,6 +3678,7 @@ ${savedCardFeedbackBarHtml(listKind)}
           const on = saved.has(desktopSavedItem(item).item_key);
           btn.setAttribute("aria-pressed", on ? "true" : "false");
         });
+        reconcileRecommendationSavedRegistry("watch_later", saved);
         updateSavedBadge("watchLaterCountBadge", data?.total);
       }).catch(() => {});
     }
@@ -3456,6 +3695,7 @@ ${savedCardFeedbackBarHtml(listKind)}
           const on = saved.has(desktopSavedItem(item).item_key);
           btn.setAttribute("aria-pressed", on ? "true" : "false");
         });
+        reconcileRecommendationSavedRegistry("favorite", saved);
         updateSavedBadge("favoritesCountBadge", data?.total);
       }).catch(() => {});
     }
@@ -3715,8 +3955,26 @@ ${savedCardFeedbackBarHtml(listKind)}
       return counts;
     }
 
-    // Tab 用中文标签做本地过滤，后端只认 canonical slug。"全部" 映射成空串，
-    // 调用方据此决定「不带 source_platform」（保持旧请求形状）。
+    function recommendationTopicLabel(item) {
+      const explicit = String(item?.topic_group || "").replace(/\s+/g, " ").trim();
+      if (explicit) return explicit;
+      const tagged = normalizeDisplayTags(item?.display_tags).find((tag) => tag.type === "topic")?.label || "";
+      if (tagged) return tagged;
+      const legacy = String(item?.topic || "").replace(/\s+/g, " ").trim();
+      return legacy && legacy !== "未归类" ? legacy : "未归类";
+    }
+
+    function recommendationTopicCounts() {
+      const counts = new Map();
+      for (const item of state.videos) {
+        const label = recommendationTopicLabel(item);
+        counts.set(label, (counts.get(label) || 0) + 1);
+      }
+      return counts;
+    }
+
+    // 旧的多平台 helper 依然供内容库兼容路径使用；首页的主题、媒体和
+    // 搜索都只是当前已加载数据的本地视图，不是后端推荐请求参数。
     function platformSlugForFilterLabel(label) {
       const name = String(label || "").trim();
       if (!name || name === "全部") return "";
@@ -3726,8 +3984,24 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     function activePlatformSlug() {
-      if (state.filter !== "全部" && recommendationMediaCounts().has(state.filter)) return "news";
-      return platformSlugForFilterLabel(state.filter);
+      // NewsClaw 的推荐池本身已经是 news scope；不要把界面上的媒体名
+      // 伪装成 source_platform 发给后端。空字符串保留正式无范围请求形状。
+      return "";
+    }
+
+    function recommendationLocalFiltersActive() {
+      return state.filter !== "全部"
+        || state.mediaFilter !== ALL_MEDIA_FILTER
+        || Boolean(String(state.query || "").trim());
+    }
+
+    function syncReshuffleFilterGuard() {
+      const button = $("#reshuffleBtn");
+      if (!button) return;
+      const guarded = recommendationLocalFiltersActive();
+      button.setAttribute("aria-disabled", guarded ? "true" : "false");
+      button.title = guarded ? "先重置本地筛选，再换一批" : "换一批";
+      button.setAttribute("aria-label", button.title);
     }
 
     // 返回该平台「可立即推荐」的剩余数量；null = 未知（尚无成功快照）。
@@ -3798,25 +4072,136 @@ ${savedCardFeedbackBarHtml(listKind)}
         .map((source) => source.label);
     }
 
-    // Tab 集合 = 已启用配置 ∪ 库存快照中数量>0 的平台 ∪ 本会话已加载卡片的平台。
-    // 已知平台沿用 sourceFilterDefinitions 顺序，其它值按稳定字典序，"全部"恒居首。
+    // 主筛选用新闻类别，而不再把媒体名当作类别。数量是当前已加载
+    // 卡片数，因此无论后端库存快照是否就绪，点击都会真实过滤当前列表。
     function buildFilters() {
-      const mediaCounts = recommendationMediaCounts();
-      if (mediaCounts.size > 0) {
-        const media = [...mediaCounts].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-Hans-CN"));
-        return ["全部", ...media.map(([label]) => label)];
-      }
-      return ["全部"];
+      const topics = [...recommendationTopicCounts()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-Hans-CN"));
+      return ["全部", ...topics.map(([label]) => label)];
     }
 
     function filteredVideos() {
       const q = state.query.trim().toLowerCase();
-      return state.videos.filter((item) => {
-        const label = recommendationMediaLabel(item);
-        const filterOk = state.filter === "全部" || state.filter === label;
-        const queryOk = !q || [item.title, item.up, item.media, item.provider, item.topic, item.reason, label].join(" ").toLowerCase().includes(q);
-        return filterOk && queryOk;
+      return sortRecommendationsByPriority(state.videos.filter((item) => {
+        const media = recommendationMediaLabel(item);
+        const topic = recommendationTopicLabel(item);
+        const topicOk = state.filter === "全部" || state.filter === topic;
+        const mediaOk = state.mediaFilter === ALL_MEDIA_FILTER || state.mediaFilter === media;
+        const tagText = normalizeDisplayTags(item.display_tags).map((tag) => tag.label).join(" ");
+        const queryOk = !q || [
+          item.title, item.up, item.media, item.provider, item.topic, item.topic_group,
+          item.franchise_key, item.reason, media, tagText
+        ].join(" ").toLowerCase().includes(q);
+        return topicOk && mediaOk && queryOk;
+      }));
+    }
+
+    function isNarrowRecommendationWorkbench() {
+      return Boolean(window.matchMedia?.("(max-width: 900px)")?.matches);
+    }
+
+    function selectedRecommendation(items = filteredVideos()) {
+      const selectedKey = String(state.selectedRecommendationKey || "");
+      return items.find((item) => recommendationKey(item) === selectedKey) || null;
+    }
+
+    function reconcileSelectedRecommendation(items = filteredVideos()) {
+      const current = selectedRecommendation(items);
+      if (current) return current;
+      const next = items[0] || null;
+      state.selectedRecommendationKey = next ? recommendationKey(next) : "";
+      if (!next) state.recommendationDetailSheetOpen = false;
+      return next;
+    }
+
+    function syncRecommendationSelection(items = filteredVideos()) {
+      const selected = reconcileSelectedRecommendation(items);
+      const selectedKey = selected ? recommendationKey(selected) : "";
+      grid?.querySelectorAll(".video-card[data-item-key]").forEach((card) => {
+        const active = card.dataset.itemKey === selectedKey;
+        card.classList.toggle("is-selected", active);
+        if (active) card.setAttribute("aria-current", "true");
+        else card.removeAttribute("aria-current");
+        const selectButton = card.querySelector("[data-select-recommendation]");
+        const expanded = active
+          && (!isNarrowRecommendationWorkbench() || state.recommendationDetailSheetOpen);
+        selectButton?.setAttribute("aria-expanded", expanded ? "true" : "false");
       });
+      return selected;
+    }
+
+    function syncRecommendationDetailSheetPresentation() {
+      const pane = $("#recommendationDetailPane");
+      const scrim = $("#recommendationDetailScrim");
+      if (!pane) return;
+      const narrow = isNarrowRecommendationWorkbench();
+      const open = narrow && state.recommendationDetailSheetOpen && Boolean(state.selectedRecommendationKey);
+      pane.classList.toggle("is-sheet", narrow);
+      pane.classList.toggle("is-open", !narrow || open);
+      document.body.classList.toggle("recommendation-detail-sheet-open", open);
+      if (narrow) {
+        pane.setAttribute("role", "dialog");
+        pane.setAttribute("aria-modal", "true");
+        pane.setAttribute("aria-hidden", open ? "false" : "true");
+      } else {
+        pane.setAttribute("role", "region");
+        pane.removeAttribute("aria-modal");
+        pane.removeAttribute("aria-hidden");
+      }
+      if (scrim) scrim.hidden = !open;
+    }
+
+    function closeRecommendationDetailSheet({ restoreFocus = true } = {}) {
+      if (!isNarrowRecommendationWorkbench()) return;
+      state.recommendationDetailSheetOpen = false;
+      syncRecommendationSelection();
+      syncRecommendationDetailSheetPresentation();
+      if (restoreFocus && recommendationDetailOpener?.isConnected) {
+        recommendationDetailOpener.focus({ preventScroll: true });
+      }
+    }
+
+    function selectRecommendationByKey(key, { opener = null, focusDetail = false } = {}) {
+      const items = filteredVideos();
+      const item = items.find((candidate) => recommendationKey(candidate) === String(key || ""));
+      if (!item) return false;
+      state.selectedRecommendationKey = recommendationKey(item);
+      if (opener instanceof HTMLElement) recommendationDetailOpener = opener;
+      if (isNarrowRecommendationWorkbench()) state.recommendationDetailSheetOpen = true;
+      syncRecommendationSelection(items);
+      renderRecommendationDetail(item, items);
+      syncRecommendationDetailSheetPresentation();
+      if (focusDetail && isNarrowRecommendationWorkbench()) {
+        window.requestAnimationFrame(() => $("#recommendationDetailClose")?.focus());
+      }
+      return true;
+    }
+
+    function setWorkbenchView(view, { focus = false } = {}) {
+      const next = view === "delight" ? "delight" : "recommendations";
+      state.workbenchView = next;
+      const queuePanel = $("#recommendationWorkbenchPanel");
+      const delightPanel = $("#delightWorkbenchPanel");
+      const queueTab = $("#workbenchQueueTab");
+      const delightTab = $("#workbenchDelightTab");
+      if (queuePanel) queuePanel.hidden = next !== "recommendations";
+      if (delightPanel) delightPanel.hidden = next !== "delight";
+      [
+        [queueTab, next === "recommendations"],
+        [delightTab, next === "delight"],
+      ].forEach(([tab, active]) => {
+        if (!tab) return;
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+        tab.tabIndex = active ? 0 : -1;
+      });
+      if (focus) (next === "delight" ? delightTab : queueTab)?.focus();
+      if (next === "delight") {
+        state.recommendationDetailSheetOpen = false;
+        _startDelightAutoAdvance();
+      }
+      else _stopDelightAutoAdvance();
+      syncRecommendationSelection();
+      syncRecommendationDetailSheetPresentation();
     }
 
     function normalizeThemeMode(value) {
@@ -3955,7 +4340,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       state.autoLoadOnScroll = Boolean(enabled);
       if (persist) storageSet(AUTO_LOAD_ON_SCROLL_KEY, state.autoLoadOnScroll ? "1" : "0");
       renderAutoLoadOnScrollToggle();
-      syncAutoLoadObserver();
+      syncAutoLoadBehavior();
       if (toast) showToast(state.autoLoadOnScroll ? "滚动到底会自动加载推荐" : "已关闭滚动自动加载");
     }
 
@@ -3966,17 +4351,32 @@ ${savedCardFeedbackBarHtml(listKind)}
       if (settingText) settingText.textContent = state.autoLoadOnScroll ? "开启" : "关闭";
     }
 
-    function isAutoLoadSentinelInView() {
-      const sentinel = $("#loadMoreSentinel");
-      if (!sentinel || typeof sentinel.getBoundingClientRect !== "function") return false;
-      const rect = sentinel.getBoundingClientRect();
-      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
-      return rect.top <= viewportHeight + AUTO_LOAD_ROOT_MARGIN_PX && rect.bottom >= -AUTO_LOAD_ROOT_MARGIN_PX;
+    function isRecommendationGridAtBottom(target, userScrolled = recommendationGridScrollIntent) {
+      if (!target || !userScrolled) return false;
+      const scrollHeight = Number(target.scrollHeight) || 0;
+      const clientHeight = Number(target.clientHeight) || 0;
+      const scrollTop = Number(target.scrollTop) || 0;
+      if (clientHeight <= 0 || scrollHeight <= clientHeight + 1) return false;
+      return scrollTop + clientHeight >= scrollHeight - 32;
     }
 
-    function refreshAutoLoadSentinelVisibility() {
-      sentinelInView = isAutoLoadSentinelInView();
-      return sentinelInView;
+    function nextRecommendationGridScrollGate(target, gate) {
+      const intent = Boolean(gate?.intent || Number(target?.scrollTop) > 0);
+      const atBottom = isRecommendationGridAtBottom(target, true);
+      return {
+        intent,
+        armed: intent && !atBottom ? true : Boolean(gate?.armed),
+        atBottom,
+      };
+    }
+
+    function isRecommendationGridBottomReady() {
+      return recommendationGridBottomArmed && isRecommendationGridAtBottom(grid);
+    }
+
+    function refreshRecommendationGridBottomReady() {
+      recommendationGridBottomReady = isRecommendationGridBottomReady();
+      return recommendationGridBottomReady;
     }
 
     function scheduleAutoLoadCheck() {
@@ -3991,7 +4391,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         autoLoadCheckFallbackTimer = 0;
         if (rafId && typeof cancelAnimationFrame === "function") cancelAnimationFrame(rafId);
         if (fallbackTimer) clearTimeout(fallbackTimer);
-        if (!refreshAutoLoadSentinelVisibility()) return;
+        if (!refreshRecommendationGridBottomReady()) return;
         void autoLoadMoreIfNeeded().catch(() => {});
       };
       if (typeof requestAnimationFrame === "function") {
@@ -4005,41 +4405,36 @@ ${savedCardFeedbackBarHtml(listKind)}
       }
     }
 
-    function syncAutoLoadObserver() {
-      if (autoLoadObserver) {
-        autoLoadObserver.disconnect();
-        autoLoadObserver = null;
-      }
+    function syncAutoLoadBehavior() {
       clearAutoLoadCooldownRecheck();
-      sentinelInView = false;
+      recommendationGridBottomReady = false;
       if (!state.autoLoadOnScroll) return;
-      const sentinel = $("#loadMoreSentinel");
-      if (!sentinel) return;
-      if (typeof IntersectionObserver !== "undefined") {
-        autoLoadObserver = new IntersectionObserver(handleAutoLoadIntersect, { rootMargin: `${AUTO_LOAD_ROOT_MARGIN_PX}px`, threshold: 0 });
-        autoLoadObserver.observe(sentinel);
-      }
+      if (!grid) return;
       scheduleAutoLoadCheck();
     }
 
-    function handleAutoLoadIntersect(entries) {
-      sentinelInView = entries.some((entry) => entry.isIntersecting);
-      if (!sentinelInView && !refreshAutoLoadSentinelVisibility()) return;
-      scheduleAutoLoadCheck();
-    }
-
-    // 观察器可能已经处于相交状态，运行时库存或渲染状态变化后要补一脚几何检查。
+    // 库存或渲染状态变化后重新评估内层队列几何；未有真实滚动意图时 gate 仍会拦截。
     function maybeAutoLoadAfterPoolRefill() {
       scheduleAutoLoadCheck();
     }
 
+    function recommendationAutoLoadContextReason(context) {
+      if (!context.enabled) return "disabled";
+      if (context.inFlight) return "in-flight";
+      if (context.localFilters) return "local-filter";
+      if (!context.queueView) return "not-queue-view";
+      if (!context.hasStock) return "pool-empty";
+      if (!context.homeVisible) return "not-home";
+      if (!context.buttonVisible) return "no-button";
+      if (!context.hasCards) return "no-cards";
+      if (!context.cooldownReady) return "cooldown";
+      return "";
+    }
+
     // Returns the reason auto-load is currently blocked, or "" when a load
     // should proceed. The cooldown is evaluated LAST so a "cooldown" reason
-    // guarantees every other precondition (pool available, button shown, cards
-    // present, on home) is already satisfied — the caller uses that to re-arm.
+    // guarantees every other precondition is already satisfied.
     function autoLoadBlockReason(now) {
-      if (!state.autoLoadOnScroll) return "disabled";
-      if (appendMoreInFlight) return "in-flight";
       // 库存 gate 用「当前平台」的可推数量：全局还有货不代表当前 Tab 有货，否则
       // 0 库存平台会被反复空请求。库存未知（首次快照尚未成功 / 后端还没有这个
       // 接口）时回退到全局 pool_available_count，保持既有行为。
@@ -4047,24 +4442,26 @@ ${savedCardFeedbackBarHtml(listKind)}
       const hasStock = scopedAvailable === null
         ? state.runtimeStatus?.pool_available_count > 0
         : scopedAvailable > 0;
-      if (!hasStock) return "pool-empty";
       const homePage = $("#homePage");
-      if (!homePage || homePage.hidden) return "not-home";
       const loadMore = $("#loadMoreBtn");
-      if (!loadMore || loadMore.hidden) return "no-button";
-      if (!grid.querySelector(".video-card:not(.is-skeleton)")) return "no-cards";
-      if (now - lastAutoLoadAt < AUTO_LOAD_COOLDOWN_MS) return "cooldown";
-      return "";
+      return recommendationAutoLoadContextReason({
+        enabled: state.autoLoadOnScroll,
+        inFlight: appendMoreInFlight,
+        localFilters: recommendationLocalFiltersActive(),
+        queueView: state.workbenchView === "recommendations",
+        hasStock,
+        homeVisible: Boolean(homePage && !homePage.hidden),
+        buttonVisible: Boolean(loadMore && !loadMore.hidden),
+        hasCards: Boolean(grid.querySelector(".video-card:not(.is-skeleton)")),
+        cooldownReady: now - lastAutoLoadAt >= AUTO_LOAD_COOLDOWN_MS,
+      });
     }
 
     function shouldAutoLoadMore(now) {
       return autoLoadBlockReason(now) === "";
     }
 
-    // When the only thing standing between us and a load is the cooldown, and the
-    // sentinel is still in view (user parked at the bottom with no further scroll
-    // or intersection events to re-invoke us), schedule a one-shot re-check for
-    // when the cooldown lapses so loading resumes without needing a manual nudge.
+    // 用户已真实离开并重新进入内层底部，但恰好还在 cooldown 时，只预约一次到点重检。
     function armAutoLoadCooldownRecheck(now) {
       if (autoLoadCooldownTimer) return;
       const wait = AUTO_LOAD_COOLDOWN_MS - (now - lastAutoLoadAt);
@@ -4085,10 +4482,11 @@ ${savedCardFeedbackBarHtml(listKind)}
       const now = Date.now();
       const blockReason = autoLoadBlockReason(now);
       if (blockReason) {
-        if (blockReason === "cooldown" && sentinelInView) armAutoLoadCooldownRecheck(now);
+        if (blockReason === "cooldown" && recommendationGridBottomReady) armAutoLoadCooldownRecheck(now);
         return;
       }
       lastAutoLoadAt = now;
+      recommendationGridBottomArmed = false;
       const button = $("#loadMoreBtn");
       const previousText = button?.textContent || "加载更多推荐";
       if (button) {
@@ -4127,10 +4525,32 @@ ${savedCardFeedbackBarHtml(listKind)}
       setActiveFilter(filters[next], { restoreFocus: true });
     }
 
+    function renderMediaFilter() {
+      const select = $("#mediaFilterSelect");
+      if (!select) return;
+      const entries = [...recommendationMediaCounts()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-Hans-CN"));
+      const available = new Set(entries.map(([label]) => label));
+      if (state.mediaFilter !== ALL_MEDIA_FILTER && !available.has(state.mediaFilter)) {
+        state.mediaFilter = ALL_MEDIA_FILTER;
+      }
+      const options = [
+        [ALL_MEDIA_FILTER, `全部来源（${state.videos.length}）`],
+        ...entries.map(([label, count]) => [label, `${label}（${count}）`])
+      ].map(([value, text]) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        return option;
+      });
+      select.replaceChildren(...options);
+      select.value = state.mediaFilter;
+    }
+
     function renderFilters() {
       const row = $("#filterRow");
       const filters = buildFilters();
-      const mediaCounts = recommendationMediaCounts();
+      const topicCounts = recommendationTopicCounts();
       if (!filters.includes(state.filter)) state.filter = "全部";
       // 整排 chip 每次都被替换掉：先记住焦点原本落在哪个 Tab 上，重建后还回去，
       // 否则点一下 Tab 就把键盘焦点丢回 <body>，方向键再也走不动。
@@ -4138,26 +4558,25 @@ ${savedCardFeedbackBarHtml(listKind)}
       row.replaceChildren(...filters.map((name, index) => {
         const btn = document.createElement("button");
         const selected = state.filter === name;
-        const slug = name === "全部" ? "" : "news";
         const count = name === "全部"
-          ? (state.platformAvailability ? platformAvailableCount("") : state.videos.length)
-          : (mediaCounts.get(name) || 0);
+          ? state.videos.length
+          : (topicCounts.get(name) || 0);
         btn.className = `chip${selected ? " is-active" : ""}`;
         btn.type = "button";
         btn.dataset.filter = name;
-        btn.dataset.platform = slug;
+        btn.dataset.topic = name === "全部" ? "" : name;
         // role=tab + aria-selected：选中态不能只靠颜色表达，AT 也要能读到。
         btn.setAttribute("role", "tab");
         btn.setAttribute("aria-selected", selected ? "true" : "false");
-        btn.setAttribute("aria-label", `${name}，可推荐 ${count === null ? PLATFORM_COUNT_UNKNOWN_LABEL : `${count} 条`}`);
+        btn.setAttribute("aria-label", `${name}，当前已加载 ${count} 条`);
         btn.tabIndex = selected ? 0 : -1;
         const labelSpan = document.createElement("span");
         labelSpan.className = "chip-label";
         labelSpan.textContent = name;
         const countSpan = document.createElement("span");
         countSpan.className = "chip-count";
-        countSpan.dataset.state = count === null ? "unknown" : "known";
-        countSpan.textContent = count === null ? PLATFORM_COUNT_UNKNOWN_TEXT : String(count);
+        countSpan.dataset.state = "known";
+        countSpan.textContent = String(count);
         countSpan.setAttribute("aria-hidden", "true");
         btn.replaceChildren(labelSpan, countSpan);
         btn.addEventListener("click", () => setActiveFilter(name));
@@ -4172,8 +4591,12 @@ ${savedCardFeedbackBarHtml(listKind)}
         // Tab 可能已经远在视口上方；普通 focus() 会把页面从列表底部拉回 Tab。
         restored?.focus({ preventScroll: true });
       }
+      renderMediaFilter();
       const resetButton = $("#resetFiltersBtn");
-      if (resetButton) resetButton.hidden = state.filter === "全部" && !String(state.query || "").trim();
+      if (resetButton) {
+        resetButton.hidden = !recommendationLocalFiltersActive();
+      }
+      syncReshuffleFilterGuard();
     }
 
     function normalizeImageUrl(value) {
@@ -4240,9 +4663,21 @@ ${savedCardFeedbackBarHtml(listKind)}
       return Promise.race([Promise.all(pending), new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
     }
 
+    function safeHttpContentUrl(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      try {
+        const url = new URL(raw);
+        return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+      } catch {
+        return "";
+      }
+    }
+
     function contentUrl(item) {
       const platform = item.platform || item.source_platform;
-      if (item.content_url) return item.content_url;
+      const explicitUrl = safeHttpContentUrl(item.content_url);
+      if (explicitUrl) return explicitUrl;
       if (platform === "bilibili" && item.bvid) return `https://www.bilibili.com/video/${encodeURIComponent(item.bvid)}`;
       if (platform === "youtube" && item.content_id) return `https://www.youtube.com/watch?v=${encodeURIComponent(item.content_id)}`;
       if (platform === "twitter" && item.content_id) return `https://x.com/i/status/${encodeURIComponent(item.content_id)}`;
@@ -4503,6 +4938,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         context.restored = true;
         restored = true;
         if (item.context === context.context) item.restored = true;
+        publishSavedChange(context.context, desktopSavedItem(item).item_key, true);
         showToast(context.context === "favorite" ? "已重新收藏" : "已重新加入稍后读");
         if (context.context === "favorite") void syncFavoriteButtons();
         else void syncWatchLaterButtons();
@@ -4628,8 +5064,87 @@ ${savedCardFeedbackBarHtml(listKind)}
       return String(item.body_text || item.title || "先看文字也行").trim();
     }
 
+    function recommendationHasVisualCover(item) {
+      return Boolean(imageProxyUrl(item?.cover_url));
+    }
+
+    function recommendationUsesTagFingerprint(item) {
+      if (recommendationHasVisualCover(item)) return false;
+      const platform = recommendationPlatformSlug(item);
+      return platform === "news";
+    }
+
+    function evidenceTagLabel(value) {
+      const scope = String(value || "").trim().toLowerCase();
+      if (scope.includes("title")) return "标题级";
+      if (scope.includes("summary")) return "摘要级";
+      if (scope.includes("full")) return "全文级";
+      return "证据待确认";
+    }
+
+    function temporalTagLabel(item) {
+      const stateLabel = {
+        active: "持续有效",
+        expired: "已过期",
+        superseded: "已替代"
+      }[String(item?.temporal_state || "").trim().toLowerCase()];
+      if (stateLabel) return stateLabel;
+      const classLabel = {
+        breaking: "突发",
+        current: "近期进展",
+        versioned: "版本信息",
+        historical: "历史回顾",
+        evergreen: "长期有效",
+        time_sensitive: "时效敏感"
+      }[String(item?.temporal_class || "").trim().toLowerCase()];
+      if (classLabel) return classLabel;
+      const freshness = String(item?.freshness || "").replace(/\s+/g, " ").trim();
+      return freshness && freshness.toLowerCase() !== "unknown"
+        ? freshness.slice(0, 18)
+        : "时效待确认";
+    }
+
+    function recommendationDisplayTags(item) {
+      const tags = normalizeDisplayTags(item?.display_tags);
+      if (tags.length >= 4) return tags.slice(0, 4);
+      const candidates = [
+        { type: "topic", label: recommendationTopicLabel(item) === "未归类" ? "新闻文章" : recommendationTopicLabel(item), origin: "fallback" },
+        { type: "story", label: String(item?.franchise_key || "").trim(), origin: "fallback" },
+        { type: "temporal", label: temporalTagLabel(item), origin: "fallback" },
+        { type: "evidence", label: evidenceTagLabel(item?.content_scope), origin: "fallback" }
+      ];
+      const seen = new Set(tags.map((tag) => `${tag.type}\u0000${tag.label.toLocaleLowerCase("zh-Hans-CN")}`));
+      const presentTypes = new Set(tags.map((tag) => tag.type));
+      for (const candidate of candidates) {
+        if (!candidate.label || presentTypes.has(candidate.type)) continue;
+        const key = `${candidate.type}\u0000${candidate.label.toLocaleLowerCase("zh-Hans-CN")}`;
+        if (seen.has(key)) continue;
+        tags.push(candidate);
+        seen.add(key);
+        presentTypes.add(candidate.type);
+        if (tags.length === 4) break;
+      }
+      return tags.slice(0, 4);
+    }
+
+    function recommendationTagFingerprintHtml(item) {
+      const tags = recommendationDisplayTags(item);
+      const tagsHtml = tags.map((tag) => `
+        <span class="news-tag" data-tag-type="${escapeHtml(tag.type)}" title="${escapeHtml(`${DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签"}：${tag.label}`)}">
+          <span class="news-tag-kind">${escapeHtml(DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签")}</span>
+          <span class="news-tag-value">${escapeHtml(tag.label)}</span>
+        </span>`).join("");
+      return `<div class="tag-fingerprint">
+        <span class="tag-fingerprint-label">新闻信息指纹</span>
+        <span class="tag-fingerprint-tags">${tagsHtml}</span>
+        <span class="tag-fingerprint-hint">类别 · 故事 · 时效 · 证据</span>
+      </div>`;
+    }
+
     function recommendationIsTextCard(item) {
-      const hasCover = Boolean(imageProxyUrl(item.cover_url));
+      const hasCover = recommendationHasVisualCover(item);
+      // 新闻的真实配图本身有信息量，不再被摘要文字覆盖。
+      if (recommendationPlatformSlug(item) === "news" && hasCover) return false;
       return textCardContentTypes.has(String(item.content_type || "").toLowerCase()) || !hasCover;
     }
 
@@ -4642,6 +5157,7 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     function recommendationCoverClass(item) {
+      if (recommendationUsesTagFingerprint(item)) return " is-tag-card is-coverless";
       if (!recommendationIsTextCard(item)) return "";
       return recommendationTextCardBackdrop(item)
         ? " is-text-card has-backdrop"
@@ -4650,6 +5166,7 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     function recommendationMediaHtml(item, index = 0) {
       const eager = index < DESKTOP_EAGER_COVER_COUNT;
+      if (recommendationUsesTagFingerprint(item)) return recommendationTagFingerprintHtml(item);
       if (recommendationIsTextCard(item)) {
         const backdrop = recommendationTextCardBackdrop(item);
         const backdropHtml = backdrop
@@ -4687,10 +5204,12 @@ ${savedCardFeedbackBarHtml(listKind)}
           ? "标题级信息"
           : lowerScope.includes("full")
             ? "全文级信息"
-            : rawScope;
+            : lowerScope.includes("summary")
+              ? "摘要级信息"
+              : rawScope;
         parts.push(`<span class="content-scope" data-scope="${escapeHtml(rawScope)}">${escapeHtml(scopeLabel)}</span>`);
       }
-      if (topic) parts.push(escapeHtml(topic));
+      if (topic && !recommendationUsesTagFingerprint(item)) parts.push(escapeHtml(topic));
       if (published) {
         const exactTitle = Number.isFinite(Date.parse(item.published_at))
           ? new Date(item.published_at).toLocaleString()
@@ -4724,8 +5243,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         <div>
           <p class="video-title skeleton-line skeleton-shimmer"></p>
           <p class="video-meta skeleton-line skeleton-shimmer short"></p>
-        </div>
-        <p class="reason skeleton-line skeleton-shimmer"></p>`;
+        </div>`;
       return card;
     }
 
@@ -4749,17 +5267,17 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     // Shared recommendation-card feedback action bar markup.
     function cardFeedbackBarHtml() {
-      return `          <div class="card-actions" aria-label="推荐反馈操作">
+      return `          <div class="card-actions" aria-label="快捷反馈与保存">
             <div class="card-feedback-icons" aria-label="喜欢或不感兴趣">
-              <button class="feedback-icon-btn" data-action="like" type="button" aria-label="喜欢" title="喜欢">
+              <button class="feedback-icon-btn" data-action="like" type="button" aria-label="喜欢" title="喜欢" aria-pressed="false">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M7 10v10"/><path d="M15 5.2 14 10h5.4a1.8 1.8 0 0 1 1.7 2.2l-1.5 6A2.4 2.4 0 0 1 17.3 20H7"/><path d="M7 10l4.5-5.3A2 2 0 0 1 15 6v4"/></svg>
               </button>
               <span class="feedback-separator" aria-hidden="true">/</span>
-              <button class="feedback-icon-btn" data-action="dislike" type="button" aria-label="不感兴趣" title="不感兴趣">
+              <button class="feedback-icon-btn" data-action="dislike" type="button" aria-label="不感兴趣" title="不感兴趣" aria-pressed="false">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M17 14V4"/><path d="M9 18.8 10 14H4.6a1.8 1.8 0 0 1-1.7-2.2l1.5-6A2.4 2.4 0 0 1 6.7 4H17"/><path d="M17 14l-4.5 5.3A2 2 0 0 1 9 18v-4"/></svg>
               </button>
               <span class="feedback-separator" aria-hidden="true">/</span>
-              <button class="feedback-icon-btn" data-action="dismiss" type="button" aria-label="忽略" title="忽略">
+              <button class="feedback-icon-btn" data-action="dismiss" type="button" aria-label="忽略" title="忽略" aria-pressed="false">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18M9.84 9.91A3 3 0 0 0 12 15c.82 0 1.57-.33 2.11-.87M6.5 6.65A10.45 10.45 0 0 0 2.46 12C3.73 16.06 7.52 19 12 19c1.99 0 3.84-.58 5.4-1.58M11 5.05c.33-.03.66-.05 1-.05 4.48 0 8.27 2.94 9.54 7a10.5 10.5 0 0 1-1.19 2.5"/></svg>
               </button>
               <span class="feedback-separator" aria-hidden="true">/</span>
@@ -4771,9 +5289,9 @@ ${savedCardFeedbackBarHtml(listKind)}
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.65 5.37 5.93.86-4.29 4.18 1.01 5.9L12 17.1l-5.31 2.8 1.01-5.9L3.41 9.83l5.93-.86z"/></svg>
               </button>
             </div>
-            <div class="comment-field"><input placeholder="想围绕这条聊什么？" aria-label="想围绕这条聊什么？"></div>
+            <div class="comment-field"><input placeholder="写一句反馈" aria-label="写一句推荐反馈"></div>
             <button class="small-btn composer-cancel" data-action="cancel-comment" type="button" aria-label="返回" title="返回">‹</button>
-            <button class="small-btn chat-action" data-action="comment" type="button">聊一聊</button>
+            <button class="small-btn chat-action" data-action="comment" type="button">反馈一句</button>
           </div>
           <p class="status-line" aria-live="polite"></p>`;
     }
@@ -4935,6 +5453,7 @@ ${savedCardFeedbackBarHtml(listKind)}
           });
           const saved = desktopSavedMutations.isSaved(crossKind, savedItem.item_key);
           setCrossState(saved);
+          publishSavedChange(crossKind, savedItem.item_key, saved);
           if (status) {
             status.textContent = crossIsFavorite
               ? (saved ? "已加入本机收藏。" : "已从本机收藏移除。")
@@ -4959,67 +5478,112 @@ ${savedCardFeedbackBarHtml(listKind)}
     const renderedRecommendationCards = new Map();
 
     function recommendationCardHtml(item, index) {
-      const url = contentUrl(item);
       const durationBadge = item.content_type === "video" && item.duration > 0
         ? `<span class="duration-badge">${escapeHtml(formatDuration(item.duration))}</span>`
         : "";
-      const stats = recommendationStats(item);
-      const observationText = Array.isArray(item.observation_points) && item.observation_points.length
-        ? `后续观察：${item.observation_points.join("；")}`
-        : "";
-      const reasonText = [
-        item.reason,
-        item.impact_chain ? `可能影响链：${item.impact_chain}` : "",
-        observationText
-      ].filter(Boolean).join("\n");
+      const queueRank = String(index + 1).padStart(2, "0");
+      const topic = recommendationTopicLabel(item);
+      const priorityLabel = String(item.priority_label || "").trim() || `队列 ${queueRank}`;
+      const priorityLevel = String(item.priority_level || "normal");
+      const priorityReason = String(item.priority_reason || "").trim();
       return `
-          ${url
-          ? `<a class="cover${recommendationCoverClass(item)}" data-platform="${escapeHtml(item.platform)}" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="打开 ${escapeHtml(item.title)}">
+          <div class="queue-card-main">
+            <div class="cover${recommendationCoverClass(item)}" data-platform="${escapeHtml(item.platform)}" aria-hidden="true">
             ${recommendationMediaHtml(item, index)}
             <span class="platform" data-platform="${escapeHtml(item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || "新闻")}</span>
             ${durationBadge}
-          </a>`
-          : `<button class="cover${recommendationCoverClass(item)}" data-platform="${escapeHtml(item.platform)}" type="button" aria-label="打开 ${escapeHtml(item.title)}">
-            ${recommendationMediaHtml(item, index)}
-            <span class="platform" data-platform="${escapeHtml(item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || "新闻")}</span>
-            ${durationBadge}
-          </button>`}
-          <div>
-            <p class="video-title">${escapeHtml(item.title)}</p>
-            <p class="video-meta">${recommendationMetaHtml(item)}</p>
-            ${stats ? `<p class="video-stats">${escapeHtml(stats)}</p>` : ""}
+            </div>
+            <div class="queue-card-copy">
+              <div class="queue-card-flags">
+                <span class="queue-priority-tag" data-priority="${escapeHtml(priorityLevel)}" title="${escapeHtml(priorityReason || priorityLabel)}">${escapeHtml(priorityLabel)}</span>
+                <span class="queue-topic-tag">${escapeHtml(topic)}</span>
+              </div>
+              <button class="video-title queue-card-select" data-select-recommendation type="button" aria-controls="recommendationDetailPane" aria-expanded="false">${escapeHtml(item.title)}</button>
+              <p class="video-meta">${recommendationMetaHtml(item)}</p>
+            </div>
           </div>
-          <p class="reason" role="button" tabindex="0" aria-expanded="false" title="${escapeHtml(reasonText)}"><span class="reason-text">${escapeHtml(reasonText)}</span></p>
 ${cardFeedbackBarHtml()}`;
+    }
+
+    function recommendationCardForItem(item) {
+      const key = recommendationKey(item);
+      return Array.from(grid?.querySelectorAll(".video-card[data-item-key]") || [])
+        .find((card) => card.dataset.itemKey === key) || null;
+    }
+
+    function installRecommendationMediaFallback(container, item, index = 0) {
+      const image = container?.querySelector("img:not(.cover-backdrop)");
+      if (!image) return;
+      image.addEventListener("error", () => {
+        const fallbackItem = { ...item, cover_url: "" };
+        container.className = `cover${recommendationCoverClass(fallbackItem)}`;
+        container.dataset.platform = String(item.platform || item.source_platform || "news");
+        container.innerHTML = `${recommendationMediaHtml(fallbackItem, index)}<span class="platform" data-platform="${escapeHtml(item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || "新闻")}</span>`;
+      }, { once: true });
+    }
+
+    function syncSavedControlsForRecommendation(item) {
+      const savedItem = desktopSavedItem(item);
+      if (!savedItem.item_key) return;
+      const card = recommendationCardForItem(item);
+      const detail = recommendationKey(selectedRecommendation()) === recommendationKey(item) ? $("#recommendationDetailPane") : null;
+      [
+        ["watch_later", "watch-later", "稍后读", "取消稍后读"],
+        ["favorite", "favorite", "收藏", "取消收藏"],
+      ].forEach(([kind, action, inactiveLabel, activeLabel]) => {
+        const saved = desktopSavedMutations.isSaved(kind, savedItem.item_key);
+        const buttons = [
+          card?.querySelector(`[data-action="${action}"]`),
+          detail?.querySelector(`[data-detail-action="${action}"]`),
+        ].filter(Boolean);
+        buttons.forEach((button) => {
+          const label = saved ? activeLabel : inactiveLabel;
+          button.setAttribute("aria-pressed", saved ? "true" : "false");
+          button.setAttribute("aria-label", label);
+          button.title = label;
+        });
+      });
     }
 
     function createRecommendationCard(item, html) {
       const card = document.createElement("article");
-      card.className = recommendationIsTextCard(item) && !recommendationTextCardBackdrop(item)
-        ? "video-card is-text-only"
-        : "video-card";
+      card.className = recommendationUsesTagFingerprint(item)
+        ? "video-card is-tag-only"
+          : recommendationIsTextCard(item) && !recommendationTextCardBackdrop(item)
+            ? "video-card is-text-only"
+            : "video-card";
       card.dataset.bvid = item.bvid || item.id;
+      card.dataset.itemKey = recommendationKey(item);
+      card.setAttribute("role", "listitem");
       card.innerHTML = html;
-      const reason = card.querySelector(".reason");
-      const toggleReason = () => {
-        const expanded = reason.classList.toggle("is-expanded");
-        reason.setAttribute("aria-expanded", expanded ? "true" : "false");
-      };
-      reason.addEventListener("click", toggleReason);
-      reason.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          toggleReason();
-        }
+      const selectButton = card.querySelector("[data-select-recommendation]");
+      selectButton?.addEventListener("click", () => {
+        selectRecommendationByKey(recommendationKey(item), { opener: selectButton, focusDetail: true });
+      });
+      selectButton?.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        const selectors = Array.from(grid.querySelectorAll("[data-select-recommendation]"));
+        const current = selectors.indexOf(selectButton);
+        if (current < 0) return;
+        event.preventDefault();
+        const next = event.key === "ArrowDown"
+          ? Math.min(selectors.length - 1, current + 1)
+          : Math.max(0, current - 1);
+        selectors[next]?.focus({ preventScroll: true });
       });
       const cover = card.querySelector(".cover");
-      cover.addEventListener("click", () => openRecommendation(item, card));
-      cover.addEventListener("auxclick", (event) => {
-        if (event.button === 1) openRecommendation(item, card);
-      });
-      card.querySelectorAll("[data-action]").forEach((btn) => btn.addEventListener("click", () => handleCardAction(btn.dataset.action, item, card)));
+      installRecommendationMediaFallback(cover, item);
+      card.querySelectorAll("[data-action]").forEach((btn) => btn.addEventListener("click", () => {
+        void handleCardAction(btn.dataset.action, item, card).finally(() => {
+          syncSavedControlsForRecommendation(item);
+          syncSelectedDetailControls();
+        });
+      }));
       card.querySelector(".comment-field input").addEventListener("keydown", (event) => {
-        if (event.key === "Enter") handleCardAction("send-comment", item, card);
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void handleCardAction("send-comment", item, card).finally(syncSelectedDetailControls);
+        }
         if (event.key === "Escape") closeCardComposer(card);
       });
       card.querySelector(".comment-field input").addEventListener("blur", (event) => {
@@ -5030,9 +5594,7 @@ ${cardFeedbackBarHtml()}`;
       if (wlBtn) {
         const savedItem = desktopSavedItem(item);
         void desktopSavedMutations.hydrate("watch_later", savedItem.item_key, () => watchLaterStatus(savedItem)).then(() => {
-          const saved = desktopSavedMutations.isSaved("watch_later", savedItem.item_key);
-          wlBtn.setAttribute("aria-pressed", saved ? "true" : "false");
-          wlBtn.title = saved ? "取消稍后读" : "稍后读";
+          syncSavedControlsForRecommendation(item);
         });
       }
       // Lazy-load favorite state
@@ -5040,12 +5602,397 @@ ${cardFeedbackBarHtml()}`;
       if (favBtn) {
         const savedItem = desktopSavedItem(item);
         void desktopSavedMutations.hydrate("favorite", savedItem.item_key, () => favoriteStatus(savedItem)).then(() => {
-          const saved = desktopSavedMutations.isSaved("favorite", savedItem.item_key);
-          favBtn.setAttribute("aria-pressed", saved ? "true" : "false");
-          favBtn.title = saved ? "取消收藏" : "收藏";
+          syncSavedControlsForRecommendation(item);
         });
       }
+      if (recommendationFeedbackAlreadyCommitted(item, "like")) {
+        finishRecommendationFeedback(card, "like");
+      }
       return card;
+    }
+
+    function trackedObservationKey(item, observation) {
+      return `${recommendationKey(item)}\u0000${String(observation || "").trim()}`;
+    }
+
+    function trackedObservationList(payload) {
+      if (Array.isArray(payload)) return payload;
+      return asArray(payload?.items ?? payload?.records ?? payload?.tracked_observations);
+    }
+
+    function syncObservationTrackingControls(container, item) {
+      if (!container || !item) return;
+      container.querySelectorAll("[data-detail-track-observation]").forEach((button) => {
+        const observation = String(button.dataset.observation || "").trim();
+        const record = trackedObservationRecords.get(trackedObservationKey(item, observation));
+        const tracked = Boolean(record);
+        button.setAttribute("aria-pressed", tracked ? "true" : "false");
+        button.textContent = tracked ? "移出跟踪" : "加入跟踪";
+        button.title = tracked ? "停止在本地持续跟踪这个观察点" : "加入本地持续观察清单";
+      });
+    }
+
+    async function hydrateTrackedObservations(item, container) {
+      const itemKey = recommendationKey(item);
+      if (!itemKey || trackedObservationHydratedItems.has(itemKey)) {
+        syncObservationTrackingControls(container, item);
+        return;
+      }
+      const requestEpoch = trackedObservationEpochs.get(itemKey) || 0;
+      try {
+        const payload = await requestJsonStrict(
+          `${ENDPOINTS.trackedObservations}?item_key=${encodeURIComponent(itemKey)}`,
+          { timeoutMs: 15000 }
+        );
+        if ((trackedObservationEpochs.get(itemKey) || 0) !== requestEpoch) {
+          syncObservationTrackingControls(container, item);
+          return;
+        }
+        for (const [key] of trackedObservationRecords) {
+          if (key.startsWith(`${itemKey}\u0000`)) trackedObservationRecords.delete(key);
+        }
+        trackedObservationList(payload).forEach((record) => {
+          const observation = String(record?.observation || "").trim();
+          if (!observation) return;
+          trackedObservationRecords.set(trackedObservationKey(item, observation), record);
+        });
+        trackedObservationHydratedItems.add(itemKey);
+      } catch {
+        // 跟踪接口属于渐进增强：读取失败不影响新闻判断和其它动作，按钮仍可重试写入。
+      }
+      syncObservationTrackingControls(container, item);
+    }
+
+    async function toggleTrackedObservation(item, observation, button, status) {
+      const cleanObservation = String(observation || "").trim();
+      const itemKey = recommendationKey(item);
+      if (!itemKey || !cleanObservation || !button || button.disabled) return;
+      const key = trackedObservationKey(item, cleanObservation);
+      const previous = trackedObservationRecords.get(key) || null;
+      trackedObservationEpochs.set(itemKey, (trackedObservationEpochs.get(itemKey) || 0) + 1);
+      trackedObservationHydratedItems.add(itemKey);
+      button.disabled = true;
+      if (status) {
+        status.removeAttribute("role");
+        status.textContent = previous ? "正在移出持续跟踪…" : "正在加入持续跟踪…";
+      }
+      try {
+        if (previous) {
+          const trackingId = previous.tracking_id ?? previous.id;
+          if (trackingId == null || trackingId === "") throw new Error("跟踪记录缺少编号，请刷新后重试。");
+          await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}`, {
+            method: "DELETE",
+            timeoutMs: 15000,
+          });
+          trackedObservationRecords.delete(key);
+          if (status) status.textContent = "已移出持续跟踪。";
+        } else {
+          const body = {
+            request_id: newRequestId(),
+            item_key: itemKey,
+            observation: cleanObservation,
+          };
+          if (item.id != null) body.recommendation_id = item.id;
+          const payload = await requestJsonStrict(ENDPOINTS.trackedObservations, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            timeoutMs: 15000,
+          });
+          const record = payload?.item || payload?.record || payload;
+          trackedObservationRecords.set(key, {
+            ...record,
+            observation: cleanObservation,
+            tracking_id: record?.tracking_id ?? record?.id,
+          });
+          trackedObservationHydratedItems.add(itemKey);
+          if (status) status.textContent = "已加入持续跟踪；后续新证据会沿这个观察点归档。";
+        }
+        syncObservationTrackingControls(button.closest(".recommendation-detail-pane, .delight") || document, item);
+      } catch (error) {
+        trackedObservationHydratedItems.delete(itemKey);
+        if (status) {
+          status.setAttribute("role", "alert");
+          status.textContent = configErrorMessage(error?.details) || error?.message || "持续跟踪操作失败，请重试。";
+        }
+      } finally {
+        if (button.isConnected) button.disabled = false;
+      }
+    }
+
+    function bindObservationTrackingControls(container, item, status) {
+      container?.querySelectorAll("[data-detail-track-observation]").forEach((button) => {
+        button.addEventListener("click", () => {
+          void toggleTrackedObservation(item, button.dataset.observation, button, status);
+        });
+      });
+      void hydrateTrackedObservations(item, container);
+    }
+
+    function recommendationDetailExplanationHtml(item) {
+      const why = String(item.why_recommended || "").trim();
+      const impact = String(item.impact_chain || "").trim();
+      const observations = asArray(item.observation_points).map((point) => String(point || "").trim()).filter(Boolean);
+      const expression = String(item.expression || item.reason || "").trim();
+      const sections = [];
+      if (why) {
+        sections.push(`<section class="detail-analysis-block" data-analysis-field="why_recommended"><p class="detail-block-label">为什么值得看</p><p>${escapeHtml(why)}</p></section>`);
+      }
+      if (impact) {
+        sections.push(`<section class="detail-analysis-block" data-analysis-field="impact_chain"><p class="detail-block-label">可能影响链</p><p>${escapeHtml(impact)}</p></section>`);
+      }
+      if (observations.length) {
+        sections.push(`<section class="detail-analysis-block" data-analysis-field="observation_points"><p class="detail-block-label">后续观察点</p><ul>${observations.map((point) => `<li><span>${escapeHtml(point)}</span><button class="observation-track-btn" data-detail-track-observation data-observation="${escapeHtml(point)}" type="button" aria-pressed="false">加入跟踪</button></li>`).join("")}</ul></section>`);
+      }
+      const structuredComplete = Boolean(why && impact && observations.length);
+      if (!structuredComplete) {
+        sections.push(`<section class="detail-analysis-block is-expression-fallback" data-analysis-field="expression"><p class="detail-block-label">${sections.length ? "后端完整推荐说明（结构字段不全）" : "推荐说明"}</p><p>${escapeHtml(expression || "后端暂未返回推荐解释。")}</p></section>`);
+      }
+      return sections.join("");
+    }
+
+    function recommendationDetailHtml(item, items) {
+      const index = Math.max(0, items.findIndex((candidate) => recommendationKey(candidate) === recommendationKey(item)));
+      const queueRank = String(index + 1).padStart(2, "0");
+      const priorityLabel = String(item.priority_label || "").trim() || `队列 ${queueRank}`;
+      const priorityLevel = String(item.priority_level || "normal");
+      const priorityReason = String(item.priority_reason || "").trim();
+      const url = contentUrl(item);
+      const stats = recommendationStats(item);
+      const tags = recommendationDisplayTags(item);
+      const body = String(item.body_text || "").trim();
+      const tagMarkup = tags.length
+        ? tags.map((tag) => `<span class="detail-tag" data-tag-type="${escapeHtml(tag.type)}"><span>${escapeHtml(DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签")}</span>${escapeHtml(tag.label)}</span>`).join("")
+        : `<span class="detail-tag" data-tag-type="topic"><span>主题</span>${escapeHtml(recommendationTopicLabel(item))}</span>`;
+      return `
+        <div class="recommendation-detail-shell" data-detail-item-key="${escapeHtml(recommendationKey(item))}">
+          <header class="recommendation-detail-head">
+            <div class="detail-head-topline">
+              <div class="queue-card-flags"><span class="queue-priority-tag" data-priority="${escapeHtml(priorityLevel)}" title="${escapeHtml(priorityReason || priorityLabel)}">${escapeHtml(priorityLabel)}</span><span class="queue-topic-tag">${escapeHtml(recommendationTopicLabel(item))}</span></div>
+              ${priorityReason ? `<p class="detail-priority-reason">${escapeHtml(priorityReason)}</p>` : ""}
+              <button class="icon-btn recommendation-detail-close" id="recommendationDetailClose" type="button" aria-label="关闭新闻详情">×</button>
+            </div>
+            <h3 id="recommendationDetailTitle" tabindex="-1" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h3>
+            <p class="video-meta">${recommendationMetaHtml(item)}</p>
+            ${stats ? `<p class="video-stats">${escapeHtml(stats)}</p>` : ""}
+            <div class="recommendation-detail-tags" aria-label="新闻标签">${tagMarkup}</div>
+          </header>
+          <div class="recommendation-detail-scroll">
+            <div class="detail-media cover${recommendationCoverClass(item)}" data-platform="${escapeHtml(item.platform || "news")}">
+              ${recommendationMediaHtml(item, 0)}
+              <span class="platform" data-platform="${escapeHtml(item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || "新闻")}</span>
+            </div>
+            <div class="detail-analysis-stack">${recommendationDetailExplanationHtml(item)}</div>
+            ${body ? `<details class="detail-source-copy"><summary>查看已采集的原始内容</summary><p>${escapeHtml(body)}</p></details>` : `<p class="detail-source-missing">当前来源只提供了标题或摘要，没有可展开的正文。</p>`}
+          </div>
+          <footer class="recommendation-detail-actions" aria-label="当前新闻操作">
+            <div class="detail-primary-actions">
+              ${url
+                ? `<a class="small-btn primary" data-detail-open-original href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">阅读原文</a>`
+                : `<span class="small-btn is-disabled" aria-disabled="true">暂无原文链接</span>`}
+              <button class="small-btn" data-detail-action="watch-later" type="button" aria-pressed="false">稍后读</button>
+              <button class="small-btn" data-detail-action="favorite" type="button" aria-pressed="false">收藏</button>
+            </div>
+            <div class="detail-feedback-actions" aria-label="反馈这条推荐">
+              <button type="button" data-detail-action="like" aria-pressed="false">喜欢</button>
+              <button type="button" data-detail-action="dislike" aria-pressed="false">不感兴趣</button>
+              <button type="button" data-detail-action="dismiss" aria-pressed="false">忽略</button>
+              <button type="button" data-detail-undo hidden>撤销</button>
+            </div>
+            <form class="detail-feedback-form" data-detail-feedback-form>
+              <label for="recommendationDetailFeedback">反馈一句</label>
+              <div><input id="recommendationDetailFeedback" type="text" autocomplete="off" placeholder="例如：这条与我当前方向无关"><button class="small-btn" type="submit">提交反馈</button></div>
+            </form>
+            <p class="status-line detail-action-status" id="recommendationDetailStatus" role="status" aria-live="polite"></p>
+          </footer>
+        </div>`;
+    }
+
+    function syncSelectedDetailControls({ forceStatusSync = false } = {}) {
+      const item = selectedRecommendation();
+      const pane = $("#recommendationDetailPane");
+      if (!item || !pane?.querySelector(".recommendation-detail-shell")) return;
+      syncSavedControlsForRecommendation(item);
+      const card = recommendationCardForItem(item);
+      const feedbackType = String(item.feedback_type || "").toLowerCase();
+      const pending = card?.dataset.feedbackPending === "true";
+      ["like", "dislike", "dismiss"].forEach((action) => {
+        const button = pane.querySelector(`[data-detail-action="${action}"]`);
+        if (!button) return;
+        const active = feedbackType === action;
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.classList.toggle("is-active", active);
+        button.disabled = Boolean(recommendationFeedbackAlreadyCommitted(item, action) || pending);
+      });
+      const undo = pane.querySelector("[data-detail-undo]");
+      if (undo) undo.hidden = !pending;
+      const cardStatus = card?.querySelector(".status-line")?.textContent?.trim() || "";
+      const detailStatus = pane.querySelector("#recommendationDetailStatus");
+      if (detailStatus && (cardStatus || forceStatusSync)) detailStatus.textContent = cardStatus;
+    }
+
+    async function handleRecommendationDetailFeedback(item, note, input, submitButton) {
+      const pane = input?.closest(".recommendation-detail-pane") || $("#recommendationDetailPane");
+      const itemKey = recommendationKey(item);
+      const isCurrentDetail = () => Boolean(
+        pane?.isConnected
+        && pane.dataset.detailKey === itemKey
+        && recommendationKey(selectedRecommendation()) === itemKey
+      );
+      const status = pane?.querySelector("#recommendationDetailStatus");
+      const previous = item.feedback_type;
+      submitButton.disabled = true;
+      if (status && isCurrentDetail()) status.textContent = "正在提交推荐反馈…";
+      try {
+        await submitFeedback(item, "comment", note);
+        item.feedback_type = "comment";
+        input.value = "";
+        const cardStatus = recommendationCardForItem(item)?.querySelector(".status-line");
+        if (cardStatus) cardStatus.textContent = "已提交推荐反馈，推荐会继续保留在当前列表。";
+        if (status && isCurrentDetail()) status.textContent = "已提交推荐反馈，推荐会继续保留在当前列表。";
+        showToast("已提交推荐反馈");
+      } catch (error) {
+        item.feedback_type = previous;
+        if (status && isCurrentDetail()) {
+          status.setAttribute("role", "alert");
+          status.textContent = configErrorMessage(error?.details) || error?.message || "反馈提交失败，请稍后重试。";
+        }
+      } finally {
+        submitButton.disabled = false;
+        if (isCurrentDetail()) syncSelectedDetailControls();
+      }
+    }
+
+    function renderRecommendationDetail(item = null, items = filteredVideos()) {
+      const pane = $("#recommendationDetailPane");
+      if (!pane) return;
+      const selected = item || reconcileSelectedRecommendation(items);
+      if (!selected) {
+        const loading = desktopRecommendationLoadState === "loading" || desktopRecommendationLoadState === "idle";
+        const loadFailed = desktopRecommendationLoadState === "failed" || desktopRecommendationLoadState === "failed-exhausted";
+        const title = loading ? "正在读取推荐" : loadFailed ? "推荐暂时不可用" : state.videos.length ? "当前筛选没有结果" : "等待推荐";
+        const message = loading
+          ? "正在向本地后端读取推荐队列，完成前不会把未知状态显示成空列表。"
+          : loadFailed
+          ? "后端读取失败，但这不代表候选池为空。可以使用左侧重试按钮重新加载。"
+          : state.videos.length
+            ? "调整主题、媒体来源或搜索词后，第一条结果会自动成为当前判断对象。"
+            : "推荐加载完成后，左侧第一条会自动成为当前判断对象。";
+        pane.dataset.detailKey = "";
+        pane.dataset.detailSignature = "";
+        pane.innerHTML = `<div class="detail-pane-empty"><p class="eyebrow">Analysis</p><h3 id="recommendationDetailTitle">${escapeHtml(title)}</h3><p>${escapeHtml(message)}</p></div>`;
+        syncRecommendationDetailSheetPresentation();
+        return;
+      }
+      const markup = recommendationDetailHtml(selected, items);
+      const signature = JSON.stringify([
+        selected.id,
+        selected.title,
+        selected.why_recommended,
+        selected.impact_chain,
+        selected.observation_points,
+        selected.expression,
+        selected.body_text,
+        selected.cover_url,
+        selected.content_url,
+        selected.priority,
+        selected.priority_level,
+        selected.priority_label,
+        selected.priority_reason,
+        selected.priority_signals,
+        selected.display_tags,
+      ]);
+      const key = recommendationKey(selected);
+      if (pane.dataset.detailKey === key && pane.dataset.detailSignature === signature) {
+        syncSelectedDetailControls();
+        syncRecommendationDetailSheetPresentation();
+        return;
+      }
+      pane.dataset.detailKey = key;
+      pane.dataset.detailSignature = signature;
+      pane.innerHTML = markup;
+      installRecommendationMediaFallback(pane.querySelector(".detail-media"), selected);
+      pane.querySelector("#recommendationDetailClose")?.addEventListener("click", () => closeRecommendationDetailSheet());
+      const originalLink = pane.querySelector("[data-detail-open-original]");
+      const recordOriginalOpen = () => {
+        const card = recommendationCardForItem(selected);
+        const status = pane.querySelector("#recommendationDetailStatus");
+        if (status) status.textContent = "原文已打开，正在记录这次主动选择…";
+        const tracked = card ? openRecommendation(selected, card) : trackRecommendationClick(selected);
+        void Promise.resolve(tracked).then((ok) => {
+          if (!status?.isConnected || pane.dataset.detailKey !== recommendationKey(selected)) return;
+          status.textContent = ok
+            ? "原文已打开，这次主动选择已记录。"
+            : "原文已打开，但点击信号未记录成功；不会把它宣称为已学习。";
+          if (!ok) status.setAttribute("role", "alert");
+        });
+        syncSelectedDetailControls();
+      };
+      originalLink?.addEventListener("click", recordOriginalOpen);
+      originalLink?.addEventListener("auxclick", (event) => {
+        if (event.button === 1) recordOriginalOpen();
+      });
+      pane.querySelectorAll("[data-detail-action]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const current = selectedRecommendation();
+          const card = current ? recommendationCardForItem(current) : null;
+          if (!current || !card) return;
+          const action = button.dataset.detailAction;
+          const savedMutation = action === "watch-later" || action === "favorite";
+          if (savedMutation) button.disabled = true;
+          try {
+            await handleCardAction(action, current, card);
+          } finally {
+            if (savedMutation && button.isConnected) button.disabled = false;
+            syncSavedControlsForRecommendation(current);
+            syncSelectedDetailControls();
+          }
+        });
+      });
+      pane.querySelector("[data-detail-undo]")?.addEventListener("click", () => {
+        const current = selectedRecommendation();
+        if (!current) return;
+        pendingActions.undo(feedbackActionKey(current));
+        window.setTimeout(() => syncSelectedDetailControls({ forceStatusSync: true }), 0);
+      });
+      pane.querySelector("[data-detail-feedback-form]")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const input = pane.querySelector("#recommendationDetailFeedback");
+        const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+        const note = String(input?.value || "").trim();
+        if (!note) {
+          const status = pane.querySelector("#recommendationDetailStatus");
+          if (status) status.textContent = "先写一句反馈，再提交。";
+          input?.focus();
+          return;
+        }
+        void handleRecommendationDetailFeedback(selected, note, input, submitButton);
+      });
+      bindObservationTrackingControls(pane, selected, pane.querySelector("#recommendationDetailStatus"));
+      syncSelectedDetailControls();
+      syncRecommendationDetailSheetPresentation();
+    }
+
+    function removeRecommendationFromWorkspace(item, { broadcast = false } = {}) {
+      const key = recommendationKey(item);
+      if (!key) return;
+      const previousLength = state.videos.length;
+      state.videos = state.videos.filter((candidate) => recommendationKey(candidate) !== key);
+      if (state.videos.length === previousLength) return;
+      const removedSelection = state.selectedRecommendationKey === key;
+      const closeNarrowSheet = removedSelection && isNarrowRecommendationWorkbench() && state.recommendationDetailSheetOpen;
+      if (removedSelection) state.selectedRecommendationKey = "";
+      if (closeNarrowSheet) state.recommendationDetailSheetOpen = false;
+      renderAll();
+      if (closeNarrowSheet) {
+        window.requestAnimationFrame(() => {
+          const next = selectedRecommendation();
+          recommendationCardForItem(next)?.querySelector("[data-select-recommendation]")?.focus({ preventScroll: true });
+        });
+      }
+      if (broadcast && recommendationSyncChannel) {
+        recommendationSyncChannel.postMessage({ type: "recommendation-removed", item_key: key });
+      }
     }
 
     // 按 recommendation key 做增量对账，而不是 grid.replaceChildren(...)。整表重建
@@ -5091,11 +6038,43 @@ ${cardFeedbackBarHtml()}`;
       if (shouldShowInitOnboarding(state.runtimeStatus)) {
         renderedRecommendationCards.clear();
         renderInitOnboarding();
+        state.selectedRecommendationKey = "";
+        const summary = $("#queueResultSummary");
+        if (summary) summary.textContent = "需要先完成首次设置";
+        renderRecommendationDetail(null, []);
         return;
       }
       const loadMore = $("#loadMoreBtn");
       if (loadMore) loadMore.hidden = false;
+      const initialLoading = state.videos.length === 0
+        && (desktopRecommendationLoadState === "loading" || desktopRecommendationLoadState === "idle");
+      if (initialLoading) {
+        renderedRecommendationCards.clear();
+        grid.replaceChildren(...Array.from({ length: APPEND_SKELETON_COUNT }, () => makeSkeletonCard()));
+        state.selectedRecommendationKey = "";
+        if (loadMore) loadMore.disabled = true;
+        const reshuffleButton = $("#reshuffleBtn");
+        if (reshuffleButton) reshuffleButton.disabled = true;
+        const summary = $("#queueResultSummary");
+        if (summary) {
+          delete summary.dataset.tone;
+          summary.textContent = "正在读取推荐…";
+        }
+        renderRecommendationDetail(null, []);
+        return;
+      }
+      if (loadMore && !appendMoreInFlight) loadMore.disabled = false;
+      const reshuffleButton = $("#reshuffleBtn");
+      if (reshuffleButton && !reshuffleInFlight) reshuffleButton.disabled = false;
       const items = filteredVideos();
+      const summary = $("#queueResultSummary");
+      if (summary) {
+        delete summary.dataset.tone;
+        const total = state.videos.length;
+        summary.textContent = items.length === total
+          ? `${items.length} 条待判断`
+          : `显示 ${items.length} / ${total} 条`;
+      }
       if (!items.length) {
         // 平台 Tab 的空态要区分「本会话还没装入」和「该平台暂时没有新候选」，
         // 用的是同一份可推库存快照，不是 DOM 卡片数。
@@ -5109,8 +6088,11 @@ ${cardFeedbackBarHtml()}`;
               ? `${escapeHtml(platformName(activePlatform))}还有 ${activePlatformCount} 条候选没装进来，点「加载更多推荐」即可。`
               : `${escapeHtml(platformName(activePlatform))}暂时没有新候选，后台会继续补货。`
           : "";
+        const hasLocalFilter = state.filter !== "全部" || state.mediaFilter !== ALL_MEDIA_FILTER;
         const message = state.query.trim()
           ? `没有找到包含“${escapeHtml(state.query.trim())}”的推荐。`
+          : hasLocalFilter
+            ? "当前类别或媒体来源下没有已加载的推荐，可以重置筛选或继续加载。"
           : platformMessage
             ? platformMessage
             : state.videos.length
@@ -5126,9 +6108,20 @@ ${cardFeedbackBarHtml()}`;
         renderedRecommendationCards.clear();
         grid.innerHTML = `<div class="empty-state">${message}${retry}</div>`;
         $("#retryEmptyRecommendations")?.addEventListener("click", restartDesktopFailedRecoveries);
+        state.selectedRecommendationKey = "";
+        renderRecommendationDetail(null, items);
         return;
       }
+      reconcileSelectedRecommendation(items);
+      // The initial loading skeletons share the same class as append placeholders.
+      // Once the first real response arrives there is no append owner to remove them,
+      // so keeping them here leaves four blank cards in the queue and distorts its
+      // scroll height. During a real append request the placeholders stay until that
+      // request's finally block removes them.
+      if (!appendMoreInFlight) removeAppendSkeletons();
       syncRecommendationCards(items);
+      syncRecommendationSelection(items);
+      renderRecommendationDetail(selectedRecommendation(items), items);
     }
 
     function trackRecommendationClick(item) {
@@ -5166,11 +6159,19 @@ ${cardFeedbackBarHtml()}`;
       ).then(() => true, () => false);
     }
 
-    function openRecommendation(item, card) {
+    async function openRecommendation(item, card) {
       const url = contentUrl(item);
-      trackRecommendationClick(item);
-      card.querySelector(".status-line").textContent = url ? "已打开真实内容链接，点击信号会在后台记录。" : "后端没有返回可打开链接；点击信号会在后台记录。";
+      const status = card?.querySelector(".status-line");
+      if (status) status.textContent = url ? "已打开原文，正在记录这次主动选择…" : "没有可打开的安全原文链接，正在尝试记录这次选择…";
       showToast(url ? `打开：${item.title}` : "后端没有返回可打开链接");
+      const recorded = await trackRecommendationClick(item);
+      if (status?.isConnected) {
+        status.textContent = recorded
+          ? (url ? "已打开原文，这次主动选择已记录。" : "没有可打开链接；选择信号已记录。")
+          : (url ? "原文已打开，但点击信号未记录成功。" : "没有可打开链接，点击信号也未记录成功。");
+        if (!recorded) status.setAttribute("role", "alert");
+      }
+      return recorded;
     }
 
     function submitFeedback(item, feedback_type, note = "", { keepalive = false } = {}) {
@@ -5245,13 +6246,13 @@ ${cardFeedbackBarHtml()}`;
         dislike: {
           pending: "已标记不感兴趣，10 秒内可撤销。",
           saving: "正在保存不感兴趣反馈…",
-          committed: "已记录不感兴趣，下次刷新列表时会隐藏。",
+          committed: "已记录不感兴趣，并从当前队列移除。",
           toast: "已记录不感兴趣"
         },
         dismiss: {
           pending: "已标记忽略，10 秒内可撤销。",
           saving: "正在保存忽略反馈…",
-          committed: "已忽略这条推荐，下次刷新列表时会隐藏。",
+          committed: "已忽略这条推荐，并从当前队列移除。",
           toast: "已忽略推荐"
         }
       }[feedbackType];
@@ -5262,20 +6263,28 @@ ${cardFeedbackBarHtml()}`;
             card.classList.add("is-feedback-saving");
             status.classList.remove("has-feedback-action");
             status.textContent = copy.saving;
+            syncSelectedDetailControls({ forceStatusSync: true });
           }
           return submitFeedback(item, feedbackType, "", { keepalive });
         },
         rollback: ({ reason }) => {
           restoreRecommendationFeedback(item, card, status, snapshot);
+          syncSelectedDetailControls({ forceStatusSync: true });
           if (reason === "undo") showToast("已撤销反馈");
         },
         committed: () => {
-          if (!card.isConnected) return;
-          delete card.dataset.feedbackPending;
-          card.classList.remove("is-feedback-pending", "is-feedback-saving");
-          status.classList.remove("has-feedback-action");
-          status.textContent = copy.committed;
+          if (card.isConnected) {
+            delete card.dataset.feedbackPending;
+            card.classList.remove("is-feedback-pending", "is-feedback-saving");
+            status.classList.remove("has-feedback-action");
+            status.textContent = copy.committed;
+          }
           showToast(copy.toast);
+          if (shouldRemoveRecommendationAfterFeedback(feedbackType)) {
+            removeRecommendationFromWorkspace(item, { broadcast: true });
+          } else {
+            syncSelectedDetailControls({ forceStatusSync: true });
+          }
         }
       });
       if (!scheduled) return false;
@@ -5298,6 +6307,7 @@ ${cardFeedbackBarHtml()}`;
       status.classList.add("has-feedback-action");
       status.setAttribute("aria-live", "polite");
       status.replaceChildren(document.createTextNode(`${copy.pending} `), undo);
+      syncSelectedDetailControls({ forceStatusSync: true });
       return true;
     }
 
@@ -5323,8 +6333,8 @@ ${cardFeedbackBarHtml()}`;
       button.classList.add("is-send");
       button.dataset.action = "send-comment";
       button.innerHTML = sendIcon;
-      button.setAttribute("aria-label", "发送");
-      button.setAttribute("title", "发送");
+      button.setAttribute("aria-label", "发送反馈");
+      button.setAttribute("title", "发送反馈");
       requestAnimationFrame(() => card.querySelector(".comment-field input")?.focus());
     }
 
@@ -5334,7 +6344,7 @@ ${cardFeedbackBarHtml()}`;
       actions.classList.remove("is-composing");
       button.classList.remove("is-send");
       button.dataset.action = "comment";
-      button.textContent = "聊一聊";
+      button.textContent = "反馈一句";
       button.removeAttribute("aria-label");
       button.removeAttribute("title");
     }
@@ -5413,6 +6423,10 @@ ${cardFeedbackBarHtml()}`;
       if (action === "open") return openRecommendation(item, card);
       if (action === "comment") { openCardComposer(card); return; }
       if (action === "cancel-comment") { closeCardComposer(card); return; }
+      if (recommendationFeedbackAlreadyCommitted(item, action)) {
+        if (status) status.textContent = "这条推荐已经记录过喜欢，无需重复提交。";
+        return;
+      }
       if (action === "watch-later") {
         const btn = card.querySelector('[data-action="watch-later"]');
         const savedItem = desktopSavedItem(item);
@@ -5420,13 +6434,15 @@ ${cardFeedbackBarHtml()}`;
         btn.disabled = true;
         const wasSaved = desktopSavedMutations.isSaved("watch_later", savedItem.item_key);
         btn.setAttribute("aria-pressed", wasSaved ? "false" : "true");
-        btn.title = wasSaved ? "\u7A0D\u540E\u518D\u770B" : "\u53D6\u6D88\u6536\u85CF";
+        btn.title = wasSaved ? "稍后读" : "取消稍后读";
+        btn.setAttribute("aria-label", btn.title);
         if (status) { status.removeAttribute("role"); status.textContent = wasSaved ? "正在从本地稍后读移除…" : "正在保存到本地稍后读…"; }
         try {
           await desktopSavedMutations.toggle("watch_later", savedItem.item_key, {
             add: () => saveDesktopItem("watch_later", savedItem),
             remove: () => removeDesktopSavedItem("watch_later", savedItem.item_key)
           });
+          publishSavedChange("watch_later", savedItem.item_key, desktopSavedMutations.isSaved("watch_later", savedItem.item_key));
           if (status) status.textContent = wasSaved ? "已从本机稍后读移除。" : "已保存到本机稍后读。";
         } catch (error) {
           btn.setAttribute("aria-pressed", wasSaved ? "true" : "false");
@@ -5434,6 +6450,7 @@ ${cardFeedbackBarHtml()}`;
           if (status) { status.setAttribute("role", "alert"); status.textContent = error?.message || "本地保存失败，请重试。"; }
         } finally {
           btn.disabled = false;
+          syncSavedControlsForRecommendation(item);
         }
         return;
       }
@@ -5445,12 +6462,14 @@ ${cardFeedbackBarHtml()}`;
         const wasSaved = desktopSavedMutations.isSaved("favorite", savedItem.item_key);
         btn.setAttribute("aria-pressed", wasSaved ? "false" : "true");
         btn.title = wasSaved ? "\u6536\u85CF" : "\u53D6\u6D88\u6536\u85CF";
+        btn.setAttribute("aria-label", btn.title);
         if (status) { status.removeAttribute("role"); status.textContent = wasSaved ? "正在从本地收藏移除…" : "正在保存到本地收藏…"; }
         try {
           await desktopSavedMutations.toggle("favorite", savedItem.item_key, {
             add: () => saveDesktopItem("favorite", savedItem),
             remove: () => removeDesktopSavedItem("favorite", savedItem.item_key)
           });
+          publishSavedChange("favorite", savedItem.item_key, desktopSavedMutations.isSaved("favorite", savedItem.item_key));
           if (status) status.textContent = wasSaved ? "已从本机收藏移除。" : "已保存到本机收藏。";
         } catch (error) {
           btn.setAttribute("aria-pressed", wasSaved ? "true" : "false");
@@ -5458,6 +6477,7 @@ ${cardFeedbackBarHtml()}`;
           if (status) { status.setAttribute("role", "alert"); status.textContent = error?.message || "本地保存失败，请重试。"; }
         } finally {
           btn.disabled = false;
+          syncSavedControlsForRecommendation(item);
         }
         return;
       }
@@ -5465,7 +6485,7 @@ ${cardFeedbackBarHtml()}`;
         const input = card.querySelector(".comment-field input");
         const note = input.value.trim();
         if (!note) {
-          status.textContent = "先写一句想聊的内容，再提交这条反馈。";
+          status.textContent = "先写一句反馈，再提交。";
           input?.focus();
           return;
         }
@@ -5473,9 +6493,9 @@ ${cardFeedbackBarHtml()}`;
         if (input) input.value = "";
         closeCardComposer(card);
         item.feedback_type = "comment";
-        status.textContent = "已提交聊天线索，推荐会继续保留在当前列表。";
+        status.textContent = "已提交推荐反馈，推荐会继续保留在当前列表。";
         finishRecommendationFeedback(card, "comment");
-        showToast("已提交聊天线索");
+        showToast("已提交推荐反馈");
         void submitFeedback(item, "comment", note).catch((error) => {
           item.feedback_type = previousFeedbackType;
           if (input) input.value = note;
@@ -5514,13 +6534,11 @@ ${cardFeedbackBarHtml()}`;
         if (target) target.textContent = value;
       });
       const activityItems = state.activityItems.length ? state.activityItems : asArray(state.activity?.items);
-      const activityHtml = activityItems.length
-        ? activityItems.slice(0, 5).map((item) => `<div class="activity-item"><p>${escapeHtml(typeof item === "object" ? item.summary || item.detail || item.kind || valueList(item) : item)}</p></div>`).join("")
+      const activityMarkup = (limit) => activityItems.length
+        ? activityItems.slice(0, limit).map((item) => `<div class="activity-item"><p>${escapeHtml(typeof item === "object" ? item.summary || item.detail || item.kind || valueList(item) : item)}</p></div>`).join("")
         : `<div class="empty-state">还没有新的动态；实时流收到 activity.added 后会自动刷新。</div>`;
-      ["#activityList", "#mobileActivityList"].forEach((selector) => {
-        const target = $(selector);
-        if (target) target.innerHTML = activityHtml;
-      });
+      if ($("#activityList")) $("#activityList").innerHTML = activityMarkup(1);
+      if ($("#mobileActivityList")) $("#mobileActivityList").innerHTML = activityMarkup(5);
       const mobileCount = $("#mobileMessageCount");
       if (mobileCount) mobileCount.textContent = String(getRenderableMessages().length);
     }
@@ -6887,14 +7905,17 @@ ${cardFeedbackBarHtml()}`;
       }
       if (current && state.delight && String(state.delight.bvid || "") === key) {
         renderDelightTurns(state.delight);
-        if ($("#delightStatus")) $("#delightStatus").textContent = state.delight.response_message || "";
+        if ($("#delightStatus")) {
+          $("#delightStatus").setAttribute("role", "status");
+          $("#delightStatus").textContent = state.delight.response_message || "";
+        }
       }
       return current;
     }
 
     function delightContentUrl(delight) {
       if (!delight) return "";
-      return delight.content_url || "";
+      return contentUrl(delight);
     }
 
     function ensureDelightThumbAnchor() {
@@ -6921,13 +7942,17 @@ ${cardFeedbackBarHtml()}`;
         thumb.rel = "noopener noreferrer";
         thumb.removeAttribute("role");
         thumb.removeAttribute("tabindex");
+        thumb.removeAttribute("aria-disabled");
+        thumb.setAttribute("aria-label", "打开当前今日首选原文");
         return thumb;
       }
       thumb.removeAttribute("href");
       thumb.removeAttribute("target");
       thumb.removeAttribute("rel");
-      thumb.setAttribute("role", "button");
-      thumb.setAttribute("tabindex", "0");
+      thumb.setAttribute("role", "img");
+      thumb.setAttribute("tabindex", "-1");
+      thumb.setAttribute("aria-disabled", "true");
+      thumb.setAttribute("aria-label", "当前今日首选没有安全的原文链接");
       return thumb;
     }
 
@@ -6970,6 +7995,11 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function respondDelight(delight, response, el = null, openUrl = false) {
+      if (response === "retry") {
+        if (state.delightLoadState === "loading") return;
+        await fetchDelightQueue();
+        return;
+      }
       if (!delight) return;
       if (response === "chat") { openDelightComposer(); return; }
       if (response === "cancel-comment") { closeDelightComposer(); return; }
@@ -6987,6 +8017,7 @@ ${cardFeedbackBarHtml()}`;
             add: () => saveDesktopItem("watch_later", savedItem),
             remove: () => removeDesktopSavedItem("watch_later", savedItem.item_key)
           });
+          publishSavedChange("watch_later", savedItem.item_key, desktopSavedMutations.isSaved("watch_later", savedItem.item_key));
           if ($("#delightStatus")) $("#delightStatus").textContent = wasSaved ? "已从本机稍后读移除。" : "已保存到本机稍后读。";
         } catch (error) {
           btn.setAttribute("aria-pressed", wasSaved ? "true" : "false");
@@ -7011,6 +8042,7 @@ ${cardFeedbackBarHtml()}`;
             add: () => saveDesktopItem("favorite", savedItem),
             remove: () => removeDesktopSavedItem("favorite", savedItem.item_key)
           });
+          publishSavedChange("favorite", savedItem.item_key, desktopSavedMutations.isSaved("favorite", savedItem.item_key));
           if ($("#delightStatus")) $("#delightStatus").textContent = wasSaved ? "已从本机收藏移除。" : "已保存到本机收藏。";
         } catch (error) {
           btn.setAttribute("aria-pressed", wasSaved ? "true" : "false");
@@ -7022,6 +8054,7 @@ ${cardFeedbackBarHtml()}`;
         return;
       }
       if (response === "send-comment") {
+        if (delightFeedbackInFlight) return;
         const input = $("#delightCommentInput");
         const note = input?.value?.trim() || "";
         if (!note) {
@@ -7034,6 +8067,8 @@ ${cardFeedbackBarHtml()}`;
         applyTurnToDelight(pendingTurn);
         if (input) input.value = "";
         closeDelightComposer();
+        delightFeedbackInFlight = true;
+        syncDelightControlAvailability();
         try {
           const turn = await requestJsonStrict(ENDPOINTS.chatTurns, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(pendingTurn) });
           const scopedTurn = { ...pendingTurn, ...(turn || {}), scope: turn?.scope || "delight", subject_id: turn?.subject_id || delight.bvid };
@@ -7044,6 +8079,9 @@ ${cardFeedbackBarHtml()}`;
           applyTurnToDelight({ ...pendingTurn, status: "failed", error: error.message || "聊天提交失败，请稍后再试。" });
           if (input) input.value = note;
           showToast(`聊天提交失败：${error.message || "后端不可用"}`);
+        } finally {
+          delightFeedbackInFlight = false;
+          syncDelightControlAvailability();
         }
         return;
       }
@@ -7053,21 +8091,47 @@ ${cardFeedbackBarHtml()}`;
         // 否则点了只弹 toast 却什么都不开（field report 2026-07-07）。封面缩略图
         // 已是带 href 的 <a> 靠原生导航打开，openUrl=false 不重复开、避免双开。
         // window.open 在点击手势的同步栈内调用，不会被拦截。
-        if (openUrl && url) window.open(url, "_blank", "noopener,noreferrer");
-        trackRecommendationClick(delight);
-        // 浏览过即已读：上报 view 让后端标记 delight_notified，下次重灌不再出现。
-        // fire-and-forget，不阻塞打开内容；当场卡片仍保留。
-        requestJson(ENDPOINTS.delightRespond, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ bvid: delight.bvid, response: "view", title: delight.title || "", message: "" })
-        }).catch(() => {});
-        showToast(url ? "已打开惊喜推荐" : "后端没有返回可打开链接");
+        if (!url) {
+          if ($("#delightStatus")) $("#delightStatus").textContent = "后端没有返回可打开的 HTTP(S) 原文链接。";
+          return;
+        }
+        if (delightFeedbackInFlight) return;
+        delightFeedbackInFlight = true;
+        syncDelightControlAvailability();
+        if (openUrl) window.open(url, "_blank", "noopener,noreferrer");
+        const status = $("#delightStatus");
+        if (status) status.textContent = "原文已打开，正在记录这次主动选择…";
+        let clickRecorded = false;
+        try {
+          [clickRecorded] = await Promise.all([
+            trackRecommendationClick(delight),
+            requestJsonStrict(ENDPOINTS.delightRespond, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ bvid: delight.bvid, response: "view", title: delight.title || "", message: "" })
+            }).then(() => true, () => false),
+          ]);
+        } finally {
+          delightFeedbackInFlight = false;
+          syncDelightControlAvailability();
+        }
+        if (status) {
+          status.textContent = clickRecorded
+            ? "原文已打开，这次主动选择已记录。"
+            : "原文已打开，但点击信号未记录成功；不会把它宣称为已学习。";
+          if (!clickRecorded) status.setAttribute("role", "alert");
+        }
+        showToast("已打开今日首选原文");
         return;
       }
       const feedbackToast = response === "like" ? "惊喜推荐已喜欢" : response === "dislike" ? "这类惊喜先少来点" : "已标为看过，不再推荐";
-      const toastImmediately = response === "like" || response === "dislike";
-      if (toastImmediately) showToast(feedbackToast);
+      if (delightFeedbackInFlight) return;
+      if (response === "like" && delight.state === "liked") {
+        if ($("#delightStatus")) $("#delightStatus").textContent = "这条今日首选已经记录过喜欢，无需重复提交。";
+        return;
+      }
+      delightFeedbackInFlight = true;
+      syncDelightControlAvailability();
       let feedbackResult;
       try {
         const payload = {
@@ -7086,14 +8150,12 @@ ${cardFeedbackBarHtml()}`;
         // 失败不假装成功：保留当前卡片，下次可再试。
         showToast(response === "like" ? "这次喜欢还没记上，可以再试一次" : "这次还没记上，请再试一次");
         return;
+      } finally {
+        delightFeedbackInFlight = false;
+        syncDelightControlAvailability();
       }
-      if (response === "dismiss" && feedbackResult == null) {
-        showToast("这次还没记上，请再试一次");
-        setActiveDelight(state.delightIndex);
-        return;
-      }
-      if (response === "like" && feedbackResult == null) {
-        showToast("这次喜欢还没记上，可以再试一次");
+      if (feedbackResult == null) {
+        showToast(response === "like" ? "这次喜欢还没记上，可以再试一次" : "这次还没记上，请再试一次");
         setActiveDelight(state.delightIndex);
         return;
       }
@@ -7109,7 +8171,7 @@ ${cardFeedbackBarHtml()}`;
         setActiveDelight(Math.min(state.delightIndex, state.delights.length - 1));
         if (el) el.remove();
       }
-      if (!toastImmediately) showToast(feedbackToast);
+      showToast(feedbackToast);
     }
 
     function openMessageChat(msg) {
@@ -7634,8 +8696,45 @@ ${cardFeedbackBarHtml()}`;
       }
     }
 
+    function recommendationMutationOutcome(payload) {
+      const status = String(payload?.status || "").trim().toLowerCase();
+      return {
+        status: ["ok", "exhausted", "degraded", "error"].includes(status) ? status : "ok",
+        reason: String(payload?.reason || "").trim(),
+        retryable: payload?.retryable !== false,
+      };
+    }
+
+    function presentRecommendationMutationFailure(action, outcome) {
+      const summary = $("#queueResultSummary");
+      const reason = outcome.reason || `${action}暂时失败，当前队列已保留`;
+      if (summary) {
+        summary.dataset.tone = "error";
+        summary.textContent = reason;
+      }
+      showToast(`${reason}${outcome.retryable ? "，可以稍后重试" : ""}`);
+    }
+
     async function reshuffle() {
       const reshuffleButton = $("#reshuffleBtn");
+      if (desktopRecommendationLoadState === "loading" || desktopRecommendationLoadState === "idle") {
+        showToast("推荐队列还在读取，请稍候再换一批。");
+        return;
+      }
+      if (reshuffleInFlight || appendMoreInFlight) {
+        showToast("推荐队列正在更新，请等这次完成。");
+        return;
+      }
+      if (recommendationLocalFiltersActive()) {
+        const summary = $("#queueResultSummary");
+        if (summary) {
+          summary.dataset.tone = "error";
+          summary.textContent = "请先重置本地筛选，再换一批";
+        }
+        showToast("主题、媒体和搜索只筛选当前列表；请先点「重置筛选」。");
+        return;
+      }
+      reshuffleInFlight = true;
       // 请求发出前捕获当时选中的平台：用户在请求期间切 Tab 不能把响应写进错误批次。
       const requestPlatform = activePlatformSlug();
       // 当前可见卡片始终是本次换一批的排除集；平台定向时覆盖该平台
@@ -7651,42 +8750,68 @@ ${cardFeedbackBarHtml()}`;
         const requestBody = { excluded_bvids: excludedBvids };
         // "全部" 不带 source_platform：旧客户端 / 兼容路径的请求形状保持不变。
         if (requestPlatform) requestBody.source_platform = requestPlatform;
-        const payload = await requestJson(ENDPOINTS.reshuffle, {
+        const payload = await requestJsonStrict(ENDPOINTS.reshuffle, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(requestBody)
         });
+        const outcome = recommendationMutationOutcome(payload);
         const returned = payload?.items?.length ? normalizeRecommendationList(payload.items) : [];
         if (requestPlatform && reportPlatformScopeLeak("换一批", requestPlatform, returned)) return;
         const fresh = returned.filter((item) => !visibleKeys.has(recommendationKey(item)));
         // 后端返回空数组时保留现有卡片，不制造空屏。
-        if (fresh.length) {
+        if ((outcome.status === "error" || outcome.status === "degraded") && !fresh.length) {
+          presentRecommendationMutationFailure("换一批", outcome);
+        } else if (fresh.length && recommendationLocalFiltersActive()) {
+          showToast("你在换批期间启用了本地筛选；新批次未覆盖当前队列。");
+        } else if (fresh.length) {
           state.videos = requestPlatform ? replacePlatformCards(state.videos, requestPlatform, fresh) : fresh;
           renderAll();
           showToast("已换一批推荐");
         } else {
-          showToast("暂时没有更多新推荐了");
+          showToast(outcome.status === "exhausted" ? "当前候选已看完，后台会继续补充" : "暂时没有更多新推荐了");
         }
+      } catch (error) {
+        const summary = $("#queueResultSummary");
+        if (summary) {
+          summary.dataset.tone = "error";
+          summary.textContent = "换一批失败，当前队列已保留";
+        }
+        showToast(configErrorMessage(error?.details) || error?.message || "换一批失败，请检查后端连接");
       } finally {
         schedulePlatformAvailabilityRefresh();
+        reshuffleInFlight = false;
         if (reshuffleButton) reshuffleButton.disabled = false;
+        syncReshuffleFilterGuard();
       }
     }
 
     // 手动「加载更多」与滚动自动续页共用这一条路径。库存为 0 时按钮仍可点：
     // 它负责唤醒后端已有的补货链路；只有自动续页会被库存 gate 拦下。
     async function appendMore() {
-      if (appendMoreInFlight) return;
+      if (desktopRecommendationLoadState === "loading" || desktopRecommendationLoadState === "idle") {
+        showToast("推荐队列还在读取，请稍候再加载。");
+        return;
+      }
+      if (appendMoreInFlight || reshuffleInFlight) {
+        showToast("推荐队列正在更新，请等这次完成。");
+        return;
+      }
       appendMoreInFlight = true;
+      const loadMoreButton = $("#loadMoreBtn");
+      if (loadMoreButton) loadMoreButton.disabled = true;
       // 与换一批同理：捕获请求开始时的平台，响应到达时不再读 state.filter。
       const requestPlatform = activePlatformSlug();
       showAppendSkeletons();
       try {
         const requestBody = { excluded_bvids: state.videos.map((v) => v.bvid) };
         if (requestPlatform) requestBody.source_platform = requestPlatform;
-        const payload = await requestJson(ENDPOINTS.append, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
-        const retryHint = state.autoLoadOnScroll ? "补上后会自动加载" : "稍后可再点一次";
-        if (payload?.items?.length) {
+        const payload = await requestJsonStrict(ENDPOINTS.append, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
+        const outcome = recommendationMutationOutcome(payload);
+        const retryHint = state.autoLoadOnScroll ? "补上后再次滚到底即可加载" : "稍后可再点一次";
+        if ((outcome.status === "error" || outcome.status === "degraded") && !payload?.items?.length) {
+          presentRecommendationMutationFailure("加载更多", outcome);
+        } else if (payload?.items?.length) {
           const returned = normalizeRecommendationList(payload.items);
           if (requestPlatform && reportPlatformScopeLeak("加载更多", requestPlatform, returned)) return;
           // 按稳定 recommendation key 去重后再追加。
@@ -7711,8 +8836,17 @@ ${cardFeedbackBarHtml()}`;
             showToast(`这批内容都已反馈过，后台正在补货，${retryHint}`);
           }
         } else {
-          showToast(`候选池暂时没有新内容，已请求后台补货，${retryHint}`);
+          showToast(outcome.status === "exhausted"
+            ? "当前候选已全部加载，后台会继续补充"
+            : `候选池暂时没有新内容，已请求后台补货，${retryHint}`);
         }
+      } catch (error) {
+        const summary = $("#queueResultSummary");
+        if (summary) {
+          summary.dataset.tone = "error";
+          summary.textContent = "加载失败，已有队列已保留";
+        }
+        showToast(configErrorMessage(error?.details) || error?.message || "加载更多失败，请检查后端连接");
       } finally {
         removeAppendSkeletons();
         // showAppendSkeletons may have cleared an empty-state placeholder; if
@@ -7720,6 +8854,7 @@ ${cardFeedbackBarHtml()}`;
         if (!grid.childElementCount) renderVideos();
         schedulePlatformAvailabilityRefresh();
         appendMoreInFlight = false;
+        if (loadMoreButton) loadMoreButton.disabled = false;
       }
     }
 
@@ -7860,6 +8995,23 @@ ${cardFeedbackBarHtml()}`;
       return runtime.pool_available_count > 0 ? "可直接换一批" : "等待后台补货";
     }
 
+    function setSideHealthState(kind, label = "") {
+      const panel = document.querySelector(".side-health-summary");
+      const target = $("#sideHealthState");
+      const normalized = ["online", "degraded", "offline", "uninitialized", "checking"].includes(kind)
+        ? kind
+        : "checking";
+      const fallback = {
+        online: "在线",
+        degraded: "降级",
+        offline: "离线",
+        uninitialized: "未初始化",
+        checking: "连接中",
+      }[normalized];
+      if (panel) panel.dataset.health = normalized;
+      if (target) target.textContent = label || fallback;
+    }
+
     function renderPoolStatus(status = state.runtimeStatus) {
       const runtime = normalizeRuntimeStatus(status);
       const summary = getPoolStatusSummary(runtime);
@@ -7925,6 +9077,9 @@ ${cardFeedbackBarHtml()}`;
       state.runtimeStatus = normalizeRuntimeStatus(payload);
       const summary = getPoolStatusSummary(state.runtimeStatus);
       $("#statusLabel").textContent = state.runtimeStatus.initialized === false ? "后端未初始化" : "已连接本地后端";
+      setSideHealthState(
+        state.degraded ? "degraded" : state.runtimeStatus.initialized === false ? "uninitialized" : "online"
+      );
       $("#metricPool").textContent = String(state.runtimeStatus.pool_available_count);
       syncMessageCount();
       syncSourceMetric();
@@ -9534,6 +10689,7 @@ ${cardFeedbackBarHtml()}`;
       if (!item) return null;
       if (!isNewsDelightItem(item)) return null;
       const canonical = window.NewsClawSavedSync.normalizeSavedItem(item);
+      const priority = normalizeRecommendationPriority(item);
       // 后端 pending-batch 对喜欢过的候选下发 state="liked"，重灌后恢复
       // 「已喜欢」文案，让用户看出这条已经表过态。
       const serverState = String(item.state ?? "");
@@ -9548,6 +10704,8 @@ ${cardFeedbackBarHtml()}`;
         decodeHtmlEntities(item.title ?? ""), delightBody, delightCt);
       return {
         type: "delight",
+        id: item.recommendation_id ?? item.id ?? null,
+        recommendation_id: item.recommendation_id ?? item.id ?? null,
         bvid: String(item.bvid ?? item.content_id ?? ""),
         item_key: canonical.item_key,
         content_id: canonical.content_id,
@@ -9560,6 +10718,7 @@ ${cardFeedbackBarHtml()}`;
         cover_url: normalizeImageUrl(item.cover_url ?? item.cover ?? item.pic ?? item.thumbnail_url ?? item.thumbnail ?? item.image_url),
         content_url: canonical.content_url || String(item.canonical_url || ""),
         source_platform: canonical.source_platform,
+        platform: canonical.source_platform,
         chat_turn_id: String(item.chat_turn_id ?? ""),
         chat_reply: String(item.chat_reply ?? item.reply ?? ""),
         chat_draft: String(item.chat_draft ?? ""),
@@ -9578,6 +10737,25 @@ ${cardFeedbackBarHtml()}`;
         rating_score: Number(item?.rating_score ?? 0) || 0,
         rating_count: Number(item?.rating_count ?? 0) || 0,
         source_rank: Number(item?.source_rank ?? 0) || 0,
+        topic: decodeHtmlEntities(item?.topic_label ?? item?.topic ?? "未归类"),
+        topic_group: decodeHtmlEntities(item?.topic_group ?? "").replace(/\s+/g, " ").trim(),
+        display_tags: normalizeDisplayTags(item?.display_tags),
+        priority,
+        priority_level: priority.level,
+        priority_label: priority.label,
+        priority_score: priority.score,
+        priority_reason: priority.reason,
+        priority_signals: priority.signals,
+        why_recommended: decodeHtmlEntities(item?.why_recommended ?? item?.delight_reason ?? item?.reason ?? ""),
+        impact_chain: decodeHtmlEntities(item?.impact_chain ?? ""),
+        observation_points: (Array.isArray(item?.observation_points)
+          ? item.observation_points
+          : String(item?.observation_points || "").trim()
+            ? [item.observation_points]
+            : [])
+          .map((point) => decodeHtmlEntities(point).replace(/\s+/g, " ").trim())
+          .filter(Boolean),
+        expression: decodeHtmlEntities(item?.expression ?? item?.delight_reason ?? item?.reason ?? ""),
         turns: delightTurnList(item.turns)
       };
     }
@@ -9587,7 +10765,7 @@ ${cardFeedbackBarHtml()}`;
       const bodyText = String(delight.body_text || "").trim();
       if (!bodyText) return;
       thumb.replaceChildren();
-      thumb.classList.remove("has-image");
+      thumb.classList.remove("has-image", "is-tag-media");
       thumb.classList.add("is-text-media");
       thumb.dataset.platform = String(delight.source_platform || "bilibili").toLowerCase();
       const text = document.createElement("p");
@@ -9600,14 +10778,27 @@ ${cardFeedbackBarHtml()}`;
       thumb.append(text, badge);
     }
 
+    function renderDelightTagMedia(thumb, delight) {
+      if (!thumb || !delight) return;
+      thumb.replaceChildren();
+      thumb.classList.remove("has-image", "is-text-media");
+      thumb.classList.add("is-tag-media");
+      delete thumb.dataset.platform;
+      thumb.innerHTML = recommendationTagFingerprintHtml(delight);
+    }
+
     function renderDelightFallbackMedia(thumb, delight) {
+      if (recommendationPlatformSlug(delight) === "news") {
+        renderDelightTagMedia(thumb, delight);
+        return;
+      }
       const bodyText = String(delight?.body_text || "").trim();
       if (bodyText) {
         renderDelightTextMedia(thumb, delight);
         return;
       }
       thumb.replaceChildren();
-      thumb.classList.remove("has-image", "is-text-media");
+      thumb.classList.remove("has-image", "is-text-media", "is-tag-media");
       delete thumb.dataset.platform;
       if (!delight) return;
       const badge = document.createElement("span");
@@ -9622,7 +10813,7 @@ ${cardFeedbackBarHtml()}`;
       if (!thumb) return;
       const url = imageProxyUrl(delight?.cover_url);
       thumb.replaceChildren();
-      thumb.classList.remove("has-image", "is-text-media");
+      thumb.classList.remove("has-image", "is-text-media", "is-tag-media");
       delete thumb.dataset.platform;
       thumb.classList.toggle("has-image", Boolean(url));
       // 设置 banner 背景图（模糊用）
@@ -9663,8 +10854,9 @@ ${cardFeedbackBarHtml()}`;
       wrapper.classList.remove("is-expanded");
       wrapper.hidden = true;
       excerpt.textContent = "";
+      excerpt.hidden = true;
       toggle.hidden = true;
-      toggle.textContent = "展开正文";
+      toggle.textContent = "查看已采集的原始内容";
       toggle.setAttribute("aria-expanded", "false");
     }
 
@@ -9676,16 +10868,15 @@ ${cardFeedbackBarHtml()}`;
       const bodyText = String(delight?.body_text || "").trim();
       if (!wrapper || !excerpt || !toggle || !bodyText) return;
       excerpt.textContent = bodyText;
+      excerpt.hidden = true;
       wrapper.hidden = false;
-      requestAnimationFrame(() => {
-        const overflows = excerpt.scrollHeight > excerpt.clientHeight + 1;
-        toggle.hidden = !overflows;
-        toggle.setAttribute("aria-expanded", "false");
-      });
+      toggle.hidden = false;
+      toggle.setAttribute("aria-expanded", "false");
     }
 
     function _startDelightAutoAdvance() {
         _stopDelightAutoAdvance();
+        if (state.workbenchView !== "delight") return;
         if (state.delights.length < 2) return;
         _delightAutoTimer = setInterval(() => {
             if (delightUserEngaged()) return;
@@ -9698,7 +10889,84 @@ ${cardFeedbackBarHtml()}`;
         if (_delightAutoTimer !== null) {
             clearInterval(_delightAutoTimer);
             _delightAutoTimer = null;
-        }
+      }
+    }
+
+    function delightEmptyPresentation(loadState, errorMessage = "") {
+      const loading = loadState === "loading";
+      const failed = loadState === "failed";
+      return {
+        title: loading ? "正在读取今日首选" : failed ? "今日首选暂时不可用" : "今天还没有首选",
+        reason: loading
+          ? "正在从本地后端读取首选，完成前不会把未知状态显示成空队列。"
+          : failed
+            ? (errorMessage || "读取失败，但这不代表今天没有值得关注的内容。")
+            : "今天没有符合首选门槛的新内容；推荐队列仍可正常使用。",
+        status: failed ? "读取失败，可以重新读取。" : loading ? "正在读取…" : "队列为空。",
+        role: failed ? "alert" : "status",
+        retry: failed,
+      };
+    }
+
+    function renderDelightDecision(delight) {
+      const meta = $("#delightDecisionMeta");
+      const flags = $("#delightPriorityFlags");
+      const priorityReasonTarget = $("#delightPriorityReason");
+      const tagsTarget = $("#delightDecisionTags");
+      const analysis = $("#delightAnalysis");
+      const fallback = $("#delightReason");
+      if (!delight) {
+        if (meta) meta.hidden = true;
+        if (analysis) analysis.hidden = true;
+        return;
+      }
+      const priority = normalizeRecommendationPriority(delight);
+      const priorityLabel = priority.label || (priority.score > 0 ? `判断优先级 ${Math.round(priority.score * 100)}` : "常规参考");
+      if (flags) {
+        flags.innerHTML = `<span class="queue-priority-tag" data-priority="${escapeHtml(priority.level)}" title="${escapeHtml(priority.reason || priorityLabel)}">${escapeHtml(priorityLabel)}</span><span class="queue-topic-tag">${escapeHtml(recommendationTopicLabel(delight))}</span>`;
+      }
+      if (priorityReasonTarget) {
+        priorityReasonTarget.textContent = priority.reason;
+        priorityReasonTarget.hidden = !priority.reason;
+      }
+      const tags = recommendationDisplayTags(delight);
+      if (tagsTarget) {
+        tagsTarget.innerHTML = tags.length
+          ? tags.map((tag) => `<span class="detail-tag" data-tag-type="${escapeHtml(tag.type)}"><span>${escapeHtml(DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签")}</span>${escapeHtml(tag.label)}</span>`).join("")
+          : `<span class="detail-tag" data-tag-type="topic"><span>主题</span>${escapeHtml(recommendationTopicLabel(delight))}</span>`;
+      }
+      if (meta) meta.hidden = false;
+      if (analysis) {
+        analysis.innerHTML = recommendationDetailExplanationHtml(delight);
+        analysis.hidden = false;
+        bindObservationTrackingControls(analysis, delight, $("#delightStatus"));
+      }
+      if (fallback) fallback.hidden = true;
+    }
+
+    function syncDelightControlAvailability() {
+      const count = state.delights.length;
+      const hasItem = Boolean(state.delight);
+      const busy = delightFeedbackInFlight;
+      const safeUrl = hasItem ? delightContentUrl(state.delight) : "";
+      document.querySelectorAll('[data-delight="prev"], [data-delight="next"]').forEach((button) => {
+        button.disabled = busy || count <= 1;
+      });
+      const view = document.querySelector('[data-delight="view"]');
+      if (view) {
+        view.disabled = busy || !safeUrl;
+        view.setAttribute("aria-disabled", view.disabled ? "true" : "false");
+        view.title = safeUrl ? "阅读安全的原文链接" : "后端没有返回 HTTP(S) 原文链接";
+      }
+      const liked = state.delight?.state === "liked";
+      document.querySelectorAll('[data-delight="like"], [data-delight="dislike"], [data-delight="dismiss"], [data-delight="chat"], [data-delight="watch-later"], [data-delight="favorite"]').forEach((button) => {
+        button.disabled = busy || !hasItem || (button.dataset.delight === "like" && liked);
+      });
+      const retry = $("#delightRetryBtn");
+      if (retry) {
+        retry.hidden = state.delightLoadState !== "failed";
+        retry.disabled = state.delightLoadState === "loading";
+      }
     }
 
     function setActiveDelight(index = state.delightIndex) {
@@ -9714,8 +10982,11 @@ ${cardFeedbackBarHtml()}`;
         renderDelightCover(null);
         renderDelightTurns(null);
         resetDelightExcerpt();
-        $("#delightTitle").textContent = "暂无惊喜队列";
-        $("#delightReason").textContent = "后端产生新的高惊喜候选后会通过实时流出现在这里。";
+        const presentation = delightEmptyPresentation(state.delightLoadState, state.delightLoadError);
+        $("#delightTitle").textContent = presentation.title;
+        $("#delightReason").hidden = false;
+        $("#delightReason").textContent = presentation.reason;
+        renderDelightDecision(null);
         if ($("#delightStats")) $("#delightStats").hidden = true;
         const delightPublishedEl = $("#delightPublished");
         if (delightPublishedEl) {
@@ -9723,9 +10994,13 @@ ${cardFeedbackBarHtml()}`;
           delightPublishedEl.removeAttribute("title");
           delightPublishedEl.hidden = true;
         }
-        if ($("#delightStatus")) $("#delightStatus").textContent = "";
+        if ($("#delightStatus")) {
+          $("#delightStatus").setAttribute("role", presentation.role);
+          $("#delightStatus").textContent = presentation.status;
+        }
         if ($("#delightCount")) $("#delightCount").textContent = "0/0";
-        controls.forEach((btn) => { btn.disabled = true; });
+        controls.forEach((btn) => { btn.disabled = btn.dataset.delight !== "retry"; });
+        syncDelightControlAvailability();
         scheduleActivityRailHeightSync();
         return;
       }
@@ -9747,6 +11022,7 @@ ${cardFeedbackBarHtml()}`;
         renderDelightCover(state.delight);
         renderDelightTurns(state.delight);
         $("#delightTitle").textContent = state.delight.title;
+        renderDelightDecision(state.delight);
         syncDelightExcerpt(state.delight);
         const delightStatsEl = $("#delightStats");
         if (delightStatsEl) {
@@ -9813,9 +11089,7 @@ ${cardFeedbackBarHtml()}`;
         applyContent();
       }
       if ($("#delightCount")) $("#delightCount").textContent = `${state.delightIndex + 1}/${state.delights.length}`;
-      controls.forEach((btn) => {
-          btn.disabled = false;
-      });
+      controls.forEach((btn) => { btn.disabled = false; });
       // Sync ☆ / ♥ pressed state for the current delight.
       const delightKey = desktopSavedItem(state.delight).item_key;
       if (delightKey && _delightStatusCache.has(delightKey)) {
@@ -9832,6 +11106,7 @@ ${cardFeedbackBarHtml()}`;
         likeBtn.setAttribute("aria-pressed", liked ? "true" : "false");
         likeBtn.disabled = liked;
       }
+      syncDelightControlAvailability();
       scheduleActivityRailHeightSync();
     }
 
@@ -9921,9 +11196,11 @@ ${cardFeedbackBarHtml()}`;
 
     function applyDelights(payload) {
       const hasQueuePayload = Array.isArray(payload?.items) || Boolean(payload?.item);
-      if (!hasQueuePayload) return;
+      if (!hasQueuePayload) return false;
       const items = Array.isArray(payload?.items) ? payload.items : payload.item ? [payload.item] : [];
-      const normalized = items.map(normalizeDelight).filter(Boolean);
+      const normalized = sortRecommendationsByPriority(items.map(normalizeDelight).filter(Boolean));
+      state.delightLoadState = normalized.length ? "ready" : "empty";
+      state.delightLoadError = "";
       const previousActiveBvid = String(state.delight?.bvid || "");
       const existingByBvid = new Map(state.delights.map((item) => [String(item.bvid || ""), item]));
       state.delights = [];
@@ -9946,7 +11223,7 @@ ${cardFeedbackBarHtml()}`;
           state.delight = state.delights[activePosition];
         }
         syncDelightCount();
-        return;
+        return true;
       }
       setActiveDelight(activePosition >= 0 ? activePosition : 0);
       _startDelightAutoAdvance();
@@ -9970,6 +11247,7 @@ ${cardFeedbackBarHtml()}`;
         const currentKey = state.delight ? desktopSavedItem(state.delight).item_key : "";
         if (currentKey && _delightStatusCache.has(currentKey)) _syncDelightStatusButtons(currentKey);
       })();
+      return true;
     }
 
     function _syncDelightStatusButtons(itemKey) {
@@ -10001,8 +11279,25 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function fetchDelightQueue() {
-      const payload = await requestJson(ENDPOINTS.delightBatch);
-      applyDelights(payload);
+      state.delightLoadState = "loading";
+      state.delightLoadError = "";
+      if (!state.delights.length) setActiveDelight(0);
+      try {
+        const payload = await requestJsonStrict(ENDPOINTS.delightBatch, { timeoutMs: 15000 });
+        if (!applyDelights(payload)) throw new Error("今日首选响应格式不完整，请稍后重试。");
+      } catch (error) {
+        state.delightLoadState = "failed";
+        state.delightLoadError = configErrorMessage(error?.details) || error?.message || "读取今日首选失败，请检查本地后端连接。";
+        if (!state.delights.length) setActiveDelight(0);
+        else {
+          const status = $("#delightStatus");
+          if (status) {
+            status.setAttribute("role", "alert");
+            status.textContent = `刷新失败，保留当前首选：${state.delightLoadError}`;
+          }
+          syncDelightControlAvailability();
+        }
+      }
     }
 
     function handleRuntimeEvent(event) {
@@ -10091,6 +11386,8 @@ ${cardFeedbackBarHtml()}`;
       if (event.type === "delight.candidate" && event.bvid) {
         const delight = normalizeDelight(event);
         if (delight) {
+          state.delightLoadState = "ready";
+          state.delightLoadError = "";
           const key = String(delight.bvid || "");
           const existingIndex = state.delights.findIndex((item) => String(item.bvid || "") === key);
           if (existingIndex >= 0) {
@@ -10159,6 +11456,7 @@ ${cardFeedbackBarHtml()}`;
         state.runtimeSocket = socket;
         socket.addEventListener("open", () => {
           $("#statusLabel").textContent = "实时连接正常";
+          setSideHealthState(state.degraded ? "degraded" : state.runtimeStatus?.initialized === false ? "uninitialized" : "online");
           restartDesktopFailedRecoveries();
           scheduleDesktopPendingConfirmationRefresh();
           void refreshConfigApplyStatus();
@@ -10180,6 +11478,7 @@ ${cardFeedbackBarHtml()}`;
             const payload = JSON.parse(event.data);
             if (payload?.type === "runtime.heartbeat") {
               $("#statusLabel").textContent = "实时连接正常";
+              setSideHealthState(state.degraded ? "degraded" : state.runtimeStatus?.initialized === false ? "uninitialized" : "online");
               return;
             }
             handleRuntimeEvent(payload);
@@ -10189,6 +11488,7 @@ ${cardFeedbackBarHtml()}`;
           if (state.runtimeSocket === socket) {
             state.runtimeSocket = null;
             $("#statusLabel").textContent = "实时流重连中";
+            setSideHealthState("offline", "重连中");
             console.info("runtime-stream closed; reconnect scheduled", {
               code: event.code,
               reason: event.reason || "",
@@ -10200,10 +11500,12 @@ ${cardFeedbackBarHtml()}`;
         socket.addEventListener("error", () => {
           if (state.runtimeSocket === socket) {
             $("#statusLabel").textContent = "实时流重连中";
+            setSideHealthState("offline", "重连中");
           }
         });
       } catch {
         $("#statusLabel").textContent = "实时流重连中";
+        setSideHealthState("offline", "重连中");
         scheduleDesktopRuntimeReconnect();
       }
     }
@@ -10253,6 +11555,11 @@ ${cardFeedbackBarHtml()}`;
         if (forceHydrate) await refreshMigrationStatus({ force: true });
       } catch (error) {
         console.error("后端数据加载失败", error);
+        if (!state.videos.length && desktopRecommendationLoadState === "loading") {
+          desktopRecommendationLoadState = "failed";
+          scheduleDesktopRecommendationRecovery();
+          renderVideos();
+        }
         $("#statusLabel").textContent = "后端数据加载失败";
         $("#runtimeSummary").textContent = error?.message || "页面已保留离线数据，可打开设置检查 FastAPI 地址。";
         showToast("后端数据加载失败，页面已保留离线数据");
@@ -10350,8 +11657,8 @@ ${cardFeedbackBarHtml()}`;
           return;
         }
         $("#statusLabel").textContent = "已连接本地后端";
+        setSideHealthState(state.runtimeStatus?.initialized === false ? "uninitialized" : "online");
       }
-
       function applyInitStatusSnapshot(snapshot) {
         if (!snapshot) return;
         state.initStatus = snapshot;
@@ -10439,6 +11746,10 @@ ${cardFeedbackBarHtml()}`;
         const configSnapshot = await requestJson(ENDPOINTS.config);
         applyConfigSnapshot(configSnapshot);
         if (!configSnapshot) scheduleConfigSnapshotRetry();
+        if (!state.videos.length) {
+          desktopRecommendationLoadState = "failed-exhausted";
+          renderVideos();
+        }
         return;
       }
 
@@ -10470,7 +11781,7 @@ ${cardFeedbackBarHtml()}`;
         requestJson(ENDPOINTS.initStatus).then(applyInitStatusSnapshot),
         requestJson(`${ENDPOINTS.activityFeed}?limit=5`).then(applyActivitySnapshot),
         requestJson(ENDPOINTS.profile).then(applyProfileSnapshot),
-        requestJson(ENDPOINTS.delightBatch).then(applyDelightSnapshot),
+        fetchDelightQueue(),
         requestJson(ENDPOINTS.notificationPending).then(applyNotificationSnapshot),
         requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&limit=100`).then(applyChatSnapshot),
         requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&scope=delight&limit=80`).then(applyDelightChatSnapshot),
@@ -10938,14 +12249,65 @@ ${cardFeedbackBarHtml()}`;
     safeBind("#autoLoadOnScrollSetting", "change", (event) => {
       setAutoLoadOnScroll(Boolean(event.target.checked), { toast: true });
     });
-    window.addEventListener("scroll", scheduleAutoLoadCheck, { passive: true });
+    grid?.addEventListener("scroll", () => {
+      const gate = nextRecommendationGridScrollGate(grid, {
+        intent: recommendationGridScrollIntent,
+        armed: recommendationGridBottomArmed,
+      });
+      recommendationGridScrollIntent = gate.intent;
+      recommendationGridBottomArmed = gate.armed;
+      scheduleAutoLoadCheck();
+    }, { passive: true });
     window.addEventListener("resize", scheduleAutoLoadCheck);
+    safeBind("#workbenchQueueTab", "click", () => setWorkbenchView("recommendations"));
+    safeBind("#workbenchDelightTab", "click", () => setWorkbenchView("delight"));
+    ["#workbenchQueueTab", "#workbenchDelightTab"].forEach((selector) => {
+      safeBind(selector, "keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const delight = event.key === "ArrowRight" || event.key === "End";
+        setWorkbenchView(delight ? "delight" : "recommendations", { focus: true });
+      });
+    });
+    safeBind("#recommendationDetailScrim", "click", () => closeRecommendationDetailSheet());
+    window.addEventListener("resize", () => {
+      syncRecommendationSelection();
+      syncRecommendationDetailSheetPresentation();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (!isNarrowRecommendationWorkbench() || !state.recommendationDetailSheetOpen) return;
+      const pane = $("#recommendationDetailPane");
+      if (!pane) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRecommendationDetailSheet();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(pane.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), summary, [tabindex]:not([tabindex="-1"])'))
+        .filter((element) => !element.hidden && element.getClientRects().length > 0);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
     safeBind("#reshuffleBtn", "click", reshuffle);
     safeBind("#loadMoreBtn", "click", appendMore);
     ensureDelightThumbAnchor();
-    safeBind("#delightThumb", "click", () => respondDelight(state.delight, "view"));
+    safeBind("#delightThumb", "click", (event) => {
+      if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();
+      void respondDelight(state.delight, "view");
+    });
     safeBind("#delightThumb", "auxclick", (event) => {
-      if (event.button === 1) respondDelight(state.delight, "view");
+      if (event.button !== 1) return;
+      if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();
+      void respondDelight(state.delight, "view");
     });
     safeBind("#delightThumb", "keydown", (event) => {
       if (event.currentTarget?.getAttribute("href")) return;
@@ -10960,7 +12322,20 @@ ${cardFeedbackBarHtml()}`;
     safeBind("#delightCommentInput", "blur", (event) => {
       autoCollapseComposer(document.querySelector(".delight-main-actions"), event, closeDelightComposer);
     });
-    safeBind("#resetFiltersBtn", "click", () => { state.query = ""; state.filter = "全部"; const input = $("#searchInput"); if (input) input.value = ""; renderAll(); });
+    safeBind("#resetFiltersBtn", "click", () => {
+      state.query = "";
+      state.filter = "全部";
+      state.mediaFilter = ALL_MEDIA_FILTER;
+      const input = $("#searchInput");
+      if (input) input.value = "";
+      renderAll();
+      $('#filterRow .chip[data-filter="全部"]')?.focus({ preventScroll: true });
+    });
+    safeBind("#mediaFilterSelect", "change", (event) => {
+      state.mediaFilter = event.target.value || ALL_MEDIA_FILTER;
+      renderAll();
+      $("#mediaFilterSelect")?.focus({ preventScroll: true });
+    });
     safeBind("#searchInput", "input", (event) => { state.query = event.target.value || ""; renderAll(); });
     safeBind("#searchForm", "submit", (event) => { event.preventDefault(); state.query = $("#searchInput")?.value || ""; renderAll(); });
     window.addEventListener("resize", scheduleActivityRailHeightSync);
@@ -11334,7 +12709,9 @@ ${cardFeedbackBarHtml()}`;
       const toggle = $("#delightExcerptToggle");
       if (!wrapper || !toggle) return;
       const expanded = wrapper.classList.toggle("is-expanded");
-      toggle.textContent = expanded ? "收起正文" : "展开正文";
+      const excerpt = $("#delightExcerptText");
+      if (excerpt) excerpt.hidden = !expanded;
+      toggle.textContent = expanded ? "收起原始内容" : "查看已采集的原始内容";
       toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
       scheduleActivityRailHeightSync();
     });
@@ -11826,6 +13203,7 @@ ${cardFeedbackBarHtml()}`;
     startChatPlaceholderRotation();
     toastManager.init();
     setupThemeNotice();
+    setWorkbenchView(state.workbenchView);
     try {
       renderAll();
     } catch (error) {

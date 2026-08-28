@@ -294,7 +294,7 @@ class TestMobileWebViewModels:
               title: "A YouTube deep dive",
               recommendation_id: 42,
               topic_label: "",
-              up_name: "这位创作者还没认出来",
+              up_name: "媒体信息暂未提供",
             });
         """)
         )
@@ -399,7 +399,7 @@ class TestMobileWebViewModels:
               title: "一个知乎回答",
               recommendation_id: 43,
               topic_label: "",
-              up_name: "这位创作者还没认出来",
+              up_name: "媒体信息暂未提供",
             });
 
             const missingUrl = normalizeRecommendation({
@@ -457,7 +457,7 @@ class TestMobileWebViewModels:
               title: "Local-first agents",
               recommendation_id: 44,
               topic_label: "",
-              up_name: "这位创作者还没认出来",
+              up_name: "媒体信息暂未提供",
             });
 
             const missingUrl = normalizeRecommendation({
@@ -501,7 +501,7 @@ class TestMobileWebViewModels:
             });
 
             assert.equal(post.source_platform, "linuxdo");
-            assert.equal(post.up_name, "这位创作者还没认出来");
+            assert.equal(post.up_name, "媒体信息暂未提供");
             assert.equal(getSourceLabel(post.source_platform), "Linux.do");
             assert.equal(buildContentUrl(post), "https://linux.do/t/12345");
             assert.deepEqual(getRecommendationCardKind(post), {
@@ -583,6 +583,11 @@ class TestMobileWebViewModels:
         assert "card-cover-frame" in recommend_js
         assert "card-cover-frame" in app_css
         assert ".card-cover-frame.is-error" in app_css
+        assert "card-tag-fingerprint" in recommend_js
+        assert ".card-cover-frame.is-tag-card" in app_css
+        assert 'cardMedia.kind === "fingerprint"' in recommend_js
+        assert 'cardMedia.kind === "text"' in recommend_js
+        assert "card-cover-text" in recommend_js
         assert ".card-cover::after" not in app_css
 
     def test_runtime_status_normalizes_pool_readiness_counts(self) -> None:
@@ -700,8 +705,8 @@ class TestMobileWebViewModels:
         assert "waitForDecode" in recommend_js
         assert "await warmRecommendationCovers(newItems," in recommend_js
         assert "waitForDecode: true" in recommend_js
-        assert 'loading="${esc(imageAttrs.loading)}"' in recommend_js
-        assert 'fetchpriority="${esc(imageAttrs.fetchPriority)}"' in recommend_js
+        assert 'loading="${escapeHtmlAttribute(imageAttrs.loading)}"' in recommend_js
+        assert 'fetchpriority="${escapeHtmlAttribute(imageAttrs.fetchPriority)}"' in recommend_js
         assert "AUTO_APPEND_ROOT_MARGIN" in recommend_js
         assert "IntersectionObserver" in recommend_js
         assert "observeAutoAppendSentinel" in recommend_js
@@ -775,8 +780,8 @@ class TestMobileWebViewModels:
             const rec = normalizeRecommendation({ id: 42, bvid: "BV1xx" });
             assert.equal(rec.id, 42);
             assert.equal(rec.bvid, "BV1xx");
-            assert.equal(rec.title, "这条标题还没对上号");
-            assert.equal(rec.up_name, "这位 UP 还没认出来");
+            assert.equal(rec.title, "这条新闻暂时没有可用标题");
+            assert.equal(rec.up_name, "媒体信息暂未提供");
             assert.equal(rec.source_platform, "bilibili");
         """)
         )
@@ -863,7 +868,7 @@ class TestMobileWebViewModels:
               like_disabled: true,
               score_label: "这条可能会拐到你",
               response_tone: "success",
-              response_message: "已打开，阿B 会把这次点击当成强信号。",
+              response_message: "已打开，新闻爪会把这次点击当成强信号。",
             });
 
             const liked = getDelightUiState({ bvid: "BV1", state: "liked", delight_score: 0.7 });
@@ -1414,7 +1419,7 @@ class TestMobileWebViewModels:
               preferred_pace: "slow",
               quality_sensitivity: 0.92,
             });
-            assert.equal(style.preferred_duration, "长视频");
+            assert.equal(style.preferred_duration, "长新闻");
             assert.equal(style.preferred_pace, "慢节奏");
             assert.equal(style.quality_sensitivity, 0.92);
 
@@ -1499,7 +1504,7 @@ class TestMobileWebViewModels:
         """)
         )
 
-    def test_saved_sync_view_model_sanitizes_status_and_extension_copy(self) -> None:
+    def test_saved_view_model_enforces_newsclaw_local_only_contract(self) -> None:
         _assert_js(
             dedent("""
             import assert from "node:assert/strict";
@@ -1517,39 +1522,23 @@ class TestMobileWebViewModels:
               error_message: "unsafe\\u2028message",
             });
             assert.equal(normalized.item_key, "youtube:abc");
-            assert.equal(normalized.sync_status, "failed");
-            assert.equal(normalized.error_message, "unsafemessage");
+            assert.equal(normalized.content_type, "article");
+            assert.equal(normalized.sync_status, "unsupported");
+            assert.equal(normalized.error_code, "local_only_source");
+            assert.equal(normalized.error_message, "");
 
-            assert.deepEqual(
-              getSavedSyncViewModel({
-                item_key: "youtube:abc",
-                source_platform: "youtube",
-                content_id: "abc",
-                sync_status: "extension_required",
-              }),
-              {
-                item_key: "youtube:abc",
-                source_platform: "youtube",
-                content_id: "abc",
-                content_url: "",
-                content_type: "video",
-                title: "abc",
-                author_name: "",
-                cover_url: "",
-                sync_status: "extension_required",
-                resolved_target: "",
-                error_code: "",
-                error_message: "",
-                label: "需要连接插件",
-                tone: "warning",
-                retryable: true,
-                detail: "请连接已安装 OpenBiliClaw 插件的登录态浏览器后重试。",
-                actionable: true,
-                busy: false,
-                localOnly: false,
-                actionLabel: "重试同步",
-              },
-            );
+            const forcedLocalOnly = getSavedSyncViewModel({
+              item_key: "youtube:abc",
+              source_platform: "youtube",
+              content_id: "abc",
+              sync_status: "extension_required",
+            });
+            assert.equal(forcedLocalOnly.content_type, "article");
+            assert.equal(forcedLocalOnly.sync_status, "unsupported");
+            assert.equal(forcedLocalOnly.error_code, "local_only_source");
+            assert.equal(forcedLocalOnly.label, "仅本地保存");
+            assert.equal(forcedLocalOnly.actionable, false);
+            assert.equal(forcedLocalOnly.localOnly, true);
 
             const unsupported = getSavedSyncViewModel({
               item_key: "youtube:abc",
@@ -1562,7 +1551,7 @@ class TestMobileWebViewModels:
             assert.equal(unsupported.label, "仅本地保存");
             assert.equal(unsupported.tone, "neutral");
             assert.equal(unsupported.retryable, false);
-            assert.equal(unsupported.detail, "此内容类型暂不支持平台同步，仅保存在本地。");
+            assert.equal(unsupported.detail, "仅保存在本机新闻爪，不会修改新闻网站账号。");
             assert.equal(unsupported.actionable, false);
             assert.equal(unsupported.localOnly, true);
 
@@ -1573,8 +1562,8 @@ class TestMobileWebViewModels:
               sync_status: "unsupported",
               error_code: "unsupported_adapter_missing",
             });
-            assert.equal(rollingUpgrade.retryable, true);
-            assert.match(rollingUpgrade.detail, /更新|升级/);
+            assert.equal(rollingUpgrade.retryable, false);
+            assert.equal(rollingUpgrade.detail, "仅保存在本机新闻爪，不会修改新闻网站账号。");
 
             const supportedPlatforms = [
               "youtube",
@@ -1590,8 +1579,8 @@ class TestMobileWebViewModels:
                 source_platform: platform,
                 content_id: "1",
               });
-              assert.equal(ready.label, "待同步", platform);
-              assert.equal(ready.actionable, true, platform);
+              assert.equal(ready.label, "仅本地保存", platform);
+              assert.equal(ready.actionable, false, platform);
             }
 
             for (const sync_status of ["pending", "syncing"]) {
@@ -1603,7 +1592,7 @@ class TestMobileWebViewModels:
                 sync_task_id: sync_status === "pending" ? "task-1" : "",
               });
               assert.equal(busy.actionable, false);
-              assert.equal(busy.busy, true);
+              assert.equal(busy.busy, false);
             }
 
             const localPending = getSavedSyncViewModel({
@@ -1613,9 +1602,9 @@ class TestMobileWebViewModels:
               sync_status: "pending",
               sync_task_id: "",
             });
-            assert.equal(localPending.actionable, true);
+            assert.equal(localPending.actionable, false);
             assert.equal(localPending.busy, false);
-            assert.match(localPending.detail, /手动同步/);
+            assert.equal(localPending.detail, "仅保存在本机新闻爪，不会修改新闻网站账号。");
         """)
         )
 

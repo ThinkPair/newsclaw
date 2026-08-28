@@ -7,16 +7,20 @@ INDEX_HTML = Path("src/openbiliclaw/web/desktop/index.html")
 SAVED_SYNC_CORE = Path("src/openbiliclaw/web/desktop/assets/js/saved-sync-core.js")
 
 
-def test_main_recommendation_card_cover_is_a_real_link_when_url_exists() -> None:
+def test_main_recommendation_detail_owns_the_only_original_link() -> None:
     app_js = APP_JS.read_text(encoding="utf-8")
 
-    assert '<a class="cover${recommendationCoverClass(item)}"' in app_js
+    # The compact queue is a selector, not a wall of miniature detail cards.
+    # Safe navigation lives in the selected-item pane; a missing URL is an
+    # honestly disabled label rather than a clickable cover.
+    assert '<div class="cover${recommendationCoverClass(item)}"' in app_js
+    assert 'class="video-title queue-card-select"' in app_js
+    assert '<a class="small-btn primary" data-detail-open-original' in app_js
     assert 'href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"' in app_js
-    assert '<button class="cover${recommendationCoverClass(item)}"' in app_js
-    assert "后端没有返回可打开链接；点击信号会在后台记录。" in app_js
+    assert '<span class="small-btn is-disabled" aria-disabled="true">暂无原文链接</span>' in app_js
 
 
-def test_recommendation_click_tracking_uses_click_and_auxclick_without_window_open() -> None:
+def test_detail_original_link_tracks_click_and_auxclick_without_window_open() -> None:
     app_js = APP_JS.read_text(encoding="utf-8")
 
     open_match = re.search(
@@ -34,10 +38,10 @@ def test_recommendation_click_tracking_uses_click_and_auxclick_without_window_op
     assert "window.open" not in open_body
     assert "preventDefault" not in open_body
     assert "trackRecommendationClick(item);" in open_body
-    assert 'cover.addEventListener("click", () => openRecommendation(item, card));' in app_js
+    assert 'originalLink?.addEventListener("click", recordOriginalOpen);' in app_js
     assert re.search(
-        r'cover\.addEventListener\("auxclick", \(event\) => \{\s*'
-        r"if \(event\.button === 1\) openRecommendation\(item, card\);",
+        r'originalLink\?\.addEventListener\("auxclick", \(event\) => \{\s*'
+        r"if \(event\.button === 1\) recordOriginalOpen\(\);",
         app_js,
     )
 
@@ -48,7 +52,7 @@ def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
     assert '<a class="cover${savedCoverClass}"' in app_js
     saved_anchor = (
         '<a class="cover${savedCoverClass}" data-platform='
-        '"${escapeHtml(item.source_platform || item.platform || "bilibili")}"'
+        '"${escapeHtml(item.source_platform || item.platform || "news")}"'
     )
     assert saved_anchor in app_js
     assert 'data-notification-msg="view" href="${escapeHtml(msg.content_url)}"' in app_js
@@ -76,15 +80,19 @@ def test_delight_view_button_actually_opens_the_content() -> None:
     )
     assert view_match is not None, "delight view branch not found"
     view_body = view_match.group("body")
-    assert 'if (openUrl && url) window.open(url, "_blank", "noopener,noreferrer");' in view_body
+    assert "if (!url) {" in view_body
+    assert 'if (openUrl) window.open(url, "_blank", "noopener,noreferrer");' in view_body
 
     # The 去看看 button ([data-delight] handler) passes openUrl=true for view.
     assert 'await respondDelight(state.delight, response, null, response === "view");' in app_js
 
     # The cover thumbnail triggers must NOT pass openUrl (they navigate via the
     # native <a href>), so there's no double-open.
-    assert 'respondDelight(state.delight, "view"));' in app_js
-    assert 'if (event.button === 1) respondDelight(state.delight, "view");' in app_js
+    assert 'void respondDelight(state.delight, "view");' in app_js
+    guarded_thumb_click = (
+        "if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();"
+    )
+    assert guarded_thumb_click in app_js
 
 
 def test_delight_close_button_is_labeled_as_permanent_seen_action() -> None:
@@ -108,8 +116,11 @@ def test_delight_close_button_is_labeled_as_permanent_seen_action() -> None:
     assert ".delight-dismiss-btn:disabled" in app_css
     assert "flex-basis: 44px; width: 44px; height: 44px; min-height: 44px;" in app_css
     assert "已标为看过，不再推荐" in app_js
-    assert 'if (response === "dismiss" && feedbackResult == null)' in app_js
+    assert "if (feedbackResult == null)" in app_js
     assert "这次还没记上，请再试一次" in app_js
+    assert app_js.index("if (feedbackResult == null)") < app_js.index(
+        'if (response === "dislike" || response === "dismiss")'
+    )
 
 
 def test_cover_css_resets_anchor_defaults() -> None:
@@ -131,7 +142,7 @@ def test_saved_pages_render_manual_sync_without_platform_routing() -> None:
 
     assert "function runDesktopSavedSync" in app_js
     assert "function summarizeDesktopSavedTask" in app_js
-    assert "请连接已安装 OpenBiliClaw 插件的登录态浏览器后重试。" in core
+    assert "请连接已安装 NewsClaw 插件的登录态浏览器后重试。" in core
     assert "removeDesktopSavedItem(listKind, item.item_key)" in app_js
     assert "switch (item.source_platform" not in app_js
     assert ".saved-sync-chip" in app_css
@@ -146,5 +157,5 @@ def test_unsupported_saved_items_are_truthful_local_only_and_not_sync_eligible()
     assert 'errorCode === "unsupported_content_type"' in core
     assert 'errorCode === "unsupported_adapter_missing"' in core
     assert (
-        "window.OpenBiliClawSavedSync.isSavedSyncEligibleStatus(\n        item.sync_status,"
+        "window.NewsClawSavedSync.isSavedSyncEligibleStatus(\n        item.sync_status,"
     ) in app_js

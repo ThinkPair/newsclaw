@@ -370,12 +370,12 @@ body.chat-view-active .back-to-top {
   content: "封面加载失败";
 }
 
-/* No-cover text card for text-first sources (X tweet/thread). */
+/* Legacy non-news sources still use a compact text-first media slot. */
 .card-cover-frame.is-text-card {
   display: flex;
   align-items: flex-start;
-  aspect-ratio: auto;
   box-sizing: border-box;
+  aspect-ratio: auto;
   min-height: 88px;
   max-height: 116px;
   padding: 12px 114px 12px 14px;
@@ -383,17 +383,127 @@ body.chat-view-active .back-to-top {
 }
 
 .card-cover-text {
+  display: -webkit-box;
   margin: 0;
+  overflow: hidden;
+  color: var(--text-secondary, var(--text-muted));
   font-size: 13px;
   font-weight: 600;
   line-height: 1.55;
-  color: var(--text-secondary, var(--text-muted));
   white-space: pre-wrap;
   word-break: break-word;
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
   -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+/* No-cover cards show a compact information fingerprint.  The right padding
+   deliberately leaves room for the two 44px local-save actions. */
+.card-cover-frame.is-tag-card,
+.card-cover-frame.is-error.has-fingerprint-fallback {
+  display: block;
+  aspect-ratio: auto;
+  min-height: 116px;
+  color: var(--text-main);
+  background: var(--surface-soft);
+}
+
+.card-tag-fingerprint {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 116px;
+  padding: 14px 112px 14px 14px;
+  background:
+    radial-gradient(circle at 86% 18%, rgba(90, 169, 255, 0.18), transparent 34%),
+    linear-gradient(135deg, var(--brand-soft), var(--surface-soft) 62%);
+}
+
+.card-tag-fingerprint.is-cover-fallback { display: none; }
+.card-cover-frame.is-error.has-fingerprint-fallback .card-tag-fingerprint.is-cover-fallback {
+  display: flex;
+}
+.card-cover-frame.is-error.has-fingerprint-fallback::after { content: none; }
+
+.card-tag-kicker {
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.card-tag-list,
+.card-inline-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-info-tag {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 26px;
+  padding: 4px 9px;
   overflow: hidden;
+  border: 1px solid rgba(96, 112, 140, 0.15);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-info-tag[data-tag-type="topic"] {
+  border-color: rgba(251, 114, 153, 0.28);
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+.card-info-tag[data-tag-type="story"] {
+  border-color: rgba(90, 169, 255, 0.28);
+  background: var(--sky-soft);
+  color: #337bc5;
+}
+.card-info-tag[data-tag-type="temporal"] {
+  border-color: rgba(214, 148, 57, 0.28);
+  background: var(--warning-soft);
+  color: #95611a;
+}
+.card-info-tag[data-tag-type="evidence"] {
+  border-color: rgba(48, 185, 128, 0.25);
+  background: var(--lime-soft);
+  color: #247d5a;
+}
+.card-info-tag-overflow {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  background: var(--surface-strong);
+}
+
+.card-tag-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 9px;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.card-inline-tags { margin-bottom: 9px; }
+.card-inline-tags .card-info-tag {
+  min-height: 24px;
+  padding: 3px 8px;
+  font-size: 10px;
 }
 
 .card-body {
@@ -414,11 +524,14 @@ body.chat-view-active .back-to-top {
 .card-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 8px;
   font-size: 12px;
   color: var(--text-secondary);
 }
+
+.card-topic-label { color: var(--text-muted); }
 
 .card-published-time {
   color: var(--text-muted);
