@@ -48,6 +48,7 @@
 | 模块 | 文档 | 对应代码 | 状态 |
 |------|------|----------|------|
 | 后端 API | [modules/api.md](modules/api.md) | `src/openbiliclaw/api/` | ✅ durable 对话 + 配置后台应用 + 本机-only 迁移四 API（request ID 对账 / pending 取消） |
+| NewsClaw 新闻与持续跟踪 | [modules/news.md](modules/news.md) | `src/openbiliclaw/news/` + `api/news_routes.py` | ✅ Tushare/RSS 规范化去重、观察点检查、证据时间线、未读与归档/新周期 |
 | NewsClaw 研究 | [modules/research.md](modules/research.md) | `src/openbiliclaw/research/` | ✅ 本地受控 Tavily Search/Extract、独立 SQLite 证据账本、TTL 缓存与 Agent Bridge |
 | LLM 多模型支持 | [modules/llm.md](modules/llm.md) | `src/openbiliclaw/llm/` | ✅ v0.3.74 统一结构化 JSON 容错 + Ollama embedding 空凭据静默 |
 | B 站接入层 | [modules/bilibili.md](modules/bilibili.md) | `src/openbiliclaw/bilibili/` | ✅ M3 完成 |

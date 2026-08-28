@@ -184,8 +184,65 @@ a snapshot remain readable and explicitly lack that historical judgment.
 An observation point can be promoted into `tracked_observations`. Creation is
 idempotent by request ID and by the active semantic observation key; stopping
 tracking archives the row instead of erasing it. This creates a local memory
-anchor with its original judgment, but Phase 1 does not claim that the point is
-verified, schedule automatic Tavily research, or train the user profile.
+anchor with its original judgment. Phase 1 only establishes this anchor; it does
+not claim that the point has been verified, schedule automatic Tavily research,
+or train the user profile.
+
+### Phase 2 continuous tracking closure (implemented contract)
+
+Phase 2 implements the following end-to-end contract. The live local desktop
+service has verified the new API schema, content-library route and empty state;
+populated tracker cards, state transitions and timeline actions are covered by
+automated backend and desktop contracts. The first naturally occurring external
+news change remains an operational observation rather than a fabricated demo.
+
+```text
+normal Tushare/RSS refresh
+        |
+        v
+normalized + cross-source deduplicated Article batch
+        |                              |
+        |                              └→ normal candidate/recommendation path
+        v
+due active observations → deterministic local shortlist
+        |                         |
+        |                         └→ no related candidates → valid empty check
+        v
+bounded structured model comparison (previous state vs new evidence)
+        |                         |
+        |                         ├→ merely related / no material change → history only
+        |                         └→ provider/model failure → retry/degraded, never “unchanged”
+        v
+material change → evidence ledger → tracker timeline → unread update
+```
+
+The normal `NewsRuntime.refresh()` cycle owns source collection. Tracking reuses
+that completed local batch and source-health result in an app-owned background
+task, so scheduled model comparison does not hold the refresh lock; it must not create a second
+scheduled crawler or silently call Tavily. Deterministic rules may conclude that
+there are no related candidates and avoid a model call. Once plausible related
+evidence exists, a bounded structured model comparison is required to separate
+“related” from “material change”; a missing, malformed or failed model result is
+a retry/degraded outcome, not evidence that nothing changed.
+
+A changed check atomically records the check, its source evidence, the fact vs
+inference split, the new tracker state and an unread timeline entry. A verified
+unchanged or valid-empty check remains in history but creates no change
+notification. A tracker-level database single-flight makes a manual request join
+an already-running background check instead of launching a second model call.
+Operational failures remain read, surface a safe concrete reason,
+and keep an automatic backoff schedule; they cannot be presented as change
+updates. “Check now” waits for the same refresh, dedupe,
+shortlist, comparison and idempotency path with a forced due decision; it is not
+a Tavily research shortcut. Archiving a tracker stops future checks and cancels
+an in-flight claim while retaining the original judgment, all completed checks,
+evidence and read state.
+
+Tracking outcomes do not generate profile events or alter recommendation
+weights. The complete Phase 2 management surface belongs to desktop Web in this
+phase. Mobile/PWA, the browser extension and DSH have no tracking-center,
+timeline or check-now contract yet; they must later consume the same database
+truth rather than introduce a parallel ledger.
 
 ## Client contract
 

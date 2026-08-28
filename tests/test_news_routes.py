@@ -102,6 +102,177 @@ async def test_news_runtime_applies_and_reports_effective_settings(tmp_path: Pat
     assert runtime.runtime_state()["effective_settings"] == effective
 
 
+def test_manual_tracking_runner_caps_user_retry_policy(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    payload = runtime.settings_store.load()
+    settings = payload["settings"]
+    assert isinstance(settings, dict)
+    settings.update(
+        {
+            "retry_max_attempts": 10,
+            "retry_base_seconds": 300,
+            "retry_max_seconds": 3_600,
+        }
+    )
+    runtime.settings_store.save(payload)
+
+    normal_policy = runtime._runner()._policy
+    manual_policy = runtime._runner(bounded_tracking=True)._policy
+
+    assert normal_policy.max_attempts == 10
+    assert normal_policy.base_backoff_seconds == 300
+    assert normal_policy.max_backoff_seconds == 3_600
+    assert manual_policy.max_attempts == 3
+    assert manual_policy.timeout_seconds == 20
+    assert manual_policy.base_backoff_seconds == 1
+    assert manual_policy.max_backoff_seconds == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_reuses_deduped_batch_for_tracking_with_corroboration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.soul_engine.ready = True
+    adapter = SimpleNamespace(
+        source_id="rss:test",
+        media="测试来源",
+        provider="RSS",
+    )
+    canonical = build_article(
+        media="测试来源 A",
+        provider="RSS",
+        title="产业政策实施细则正式发布",
+        body="实施细则已经正式发布，政策进入执行阶段。",
+        canonical_url="https://example.com/a",
+        published_at="2026-08-28T08:00:00+00:00",
+        content_scope="full_text",
+        source_identifier="a",
+    )
+    corroborating = build_article(
+        media="测试来源 B",
+        provider="RSS",
+        title="产业政策实施细则正式发布",
+        canonical_url="https://example.com/b",
+        published_at="2026-08-28T08:01:00+00:00",
+        content_scope="title_only",
+        source_identifier="b",
+    )
+
+    class FakeRunner:
+        async def run(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                status="succeeded",
+                articles=(canonical, corroborating),
+                attempt_count=1,
+                replayed=False,
+            )
+
+    async def close_adapters(_adapters: object) -> None:
+        return None
+
+    async def publish(_articles: object) -> int:
+        return 1
+
+    captured: dict[str, object] = {}
+
+    async def track(
+        articles: object,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured["articles"] = list(articles)  # type: ignore[arg-type]
+        captured["kwargs"] = dict(kwargs)
+        return {"ran": 1, "changed": 0, "failed": 0, "results": []}
+
+    monkeypatch.setattr(runtime, "_build_adapters", lambda: ([adapter], []))
+    runner_options: list[dict[str, object]] = []
+
+    def fake_runner(**kwargs: object) -> FakeRunner:
+        runner_options.append(dict(kwargs))
+        return FakeRunner()
+
+    monkeypatch.setattr(runtime, "_runner", fake_runner)
+    monkeypatch.setattr(runtime, "_close_adapters", close_adapters)
+    monkeypatch.setattr(runtime, "publish_candidates", publish)
+    monkeypatch.setattr(runtime.tracking_service, "run_due_from_articles", track)
+
+    result = await runtime.refresh(
+        request_id="refresh-tracking-integration",
+        force_tracking=True,
+    )
+
+    assert result["status"] == "online"
+    assert result["tracking"] == {"ran": 1, "changed": 0, "failed": 0, "results": []}
+    assert len(captured["articles"]) == 1  # type: ignore[arg-type]
+    tracking_article = captured["articles"][0]  # type: ignore[index]
+    assert tracking_article["item_key"].startswith("news:")
+    assert tracking_article["content_scope"] == "full_text"
+    assert tracking_article["corroborating_sources"][0]["source"] == "测试来源 B"
+    assert captured["kwargs"]["source_status"] == "online"  # type: ignore[index]
+    assert captured["kwargs"]["force"] is True  # type: ignore[index]
+    assert runner_options == [{"bounded_tracking": True}]
+
+
+@pytest.mark.asyncio
+async def test_normal_refresh_detaches_tracking_analysis_from_refresh_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.soul_engine.ready = True
+    adapter = SimpleNamespace(
+        source_id="rss:test",
+        media="测试来源",
+        provider="RSS",
+    )
+
+    class FakeRunner:
+        async def run(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                status="empty",
+                articles=(),
+                attempt_count=1,
+                replayed=False,
+            )
+
+    async def close_adapters(_adapters: object) -> None:
+        return None
+
+    async def publish(_articles: object) -> int:
+        return 0
+
+    tracking_started = asyncio.Event()
+    release_tracking = asyncio.Event()
+
+    async def blocked_tracking(
+        _articles: object,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        tracking_started.set()
+        await release_tracking.wait()
+        return {"ran": 0, "changed": 0, "failed": 0, "results": []}
+
+    monkeypatch.setattr(runtime, "_build_adapters", lambda: ([adapter], []))
+    monkeypatch.setattr(runtime, "_runner", lambda: FakeRunner())
+    monkeypatch.setattr(runtime, "_close_adapters", close_adapters)
+    monkeypatch.setattr(runtime, "publish_candidates", publish)
+    monkeypatch.setattr(runtime.tracking_service, "run_due_from_articles", blocked_tracking)
+
+    result = await asyncio.wait_for(
+        runtime.refresh(request_id="refresh-detached-tracking"),
+        timeout=1,
+    )
+
+    assert result["tracking"]["scheduled"] is True  # type: ignore[index]
+    assert runtime._refresh_lock.locked() is False
+    await asyncio.wait_for(tracking_started.wait(), timeout=1)
+    assert runtime._background_tasks
+    release_tracking.set()
+    await asyncio.gather(*tuple(runtime._background_tasks))
+    assert not runtime._background_tasks
+
+
 @pytest.mark.asyncio
 async def test_scheduled_refresh_lanes_use_stable_request_ids(
     tmp_path: Path,

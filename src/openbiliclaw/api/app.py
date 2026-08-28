@@ -168,10 +168,15 @@ from openbiliclaw.api.models import (
     SpotlightResponseIn,
     StorageConfigOut,
     TrackedObservationArchiveResponse,
+    TrackedObservationCheckIn,
+    TrackedObservationCheckOut,
+    TrackedObservationCheckResponse,
     TrackedObservationCreateIn,
     TrackedObservationCreateResponse,
     TrackedObservationListResponse,
     TrackedObservationOut,
+    TrackedObservationReadResponse,
+    TrackedObservationTimelineResponse,
     TwitterSourceConfigOut,
     UpdateApplyIn,
     UpdateCheckIn,
@@ -8524,29 +8529,54 @@ def create_app(
             status=cast("Any", str(row.get("status", "active"))),
             latest_evidence=str(row.get("latest_evidence", "")),
             original_snapshot=_snapshot_model(row.get("original_snapshot")),
+            check_interval_minutes=int(row.get("check_interval_minutes", 1440) or 1440),
+            next_check_at=str(row.get("next_check_at", "")),
+            last_checked_at=str(row.get("last_checked_at", "")),
+            last_check_status=str(row.get("last_check_status", "pending")),
+            last_check_summary=str(row.get("last_check_summary", "")),
+            last_change_at=str(row.get("last_change_at", "")),
+            failure_count=int(row.get("failure_count", 0) or 0),
+            last_error=str(row.get("last_error", "")),
+            unread_count=int(row.get("unread_count", 0) or 0),
             created_at=str(row.get("created_at", "")),
             updated_at=str(row.get("updated_at", "")),
         )
+
+    def _tracked_check_out(row: Mapping[str, Any]) -> TrackedObservationCheckOut:
+        return TrackedObservationCheckOut.model_validate(dict(row))
 
     @app.get(
         "/api/news/tracked-observations",
         response_model=TrackedObservationListResponse,
     )
     async def tracked_observations(
-        item_key: str = Query(..., min_length=1, max_length=2048),
+        item_key: str = Query(default="", max_length=2048),
         status: Literal["active", "archived", "all"] = Query(default="active"),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
     ) -> TrackedObservationListResponse:
-        try:
-            normalized_key = validate_saved_item_key(item_key)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail="invalid item_key") from exc
-        if not _news_saved_item_key(normalized_key):
-            raise HTTPException(
-                status_code=422,
-                detail="tracked observations only accept NewsClaw news items",
-            )
-        rows = ctx.database.list_tracked_observations(normalized_key, status=status)
-        return TrackedObservationListResponse(items=[_tracked_observation_out(row) for row in rows])
+        normalized_key = ""
+        if item_key:
+            try:
+                normalized_key = validate_saved_item_key(item_key)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="invalid item_key") from exc
+            if not _news_saved_item_key(normalized_key):
+                raise HTTPException(
+                    status_code=422,
+                    detail="tracked observations only accept NewsClaw news items",
+                )
+        rows = ctx.database.list_tracked_observations(
+            normalized_key,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        summary = ctx.database.tracked_observation_summary(normalized_key, status=status)
+        return TrackedObservationListResponse(
+            items=[_tracked_observation_out(row) for row in rows],
+            **summary,
+        )
 
     @app.post(
         "/api/news/tracked-observations",
@@ -8614,6 +8644,7 @@ def create_app(
                 observation=payload.observation,
                 latest_evidence=payload.latest_evidence,
                 original_snapshot=snapshot_payload,
+                check_interval_minutes=payload.check_interval_minutes,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -8621,6 +8652,121 @@ def create_app(
             item=_tracked_observation_out(row),
             created=created,
             duplicate=not created,
+        )
+
+    @app.get(
+        "/api/news/tracked-observations/{tracking_id}",
+        response_model=TrackedObservationOut,
+    )
+    async def tracked_observation_detail(tracking_id: UUID) -> TrackedObservationOut:
+        row = ctx.database.get_tracked_observation(str(tracking_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        return _tracked_observation_out(row)
+
+    @app.post(
+        "/api/news/tracked-observations/{tracking_id}/restart",
+        response_model=TrackedObservationCreateResponse,
+    )
+    async def restart_tracked_observation(
+        tracking_id: UUID,
+        payload: TrackedObservationCheckIn,
+    ) -> TrackedObservationCreateResponse:
+        try:
+            row, created = ctx.database.restart_tracked_observation(
+                str(tracking_id),
+                request_id=payload.request_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        return TrackedObservationCreateResponse(
+            item=_tracked_observation_out(row),
+            created=created,
+            duplicate=not created,
+        )
+
+    @app.get(
+        "/api/news/tracked-observations/{tracking_id}/timeline",
+        response_model=TrackedObservationTimelineResponse,
+    )
+    async def tracked_observation_timeline(
+        tracking_id: UUID,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> TrackedObservationTimelineResponse:
+        row = ctx.database.get_tracked_observation(str(tracking_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        checks = ctx.database.list_tracked_observation_checks(
+            str(tracking_id),
+            limit=limit,
+            offset=offset,
+        )
+        return TrackedObservationTimelineResponse(
+            item=_tracked_observation_out(row),
+            checks=[_tracked_check_out(check) for check in checks],
+        )
+
+    @app.post(
+        "/api/news/tracked-observations/{tracking_id}/read",
+        response_model=TrackedObservationReadResponse,
+    )
+    async def read_tracked_observation(
+        tracking_id: UUID,
+    ) -> TrackedObservationReadResponse:
+        row, updated = ctx.database.mark_tracked_observation_checks_read(str(tracking_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        return TrackedObservationReadResponse(
+            item=_tracked_observation_out(row),
+            updated=updated,
+        )
+
+    @app.post(
+        "/api/news/tracked-observations/{tracking_id}/check",
+        response_model=TrackedObservationCheckResponse,
+    )
+    async def check_tracked_observation(
+        tracking_id: UUID,
+        payload: TrackedObservationCheckIn,
+    ) -> TrackedObservationCheckResponse:
+        row = ctx.database.get_tracked_observation(str(tracking_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        if str(row.get("status") or "") != "active":
+            raise HTTPException(status_code=409, detail="tracked observation is archived")
+        runtime = getattr(app.state, "newsclaw_runtime", None)
+        refresh = getattr(runtime, "refresh", None)
+        if not callable(refresh):
+            raise HTTPException(status_code=503, detail="NewsClaw runtime is unavailable")
+        try:
+            refresh_result = await refresh(
+                request_id=payload.request_id,
+                tracking_ids={str(tracking_id)},
+                force_tracking=True,
+            )
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        tracking = refresh_result.get("tracking", {})
+        results = tracking.get("results", []) if isinstance(tracking, Mapping) else []
+        result = next(
+            (
+                candidate
+                for candidate in results
+                if isinstance(candidate, Mapping) and isinstance(candidate.get("check"), Mapping)
+            ),
+            None,
+        )
+        if not isinstance(result, Mapping) or not isinstance(result.get("check"), Mapping):
+            raise HTTPException(status_code=503, detail="tracking check did not return a receipt")
+        current = ctx.database.get_tracked_observation(str(tracking_id))
+        if current is None:  # pragma: no cover - tracker is immutable inside this request
+            raise HTTPException(status_code=404, detail="tracked observation not found")
+        return TrackedObservationCheckResponse(
+            item=_tracked_observation_out(current),
+            check=_tracked_check_out(cast("Mapping[str, Any]", result["check"])),
         )
 
     @app.delete(
@@ -20982,6 +21128,8 @@ def create_app(
             request_replenishment=_request_runtime_replenishment,
             client_present=lambda: ctx.presence.is_present(grace_seconds=90),
             apply_runtime_settings=_apply_news_runtime_settings,
+            llm_service_provider=lambda: ctx.llm_service,
+            llm_concurrency_provider=lambda: ctx.llm_concurrency_gate,
         )
 
     from pathlib import Path as _Path

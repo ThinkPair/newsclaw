@@ -16650,6 +16650,20 @@ class Database:
             str(row["name"])
             for row in self.conn.execute("PRAGMA table_info(tracked_observations)").fetchall()
         }
+        tracked_additions = {
+            "check_interval_minutes": "INTEGER NOT NULL DEFAULT 1440",
+            "next_check_at": "TEXT NOT NULL DEFAULT ''",
+            "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+            "last_check_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "last_change_at": "TEXT NOT NULL DEFAULT ''",
+            "failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, declaration in tracked_additions.items():
+            if column not in tracked_columns:
+                self.conn.execute(
+                    f"ALTER TABLE tracked_observations ADD COLUMN {column} {declaration}"
+                )
         if "observation_key" not in tracked_columns:
             self.conn.execute(
                 "ALTER TABLE tracked_observations ADD COLUMN "
@@ -16695,16 +16709,221 @@ class Database:
             WHERE status = 'active'
             """
         )
+        self.conn.execute(
+            """
+            UPDATE tracked_observations
+            SET next_check_at = COALESCE(NULLIF(created_at, ''), CURRENT_TIMESTAMP)
+            WHERE status = 'active' AND next_check_at = ''
+            """
+        )
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tracked_observation_checks (
+                check_id          TEXT PRIMARY KEY,
+                request_id        TEXT NOT NULL UNIQUE,
+                tracking_id       TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN (
+                        'running', 'changed', 'unchanged', 'valid_empty',
+                        'retry_wait', 'failed', 'cancelled'
+                    )),
+                source_request_id TEXT NOT NULL DEFAULT '',
+                source_status     TEXT NOT NULL DEFAULT '',
+                summary           TEXT NOT NULL DEFAULT '',
+                candidate_count   INTEGER NOT NULL DEFAULT 0,
+                matched_count     INTEGER NOT NULL DEFAULT 0,
+                new_evidence_count INTEGER NOT NULL DEFAULT 0,
+                error             TEXT NOT NULL DEFAULT '',
+                is_read           INTEGER NOT NULL DEFAULT 1,
+                attempt_count     INTEGER NOT NULL DEFAULT 1,
+                lease_expires_at  TEXT NOT NULL DEFAULT '',
+                started_at        TEXT NOT NULL DEFAULT '',
+                completed_at      TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (tracking_id) REFERENCES tracked_observations(tracking_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tracked_checks_tracking_created
+                ON tracked_observation_checks(tracking_id, started_at DESC, check_id);
+            CREATE INDEX IF NOT EXISTS idx_tracked_checks_unread
+                ON tracked_observation_checks(is_read, status, completed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS tracked_observation_evidence (
+                evidence_id         TEXT PRIMARY KEY,
+                check_id            TEXT NOT NULL,
+                tracking_id         TEXT NOT NULL,
+                evidence_item_key   TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                change_fingerprint  TEXT NOT NULL,
+                recommendation_id   INTEGER,
+                match_basis         TEXT NOT NULL DEFAULT '',
+                match_score         REAL NOT NULL DEFAULT 0.0,
+                change_type         TEXT NOT NULL DEFAULT '',
+                previous_state      TEXT NOT NULL DEFAULT '',
+                new_state           TEXT NOT NULL DEFAULT '',
+                fact                TEXT NOT NULL DEFAULT '',
+                inference           TEXT NOT NULL DEFAULT '',
+                summary             TEXT NOT NULL DEFAULT '',
+                evidence_quote      TEXT NOT NULL DEFAULT '',
+                confidence          REAL NOT NULL DEFAULT 0.0,
+                evidence_snapshot   TEXT NOT NULL DEFAULT '{}',
+                detected_at         TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (check_id) REFERENCES tracked_observation_checks(check_id),
+                FOREIGN KEY (tracking_id) REFERENCES tracked_observations(tracking_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_evidence_change_fingerprint
+                ON tracked_observation_evidence(tracking_id, change_fingerprint);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_evidence_content_fingerprint
+                ON tracked_observation_evidence(
+                    tracking_id, evidence_item_key, evidence_fingerprint
+                );
+            CREATE INDEX IF NOT EXISTS idx_tracked_evidence_tracking_detected
+                ON tracked_observation_evidence(tracking_id, detected_at DESC, evidence_id);
+
+            CREATE TABLE IF NOT EXISTS tracked_observation_candidates (
+                candidate_record_id TEXT PRIMARY KEY,
+                check_id             TEXT NOT NULL,
+                tracking_id          TEXT NOT NULL,
+                evidence_item_key    TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                decision             TEXT NOT NULL
+                    CHECK (decision IN (
+                        'changed', 'related_no_change', 'irrelevant'
+                    )),
+                match_basis          TEXT NOT NULL DEFAULT '',
+                match_score          REAL NOT NULL DEFAULT 0.0,
+                evidence_snapshot    TEXT NOT NULL DEFAULT '{}',
+                examined_at          TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (check_id) REFERENCES tracked_observation_checks(check_id),
+                FOREIGN KEY (tracking_id) REFERENCES tracked_observations(tracking_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_candidates_content
+                ON tracked_observation_candidates(
+                    tracking_id, evidence_item_key, evidence_fingerprint
+                );
+            CREATE INDEX IF NOT EXISTS idx_tracked_candidates_check
+                ON tracked_observation_candidates(check_id, candidate_record_id);
+        """)
+        # Only verified changes are unread.  Repair databases created by an
+        # earlier tracking build that exposed terminal failures as updates.
+        self.conn.execute(
+            """
+            UPDATE tracked_observation_checks
+            SET is_read = 1
+            WHERE status != 'changed' AND is_read = 0
+            """
+        )
+        # A tracker has one comparison owner at a time.  Older builds only
+        # deduplicated request ids, so repair any pre-existing duplicate
+        # running rows before installing the database-level single-flight gate.
+        self.conn.execute(
+            """
+            WITH ranked AS (
+                SELECT check_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY tracking_id
+                           ORDER BY
+                               CASE
+                                   WHEN julianday(lease_expires_at) > julianday('now') THEN 0
+                                   ELSE 1
+                               END,
+                               julianday(started_at) DESC,
+                               check_id DESC
+                       ) AS position
+                FROM tracked_observation_checks
+                WHERE status = 'running'
+            )
+            UPDATE tracked_observation_checks
+            SET status = 'cancelled',
+                summary = '同一观察点已有另一轮检查，本轮已取消',
+                completed_at = COALESCE(NULLIF(completed_at, ''), CURRENT_TIMESTAMP),
+                lease_expires_at = '',
+                is_read = 1
+            WHERE check_id IN (
+                SELECT check_id FROM ranked WHERE position > 1
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_checks_one_running
+            ON tracked_observation_checks(tracking_id)
+            WHERE status = 'running'
+            """
+        )
 
     @staticmethod
-    def _tracked_observation_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _tracked_observation_dict(row: Mapping[str, Any]) -> dict[str, Any]:
         item = dict(row)
         try:
             decoded = json.loads(str(item.get("original_snapshot") or "{}"))
         except (TypeError, ValueError):
             decoded = {}
         item["original_snapshot"] = dict(decoded) if isinstance(decoded, Mapping) else {}
+        item["check_interval_minutes"] = int(item.get("check_interval_minutes") or 1440)
+        item["failure_count"] = int(item.get("failure_count") or 0)
+        item["unread_count"] = int(item.get("unread_count") or 0)
         return item
+
+    @staticmethod
+    def _tracked_check_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        for field in (
+            "candidate_count",
+            "matched_count",
+            "new_evidence_count",
+            "attempt_count",
+            "is_read",
+        ):
+            item[field] = int(item.get(field) or 0)
+        item["is_read"] = bool(item["is_read"])
+        return item
+
+    @staticmethod
+    def _tracked_evidence_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            snapshot = json.loads(str(item.get("evidence_snapshot") or "{}"))
+        except (TypeError, ValueError):
+            snapshot = {}
+        item["evidence_snapshot"] = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+        item["confidence"] = float(item.get("confidence") or 0.0)
+        item["match_score"] = float(item.get("match_score") or 0.0)
+        return item
+
+    @staticmethod
+    def tracked_observation_due_at(tracker: Mapping[str, Any]) -> datetime | None:
+        """Return the UTC due clock for a tracked observation."""
+
+        return _parse_axis_datetime(tracker.get("next_check_at"))
+
+    @staticmethod
+    def _tracked_observation_select() -> str:
+        return """
+            SELECT o.*,
+                   COALESCE((
+                       SELECT COUNT(*)
+                       FROM tracked_observation_checks c
+                       WHERE c.tracking_id = o.tracking_id
+                         AND c.status = 'changed' AND c.is_read = 0
+                   ), 0) AS unread_count,
+                   COALESCE((
+                       SELECT c.summary
+                       FROM tracked_observation_checks c
+                       WHERE c.tracking_id = o.tracking_id
+                       ORDER BY c.started_at DESC, c.check_id DESC
+                       LIMIT 1
+                   ), '') AS last_check_summary
+            FROM tracked_observations o
+        """
+
+    def get_tracked_observation(self, tracking_id: str) -> dict[str, Any] | None:
+        normalized_id = str(tracking_id or "").strip()
+        if not normalized_id:
+            return None
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            self._tracked_observation_select() + " WHERE o.tracking_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        return self._tracked_observation_dict(row) if row is not None else None
 
     def create_tracked_observation(
         self,
@@ -16717,6 +16936,7 @@ class Database:
         observation: str,
         latest_evidence: str,
         original_snapshot: Mapping[str, Any] | None,
+        check_interval_minutes: int = 1440,
     ) -> tuple[dict[str, Any], bool]:
         """Create once per request id or return the exact previous result."""
 
@@ -16727,6 +16947,7 @@ class Database:
             normalized_observation.casefold().encode("utf-8")
         ).hexdigest()
         normalized_evidence = " ".join(str(latest_evidence or "").split()).strip()
+        normalized_interval = max(15, min(10_080, int(check_interval_minutes)))
         normalized_recommendation_id = (
             int(recommendation_id) if recommendation_id is not None else None
         )
@@ -16755,6 +16976,7 @@ class Database:
                     == normalized_recommendation_id
                     and str(existing["observation"] or "") == normalized_observation
                     and str(existing["latest_evidence"] or "") == normalized_evidence
+                    and int(existing["check_interval_minutes"] or 1440) == normalized_interval
                 )
                 if not same_payload:
                     raise ValueError("request_id was already used for a different observation")
@@ -16780,8 +17002,8 @@ class Database:
                 INSERT INTO tracked_observations (
                     tracking_id, request_id, item_key, recommendation_id,
                     topic_group, story_key, observation_key, observation, latest_evidence,
-                    original_snapshot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_snapshot, check_interval_minutes, next_check_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     tracking_id,
@@ -16794,6 +17016,7 @@ class Database:
                     normalized_observation,
                     normalized_evidence,
                     snapshot_json,
+                    normalized_interval,
                 ),
             )
             row = conn.execute(
@@ -16813,32 +17036,729 @@ class Database:
 
     def list_tracked_observations(
         self,
-        item_key: str,
+        item_key: str = "",
         *,
         status: str = "active",
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """List active, archived, or all observation rows for one item."""
+        """List tracked observations globally or for one source item."""
 
         normalized_status = str(status or "active").strip().lower()
         if normalized_status not in {"active", "archived", "all"}:
             raise ValueError("unsupported tracked observation status")
-        status_clause = "" if normalized_status == "all" else "AND status = ?"
-        params: tuple[object, ...] = (
-            (str(item_key or "").strip(),)
-            if normalized_status == "all"
-            else (str(item_key or "").strip(), normalized_status)
-        )
+        normalized_item_key = str(item_key or "").strip()
+        clauses: list[str] = []
+        params: list[object] = []
+        if normalized_item_key:
+            clauses.append("o.item_key = ?")
+            params.append(normalized_item_key)
+        if normalized_status != "all":
+            clauses.append("o.status = ?")
+            params.append(normalized_status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend((max(1, min(500, int(limit))), max(0, int(offset))))
         self._ensure_fresh_read()
         rows = self.conn.execute(
-            f"""
-            SELECT *
-            FROM tracked_observations
-            WHERE item_key = ? {status_clause}
-            ORDER BY created_at DESC, tracking_id
-            """,
+            self._tracked_observation_select()
+            + where
+            + " ORDER BY o.updated_at DESC, o.created_at DESC, o.tracking_id LIMIT ? OFFSET ?",
             params,
         ).fetchall()
         return [self._tracked_observation_dict(row) for row in rows]
+
+    def tracked_observation_summary(
+        self,
+        item_key: str = "",
+        *,
+        status: str = "all",
+    ) -> dict[str, int]:
+        """Count trackers and unread checks using the same filters as the list."""
+
+        normalized_status = str(status or "all").strip().lower()
+        if normalized_status not in {"active", "archived", "all"}:
+            raise ValueError("unsupported tracked observation status")
+        normalized_item_key = str(item_key or "").strip()
+        clauses: list[str] = []
+        params: list[object] = []
+        if normalized_item_key:
+            clauses.append("o.item_key = ?")
+            params.append(normalized_item_key)
+        if normalized_status != "all":
+            clauses.append("o.status = ?")
+            params.append(normalized_status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            (
+                """
+            SELECT
+                SUM(CASE WHEN o.status = 'active' THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN o.status = 'archived' THEN 1 ELSE 0 END) AS archived_count
+            FROM tracked_observations o
+            """
+                + where
+            ),
+            params,
+        ).fetchone()
+        unread = self.conn.execute(
+            (
+                """
+            SELECT COUNT(*)
+            FROM tracked_observation_checks c
+            JOIN tracked_observations o ON o.tracking_id = c.tracking_id
+            """
+                + (
+                    where + " AND c.status = 'changed' AND c.is_read = 0"
+                    if where
+                    else " WHERE c.status = 'changed' AND c.is_read = 0"
+                )
+            ),
+            params,
+        ).fetchone()
+        active = int(row["active_count"] or 0) if row is not None else 0
+        archived = int(row["archived_count"] or 0) if row is not None else 0
+        return {
+            "total": active + archived,
+            "active_count": active,
+            "archived_count": archived,
+            "unread_count": int(unread[0] or 0) if unread is not None else 0,
+        }
+
+    def list_due_tracked_observations(
+        self,
+        *,
+        now: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            self._tracked_observation_select()
+            + """
+              WHERE o.status = 'active'
+                AND (
+                    o.next_check_at = ''
+                    OR julianday(o.next_check_at) <= julianday(?)
+                )
+              ORDER BY julianday(o.next_check_at), o.created_at, o.tracking_id
+              LIMIT ?
+            """,
+            (str(now or "").strip(), max(1, min(100, int(limit)))),
+        ).fetchall()
+        return [self._tracked_observation_dict(row) for row in rows]
+
+    def begin_tracked_observation_check(
+        self,
+        *,
+        tracking_id: str,
+        request_id: str,
+        started_at: str,
+        lease_expires_at: str,
+        source_request_id: str = "",
+        source_status: str = "",
+        candidate_count: int = 0,
+    ) -> tuple[dict[str, Any], bool]:
+        """Claim one replay-safe tracking check using a crash-recoverable lease."""
+
+        normalized_tracking_id = str(tracking_id or "").strip()
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_tracking_id or not normalized_request_id:
+            raise ValueError("tracking_id and request_id are required")
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tracker = conn.execute(
+                "SELECT status FROM tracked_observations WHERE tracking_id = ?",
+                (normalized_tracking_id,),
+            ).fetchone()
+            if tracker is None:
+                raise KeyError(normalized_tracking_id)
+            if str(tracker["status"] or "") != "active":
+                raise ValueError("archived tracked observation cannot be checked")
+            existing = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE request_id = ?",
+                (normalized_request_id,),
+            ).fetchone()
+            should_run = True
+            if existing is not None:
+                if str(existing["tracking_id"] or "") != normalized_tracking_id:
+                    raise ValueError("request_id was already used for another tracked observation")
+                existing_status = str(existing["status"] or "")
+                lease = _parse_axis_datetime(existing["lease_expires_at"])
+                current = _parse_axis_datetime(started_at) or datetime.now(UTC)
+                if existing_status != "running" or (lease is not None and lease > current):
+                    conn.commit()
+                    return self._tracked_check_dict(existing), False
+                conn.execute(
+                    """
+                    UPDATE tracked_observation_checks
+                    SET source_request_id = ?, source_status = ?,
+                        lease_expires_at = ?, started_at = ?, completed_at = '',
+                        candidate_count = ?, error = '', summary = '',
+                        attempt_count = attempt_count + 1
+                    WHERE check_id = ?
+                    """,
+                    (
+                        str(source_request_id or "").strip(),
+                        str(source_status or "").strip(),
+                        str(lease_expires_at or "").strip(),
+                        str(started_at or "").strip(),
+                        max(0, int(candidate_count)),
+                        str(existing["check_id"]),
+                    ),
+                )
+                check_id = str(existing["check_id"])
+            else:
+                current = _parse_axis_datetime(started_at) or datetime.now(UTC)
+                current_text = current.isoformat()
+                conn.execute(
+                    """
+                    UPDATE tracked_observation_checks
+                    SET status = 'cancelled',
+                        summary = '检查租约已过期，由新一轮检查接管',
+                        completed_at = ?, lease_expires_at = '', is_read = 1
+                    WHERE tracking_id = ? AND status = 'running'
+                      AND (
+                          lease_expires_at = ''
+                          OR julianday(lease_expires_at) <= julianday(?)
+                      )
+                    """,
+                    (current_text, normalized_tracking_id, current_text),
+                )
+                in_flight = conn.execute(
+                    """
+                    SELECT * FROM tracked_observation_checks
+                    WHERE tracking_id = ? AND status = 'running'
+                      AND julianday(lease_expires_at) > julianday(?)
+                    ORDER BY julianday(started_at) DESC, check_id DESC
+                    LIMIT 1
+                    """,
+                    (normalized_tracking_id, current_text),
+                ).fetchone()
+                if in_flight is not None:
+                    conn.commit()
+                    return self._tracked_check_dict(in_flight), False
+                check_id = str(uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO tracked_observation_checks (
+                        check_id, request_id, tracking_id, source_request_id,
+                        source_status, candidate_count, lease_expires_at, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        check_id,
+                        normalized_request_id,
+                        normalized_tracking_id,
+                        str(source_request_id or "").strip(),
+                        str(source_status or "").strip(),
+                        max(0, int(candidate_count)),
+                        str(lease_expires_at or "").strip(),
+                        str(started_at or "").strip(),
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE check_id = ?",
+                (check_id,),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("tracking check disappeared after claim")
+        self._ensure_fresh_read()
+        return self._tracked_check_dict(row), should_run
+
+    def get_tracked_observation_check(
+        self,
+        check_id: str,
+        *,
+        tracking_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Read one durable check receipt, optionally fenced to its tracker."""
+
+        normalized_check_id = str(check_id or "").strip()
+        normalized_tracking_id = str(tracking_id or "").strip()
+        if not normalized_check_id:
+            return None
+        clauses = ["check_id = ?"]
+        params: list[object] = [normalized_check_id]
+        if normalized_tracking_id:
+            clauses.append("tracking_id = ?")
+            params.append(normalized_tracking_id)
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            "SELECT * FROM tracked_observation_checks WHERE " + " AND ".join(clauses),
+            params,
+        ).fetchone()
+        return self._tracked_check_dict(row) if row is not None else None
+
+    @staticmethod
+    def _tracking_evidence_snapshot(change: Mapping[str, Any]) -> str:
+        raw_sources = change.get("corroborating_sources", [])
+        sources = raw_sources if isinstance(raw_sources, list) else []
+        snapshot = {
+            "item_key": str(change.get("item_key") or "")[:2_048],
+            "title": str(change.get("title") or "")[:1_000],
+            "content_url": str(change.get("content_url") or change.get("canonical_url") or "")[
+                :4_096
+            ],
+            "source": str(change.get("media") or change.get("up_name") or "")[:300],
+            "published_at": str(change.get("published_at") or "")[:120],
+            "content_scope": str(change.get("content_scope") or "title_only")[:40],
+            "corroborating_sources": [
+                {
+                    "source": str(item.get("source") or item.get("media") or "")[:200],
+                    "url": str(item.get("url") or item.get("content_url") or "")[:2_048],
+                    "published_at": str(item.get("published_at") or "")[:120],
+                }
+                for item in sources[:5]
+                if isinstance(item, Mapping)
+            ],
+        }
+        return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    def complete_tracked_observation_check(
+        self,
+        *,
+        check_id: str,
+        tracking_id: str,
+        completed_at: str,
+        outcome: str,
+        matched_count: int,
+        changes: Sequence[Mapping[str, Any]],
+        candidates: Sequence[Mapping[str, Any]] = (),
+        decisions: Sequence[Mapping[str, Any]] = (),
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically append evidence and advance the observation cursor."""
+
+        normalized_outcome = str(outcome or "").strip().lower()
+        if normalized_outcome not in {"changed", "unchanged", "valid_empty"}:
+            raise ValueError("unsupported tracking check outcome")
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            check = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE check_id = ? AND tracking_id = ?",
+                (str(check_id or "").strip(), str(tracking_id or "").strip()),
+            ).fetchone()
+            if check is None:
+                raise KeyError(str(check_id or ""))
+            tracker = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (str(tracking_id or "").strip(),),
+            ).fetchone()
+            if tracker is None:
+                raise KeyError(str(tracking_id or ""))
+            if str(check["status"] or "") != "running":
+                conn.commit()
+                item = self.get_tracked_observation(str(tracking_id))
+                if item is None:  # pragma: no cover
+                    raise KeyError(str(tracking_id))
+                return self._tracked_check_dict(check), item
+            if str(tracker["status"] or "") != "active":
+                conn.execute(
+                    """
+                    UPDATE tracked_observation_checks
+                    SET status = 'cancelled', summary = '跟踪已停止，本轮结果未写入',
+                        completed_at = ?, lease_expires_at = '', is_read = 1
+                    WHERE check_id = ?
+                    """,
+                    (str(completed_at or "").strip(), str(check_id or "").strip()),
+                )
+                conn.commit()
+                check_row = self.conn.execute(
+                    "SELECT * FROM tracked_observation_checks WHERE check_id = ?",
+                    (str(check_id or "").strip(),),
+                ).fetchone()
+                item = self.get_tracked_observation(str(tracking_id))
+                if check_row is None or item is None:  # pragma: no cover
+                    raise RuntimeError("cancelled tracking result disappeared")
+                return self._tracked_check_dict(check_row), item
+
+            inserted = 0
+            newest_summary = ""
+            decision_by_key = {
+                str(decision.get("evidence_item_key") or "").strip(): str(
+                    decision.get("decision") or ""
+                ).strip()
+                for decision in decisions
+                if isinstance(decision, Mapping)
+            }
+            for raw_candidate in candidates:
+                candidate = dict(raw_candidate)
+                evidence_item_key = str(candidate.get("item_key") or "").strip()
+                evidence_fingerprint = str(candidate.get("evidence_fingerprint") or "").strip()
+                decision = decision_by_key.get(evidence_item_key, "")
+                if (
+                    not evidence_item_key
+                    or not evidence_fingerprint
+                    or decision not in {"changed", "related_no_change", "irrelevant"}
+                ):
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tracked_observation_candidates (
+                        candidate_record_id, check_id, tracking_id,
+                        evidence_item_key, evidence_fingerprint, decision,
+                        match_basis, match_score, evidence_snapshot, examined_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        str(check_id or "").strip(),
+                        str(tracking_id or "").strip(),
+                        evidence_item_key,
+                        evidence_fingerprint,
+                        decision,
+                        str(candidate.get("match_basis") or "")[:80],
+                        float(candidate.get("match_score") or 0.0),
+                        self._tracking_evidence_snapshot(candidate),
+                        str(completed_at or "").strip(),
+                    ),
+                )
+            for raw_change in changes:
+                change = dict(raw_change)
+                evidence_item_key = str(change.get("item_key") or "").strip()
+                evidence_fingerprint = str(change.get("evidence_fingerprint") or "").strip()
+                change_fingerprint = str(change.get("change_fingerprint") or "").strip()
+                if not evidence_item_key or not evidence_fingerprint or not change_fingerprint:
+                    continue
+                evidence_id = str(uuid4())
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tracked_observation_evidence (
+                        evidence_id, check_id, tracking_id, evidence_item_key,
+                        evidence_fingerprint, change_fingerprint, recommendation_id,
+                        match_basis, match_score, change_type, previous_state,
+                        new_state, fact, inference, summary, evidence_quote,
+                        confidence, evidence_snapshot, detected_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence_id,
+                        str(check_id or "").strip(),
+                        str(tracking_id or "").strip(),
+                        evidence_item_key,
+                        evidence_fingerprint,
+                        change_fingerprint,
+                        (
+                            int(change["recommendation_id"])
+                            if change.get("recommendation_id") is not None
+                            else None
+                        ),
+                        str(change.get("match_basis") or "")[:80],
+                        float(change.get("match_score") or 0.0),
+                        str(change.get("change_type") or "")[:40],
+                        str(change.get("previous_state") or "")[:4_000],
+                        str(change.get("new_state") or "")[:4_000],
+                        str(change.get("fact") or "")[:6_000],
+                        str(change.get("inference") or "")[:6_000],
+                        str(change.get("summary") or "")[:2_000],
+                        str(change.get("evidence_quote") or "")[:2_000],
+                        max(0.0, min(1.0, float(change.get("confidence") or 0.0))),
+                        self._tracking_evidence_snapshot(change),
+                        str(completed_at or "").strip(),
+                    ),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    inserted += 1
+                    newest_summary = newest_summary or str(change.get("summary") or "").strip()
+
+            final_status = (
+                "changed"
+                if inserted
+                else ("valid_empty" if normalized_outcome == "valid_empty" else "unchanged")
+            )
+            summaries = {
+                "changed": newest_summary or f"发现 {inserted} 条实质变化",
+                "unchanged": "已核验相关证据，未发现实质变化",
+                "valid_empty": "本轮未发现新的相关证据",
+            }
+            completed_clock = _parse_axis_datetime(completed_at) or datetime.now(UTC)
+            interval = max(15, min(10_080, int(tracker["check_interval_minutes"] or 1440)))
+            next_check_at = (completed_clock + timedelta(minutes=interval)).isoformat()
+            conn.execute(
+                """
+                UPDATE tracked_observation_checks
+                SET status = ?, summary = ?, matched_count = ?,
+                    new_evidence_count = ?, is_read = ?, completed_at = ?,
+                    lease_expires_at = '', error = ''
+                WHERE check_id = ?
+                """,
+                (
+                    final_status,
+                    summaries[final_status],
+                    max(0, int(matched_count)),
+                    inserted,
+                    0 if inserted else 1,
+                    str(completed_at or "").strip(),
+                    str(check_id or "").strip(),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE tracked_observations
+                SET last_checked_at = ?, last_check_status = ?, next_check_at = ?,
+                    last_change_at = CASE WHEN ? = 'changed' THEN ? ELSE last_change_at END,
+                    latest_evidence = CASE WHEN ? = 'changed' THEN ? ELSE latest_evidence END,
+                    failure_count = 0, last_error = '', updated_at = CURRENT_TIMESTAMP
+                WHERE tracking_id = ? AND status = 'active'
+                """,
+                (
+                    str(completed_at or "").strip(),
+                    final_status,
+                    next_check_at,
+                    final_status,
+                    str(completed_at or "").strip(),
+                    final_status,
+                    newest_summary,
+                    str(tracking_id or "").strip(),
+                ),
+            )
+            check_row = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE check_id = ?",
+                (str(check_id or "").strip(),),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        item = self.get_tracked_observation(str(tracking_id))
+        if check_row is None or item is None:  # pragma: no cover
+            raise RuntimeError("completed tracking result disappeared")
+        return self._tracked_check_dict(check_row), item
+
+    def fail_tracked_observation_check(
+        self,
+        *,
+        check_id: str,
+        tracking_id: str,
+        completed_at: str,
+        error: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Record a bounded retry without advancing the evidence cursor."""
+
+        safe_error = " ".join(str(error or "").split()).strip()[:1_000]
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            check = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE check_id = ? AND tracking_id = ?",
+                (str(check_id or "").strip(), str(tracking_id or "").strip()),
+            ).fetchone()
+            tracker = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (str(tracking_id or "").strip(),),
+            ).fetchone()
+            if check is None or tracker is None:
+                raise KeyError(str(check_id or tracking_id or ""))
+            if str(check["status"] or "") != "running":
+                conn.commit()
+                item = self.get_tracked_observation(str(tracking_id))
+                if item is None:  # pragma: no cover
+                    raise KeyError(str(tracking_id))
+                return self._tracked_check_dict(check), item
+            if str(tracker["status"] or "") != "active":
+                final_status = "cancelled"
+                failure_count = int(tracker["failure_count"] or 0)
+                next_check_at = str(tracker["next_check_at"] or "")
+            else:
+                failure_count = int(tracker["failure_count"] or 0) + 1
+                final_status = "failed" if failure_count >= 3 else "retry_wait"
+                completed_clock = _parse_axis_datetime(completed_at) or datetime.now(UTC)
+                interval = max(15, min(10_080, int(tracker["check_interval_minutes"] or 1440)))
+                retry_minutes = min(interval, 15 * (2 ** min(6, failure_count - 1)))
+                next_check_at = (completed_clock + timedelta(minutes=retry_minutes)).isoformat()
+            summary = (
+                "连续检查失败，系统会降低频率继续重试；也可手动立即检查"
+                if final_status == "failed"
+                else "本轮检查不完整，系统会自动重试"
+                if final_status == "retry_wait"
+                else "跟踪已停止，本轮检查已取消"
+            )
+            conn.execute(
+                """
+                UPDATE tracked_observation_checks
+                SET status = ?, summary = ?, error = ?, completed_at = ?,
+                    lease_expires_at = '', is_read = ?
+                WHERE check_id = ?
+                """,
+                (
+                    final_status,
+                    summary,
+                    safe_error,
+                    str(completed_at or "").strip(),
+                    1,
+                    str(check_id or "").strip(),
+                ),
+            )
+            if str(tracker["status"] or "") == "active":
+                conn.execute(
+                    """
+                    UPDATE tracked_observations
+                    SET last_check_status = ?, failure_count = ?, last_error = ?,
+                        next_check_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE tracking_id = ? AND status = 'active'
+                    """,
+                    (
+                        final_status,
+                        failure_count,
+                        safe_error,
+                        next_check_at,
+                        str(tracking_id or "").strip(),
+                    ),
+                )
+            check_row = conn.execute(
+                "SELECT * FROM tracked_observation_checks WHERE check_id = ?",
+                (str(check_id or "").strip(),),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        item = self.get_tracked_observation(str(tracking_id))
+        if check_row is None or item is None:  # pragma: no cover
+            raise RuntimeError("failed tracking result disappeared")
+        return self._tracked_check_dict(check_row), item
+
+    def list_tracked_observation_checks(
+        self,
+        tracking_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            """
+            SELECT * FROM tracked_observation_checks
+            WHERE tracking_id = ?
+            ORDER BY started_at DESC, check_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (
+                str(tracking_id or "").strip(),
+                max(1, min(200, int(limit))),
+                max(0, int(offset)),
+            ),
+        ).fetchall()
+        checks: list[dict[str, Any]] = []
+        for row in rows:
+            check = self._tracked_check_dict(row)
+            evidence_rows = self.conn.execute(
+                """
+                SELECT * FROM tracked_observation_evidence
+                WHERE check_id = ?
+                ORDER BY detected_at, evidence_id
+                """,
+                (check["check_id"],),
+            ).fetchall()
+            check["evidence"] = [
+                self._tracked_evidence_dict(evidence) for evidence in evidence_rows
+            ]
+            checks.append(check)
+        return checks
+
+    def mark_tracked_observation_checks_read(
+        self,
+        tracking_id: str,
+    ) -> tuple[dict[str, Any] | None, int]:
+        cursor = self._execute_write(
+            """
+            UPDATE tracked_observation_checks
+            SET is_read = 1
+            WHERE tracking_id = ? AND is_read = 0
+            """,
+            (str(tracking_id or "").strip(),),
+        )
+        return self.get_tracked_observation(str(tracking_id or "")), int(cursor.rowcount or 0)
+
+    def list_tracking_candidates(
+        self,
+        *,
+        since_at: str,
+        exclude_item_key: str,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Fallback reader for manual/service tests; normal checks use the live refresh batch."""
+
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            """
+            SELECT candidate_key AS item_key, content_id, content_url, title,
+                   author_name, up_name, description, body_text, published_at,
+                   tags, topic_group, franchise_key, raw_payload, last_seen_at
+            FROM discovery_candidates
+            WHERE candidate_key != ?
+              AND (
+                  ? = '' OR julianday(last_seen_at) >= julianday(?)
+                  OR julianday(discovered_at) >= julianday(?)
+              )
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT ?
+            """,
+            (
+                str(exclude_item_key or "").strip(),
+                str(since_at or "").strip(),
+                str(since_at or "").strip(),
+                str(since_at or "").strip(),
+                max(1, min(1_000, int(limit))),
+            ),
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = dict(row)
+            try:
+                candidate["tags"] = json.loads(str(candidate.get("tags") or "[]"))
+            except (TypeError, ValueError):
+                candidate["tags"] = []
+            candidates.append(candidate)
+        return candidates
+
+    def filter_unseen_tracking_candidates(
+        self,
+        tracking_id: str,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop evidence revisions already conclusively examined for this tracker."""
+
+        normalized = [dict(candidate) for candidate in candidates]
+        identities = [
+            (
+                str(candidate.get("item_key") or "").strip(),
+                str(candidate.get("evidence_fingerprint") or "").strip(),
+            )
+            for candidate in normalized
+        ]
+        if not identities:
+            return []
+        self._ensure_fresh_read()
+        seen = {
+            (str(row["evidence_item_key"]), str(row["evidence_fingerprint"]))
+            for row in self.conn.execute(
+                """
+                SELECT evidence_item_key, evidence_fingerprint
+                FROM tracked_observation_candidates
+                WHERE tracking_id = ?
+                """,
+                (str(tracking_id or "").strip(),),
+            ).fetchall()
+        }
+        return [
+            candidate
+            for candidate, identity in zip(normalized, identities, strict=True)
+            if identity not in seen
+        ]
 
     def archive_tracked_observation(
         self,
@@ -16867,6 +17787,15 @@ class Database:
                     """,
                     (normalized_id,),
                 )
+                conn.execute(
+                    """
+                    UPDATE tracked_observation_checks
+                    SET status = 'cancelled', summary = '跟踪已停止，本轮检查已取消',
+                        completed_at = CURRENT_TIMESTAMP, lease_expires_at = '', is_read = 1
+                    WHERE tracking_id = ? AND status = 'running'
+                    """,
+                    (normalized_id,),
+                )
             row = conn.execute(
                 "SELECT * FROM tracked_observations WHERE tracking_id = ?",
                 (normalized_id,),
@@ -16879,6 +17808,35 @@ class Database:
             conn.close()
         self._ensure_fresh_read()
         return (self._tracked_observation_dict(row) if row is not None else None), archived
+
+    def restart_tracked_observation(
+        self,
+        tracking_id: str,
+        *,
+        request_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Start a new cycle from an archived observation without rewriting history."""
+
+        previous = self.get_tracked_observation(str(tracking_id or ""))
+        if previous is None:
+            return None, False
+        if str(previous.get("status") or "") == "active":
+            return previous, False
+        return self.create_tracked_observation(
+            request_id=str(request_id or "").strip(),
+            item_key=str(previous.get("item_key") or ""),
+            recommendation_id=(
+                int(previous["recommendation_id"])
+                if previous.get("recommendation_id") is not None
+                else None
+            ),
+            topic_group=str(previous.get("topic_group") or ""),
+            story_key=str(previous.get("story_key") or ""),
+            observation=str(previous.get("observation") or ""),
+            latest_evidence=str(previous.get("latest_evidence") or ""),
+            original_snapshot=cast("Mapping[str, Any]", previous.get("original_snapshot") or {}),
+            check_interval_minutes=int(previous.get("check_interval_minutes") or 1440),
+        )
 
     def _ensure_saved_sync_tables(self) -> None:
         """Create normalized saved-content tables and import legacy saved rows once."""

@@ -3700,8 +3700,549 @@ ${savedCardFeedbackBarHtml(listKind)}
       }).catch(() => {});
     }
 
+    const TRACKED_OBSERVATION_LIMIT = 100;
+    const TRACKED_OBSERVATION_TIMELINE_LIMIT = 50;
+    const trackedObservationPageState = {
+      items: [],
+      total: 0,
+      activeCount: 0,
+      archivedCount: 0,
+      unreadCount: 0,
+      loading: false,
+      loadingMore: false,
+      error: "",
+    };
+    const trackedObservationTimelineState = new Map();
+    const trackedObservationExpanded = new Set();
+    const trackedObservationBusy = new Set();
+    const trackedObservationCardMessages = new Map();
+    let trackedObservationListGeneration = 0;
+    let pendingTrackedObservationFocus = "";
+
+    function trackedObservationId(item) {
+      return String(item?.tracking_id ?? item?.id ?? "").trim();
+    }
+
+    function trackedObservationSnapshot(item) {
+      const snapshot = item?.original_snapshot;
+      if (snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)) return snapshot;
+      if (typeof snapshot !== "string" || !snapshot.trim()) return {};
+      try {
+        const decoded = JSON.parse(snapshot);
+        return decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : {};
+      } catch {
+        return {};
+      }
+    }
+
+    function trackedObservationStatusMeta(item) {
+      if (String(item?.status || "active") === "archived") {
+        return { label: "已停止", tone: "archived" };
+      }
+      if ((Number(item?.unread_count) || 0) > 0) {
+        return { label: "有新变化", tone: "changed" };
+      }
+      if (item?.last_check_status === "changed") return { label: "最近有变化", tone: "changed" };
+      return {
+        running: { label: "正在检查", tone: "progress" },
+        unchanged: { label: "暂无变化", tone: "quiet" },
+        valid_empty: { label: "没有新材料", tone: "quiet" },
+        retry_wait: { label: "等待重试", tone: "warning" },
+        failed: { label: "检查失败", tone: "danger" },
+        cancelled: { label: "已停止", tone: "archived" },
+        pending: { label: "等待首次检查", tone: "pending" },
+      }[String(item?.last_check_status || "pending")] || { label: "等待检查", tone: "pending" };
+    }
+
+    function trackedObservationCheckMeta(check) {
+      return {
+        running: { label: "检查中", tone: "progress" },
+        changed: { label: "发现变化", tone: "changed" },
+        unchanged: { label: "没有变化", tone: "quiet" },
+        valid_empty: { label: "没有新材料", tone: "quiet" },
+        retry_wait: { label: "等待重试", tone: "warning" },
+        failed: { label: "检查失败", tone: "danger" },
+        cancelled: { label: "已取消", tone: "archived" },
+      }[String(check?.status || "")] || { label: "检查记录", tone: "pending" };
+    }
+
+    function trackedObservationEvidence(check) {
+      return asArray(check?.evidence ?? check?.evidences ?? check?.changes);
+    }
+
+    function trackedObservationChangeTypeLabel(value) {
+      return {
+        new_fact: "新增事实",
+        confirmation: "再次确认",
+        contradiction: "出现反证",
+        progress: "事件推进",
+        invalidated: "原判断失效",
+      }[String(value || "")] || "变化证据";
+    }
+
+    function trackedObservationEvidenceHtml(evidence) {
+      const snapshot = evidence?.evidence_snapshot && typeof evidence.evidence_snapshot === "object"
+        ? evidence.evidence_snapshot
+        : {};
+      const title = String(snapshot.title || evidence?.summary || evidence?.fact || "新增证据").trim();
+      const url = safeHttpContentUrl(snapshot.content_url || snapshot.original_url || "");
+      const confidence = Number(evidence?.confidence);
+      const confidenceLabel = Number.isFinite(confidence) && confidence > 0
+        ? ` · 置信度 ${Math.round(confidence * 100)}%`
+        : "";
+      const fact = String(evidence?.fact || "").trim();
+      const inference = String(evidence?.inference || "").trim();
+      const previous = String(evidence?.previous_state || "").trim();
+      const next = String(evidence?.new_state || "").trim();
+      const quote = String(evidence?.evidence_quote || "").trim();
+      return `
+        <article class="tracking-evidence">
+          <div class="tracking-evidence-head">
+            <span>${escapeHtml(trackedObservationChangeTypeLabel(evidence?.change_type))}${escapeHtml(confidenceLabel)}</span>
+            <time>${escapeHtml(contentHistoryTime(evidence?.detected_at))}</time>
+          </div>
+          <h5>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)}</a>` : escapeHtml(title)}</h5>
+          ${previous || next ? `<div class="tracking-state-change"><p><span>之前</span>${escapeHtml(previous || "未记录")}</p><p><span>现在</span>${escapeHtml(next || "未记录")}</p></div>` : ""}
+          ${fact ? `<p class="tracking-fact"><strong>事实</strong>${escapeHtml(fact)}</p>` : ""}
+          ${inference ? `<p class="tracking-inference"><strong>推断</strong>${escapeHtml(inference)}</p>` : ""}
+          ${quote ? `<blockquote>${escapeHtml(quote)}</blockquote>` : ""}
+        </article>`;
+    }
+
+    function trackedObservationCheckHtml(check) {
+      const meta = trackedObservationCheckMeta(check);
+      const evidence = trackedObservationEvidence(check);
+      const error = String(check?.error || "").trim();
+      const summary = String(check?.summary || (error ? "本轮检查未完成。" : "这次检查没有补充说明。")).trim();
+      const completedAt = check?.completed_at || check?.started_at;
+      const countLine = `${Number(check?.candidate_count) || 0} 条候选 · ${Number(check?.matched_count) || 0} 条相关 · ${Number(check?.new_evidence_count) || evidence.length} 条变化`;
+      return `
+        <article class="tracking-check" data-tone="${escapeHtml(meta.tone)}">
+          <header>
+            <span class="tracking-status-chip" data-tone="${escapeHtml(meta.tone)}">${escapeHtml(meta.label)}</span>
+            <time>${escapeHtml(contentHistoryTime(completedAt))}</time>
+          </header>
+          <p>${escapeHtml(summary)}</p>
+          ${error && error !== summary ? `<p class="tracking-check-error"><strong>原因</strong>${escapeHtml(error)}</p>` : ""}
+          <p class="tracking-check-counts">${escapeHtml(countLine)}</p>
+          ${evidence.length ? `<div class="tracking-evidence-list">${evidence.map(trackedObservationEvidenceHtml).join("")}</div>` : ""}
+        </article>`;
+    }
+
+    function trackedObservationTimelineHtml(trackingId) {
+      const timeline = trackedObservationTimelineState.get(trackingId);
+      if (!timeline || timeline.loading) {
+        return '<p class="tracking-timeline-state">正在读取检查记录…</p>';
+      }
+      if (timeline.error) {
+        return `<p class="tracking-timeline-state is-error" role="alert">${escapeHtml(timeline.error)} <button class="tracking-inline-action" data-tracking-action="timeline-retry" type="button">重试</button></p>`;
+      }
+      const checks = asArray(timeline.checks);
+      if (!checks.length) {
+        return '<p class="tracking-timeline-state">还没有检查记录。你可以点“立即检查”，用本机已经采集的新闻核对一次。</p>';
+      }
+      const moreState = timeline.moreError
+        ? `<p class="tracking-timeline-state is-error" role="alert">${escapeHtml(timeline.moreError)} <button class="tracking-inline-action" data-tracking-action="timeline-more" type="button">重试加载</button></p>`
+        : timeline.hasMore
+          ? `<button class="tracking-load-more" data-tracking-action="timeline-more" type="button" ${timeline.loadingMore ? "disabled" : ""}>${timeline.loadingMore ? "正在加载…" : "加载更早记录"}</button>`
+          : "";
+      return `<div class="tracking-timeline-list">${checks.map(trackedObservationCheckHtml).join("")}</div>${moreState}`;
+    }
+
+    function trackedObservationCardHtml(item, index) {
+      const trackingId = trackedObservationId(item);
+      const snapshot = trackedObservationSnapshot(item);
+      const status = trackedObservationStatusMeta(item);
+      const active = String(item?.status || "active") === "active";
+      const expanded = trackedObservationExpanded.has(trackingId);
+      const unreadCount = Number(item?.unread_count) || 0;
+      const busy = Array.from(trackedObservationBusy).some((entry) => entry.endsWith(`:${trackingId}`));
+      const title = String(snapshot.title || item?.item_key || "原始新闻").trim();
+      const sourceUrl = safeHttpContentUrl(snapshot.content_url || "");
+      const topic = String(item?.topic_group || snapshot.topic_group || "").trim();
+      const story = String(item?.story_key || snapshot.franchise_key || "").trim();
+      const latestSummary = String(item?.last_check_summary || item?.latest_evidence || "").trim();
+      const message = trackedObservationCardMessages.get(trackingId) || "";
+      const lastCheckLabel = item?.last_checked_at
+        ? `上次检查 ${contentHistoryTime(item.last_checked_at)}`
+        : "尚未检查";
+      const nextCheckLabel = active && item?.next_check_at
+        ? `下次计划 ${contentHistoryTime(item.next_check_at)}`
+        : "";
+      return `
+        <article class="tracking-card${unreadCount ? " has-unread" : ""}" data-tracking-id="${escapeHtml(trackingId)}" data-tracking-index="${index}" tabindex="-1">
+          <div class="tracking-card-head">
+            <div class="tracking-card-title-row">
+              <span class="tracking-status-chip" data-tone="${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span>
+              ${unreadCount ? `<span class="tracking-unread-chip">${unreadCount} 条未读</span>` : ""}
+            </div>
+            <p class="tracking-card-times"><span>${escapeHtml(lastCheckLabel)}</span>${nextCheckLabel ? `<span>${escapeHtml(nextCheckLabel)}</span>` : ""}</p>
+          </div>
+          <div class="tracking-card-copy">
+            <p class="tracking-card-kicker">观察点</p>
+            <h3>${escapeHtml(item?.observation || "未命名观察点")}</h3>
+            ${latestSummary ? `<p class="tracking-latest-summary">${escapeHtml(latestSummary)}</p>` : ""}
+            <div class="tracking-context-chips">
+              ${topic ? `<span>主题 · ${escapeHtml(topic)}</span>` : ""}
+              ${story ? `<span>事件 · ${escapeHtml(story)}</span>` : ""}
+            </div>
+            <p class="tracking-origin">来自：${sourceUrl ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)}</a>` : escapeHtml(title)}</p>
+          </div>
+          <div class="tracking-card-actions" aria-label="持续跟踪操作">
+            <button class="tracking-action is-primary" data-tracking-toggle type="button" aria-expanded="${expanded}" aria-controls="trackingTimeline-${escapeHtml(trackingId)}">${expanded ? "收起时间线" : "查看时间线"}</button>
+            ${active ? `<button class="tracking-action" data-tracking-action="check" type="button" ${busy ? "disabled" : ""}>立即检查</button>` : ""}
+            ${unreadCount ? `<button class="tracking-action" data-tracking-action="read" type="button" ${busy ? "disabled" : ""}>标为已读</button>` : ""}
+            ${active ? `<button class="tracking-action is-danger" data-tracking-action="stop" type="button" ${busy ? "disabled" : ""}>停止跟踪</button>` : ""}
+            ${active ? "" : `<button class="tracking-action" data-tracking-action="restart" type="button" ${busy ? "disabled" : ""}>重新开始</button>`}
+          </div>
+          <p class="tracking-card-message${message?.error ? " is-error" : ""}" aria-live="polite">${escapeHtml(message?.text || "")}</p>
+          <section class="tracking-timeline" id="trackingTimeline-${escapeHtml(trackingId)}" aria-label="观察点检查时间线" ${expanded ? "" : "hidden"}>
+            ${expanded ? trackedObservationTimelineHtml(trackingId) : ""}
+          </section>
+        </article>`;
+    }
+
+    function syncTrackedObservationRegistry(items) {
+      for (const item of items) {
+        const itemKey = String(item?.item_key || "").trim();
+        const observation = String(item?.observation || "").trim();
+        if (!itemKey || !observation) continue;
+        const key = `${itemKey}\u0000${observation}`;
+        if (String(item?.status || "active") !== "active") {
+          trackedObservationRecords.delete(key);
+          continue;
+        }
+        trackedObservationRecords.set(key, item);
+        trackedObservationHydratedItems.add(itemKey);
+      }
+    }
+
+    function updateTrackedObservationSummary() {
+      const values = {
+        trackingActiveCount: trackedObservationPageState.activeCount,
+        trackingUnreadCount: trackedObservationPageState.unreadCount,
+        trackingArchivedCount: trackedObservationPageState.archivedCount,
+      };
+      Object.entries(values).forEach(([id, value]) => {
+        const target = document.getElementById(id);
+        if (target) target.textContent = String(Number(value) || 0);
+      });
+      updateSavedBadge("trackedObservationsUnreadBadge", trackedObservationPageState.unreadCount);
+    }
+
+    function renderTrackedObservations() {
+      const list = document.getElementById("trackingList");
+      const empty = document.getElementById("trackingEmpty");
+      const status = document.getElementById("trackingPageStatus");
+      const refresh = document.getElementById("trackingRefreshBtn");
+      updateTrackedObservationSummary();
+      if (!list) return;
+      list.setAttribute("aria-busy", trackedObservationPageState.loading ? "true" : "false");
+      if (refresh) {
+        refresh.disabled = trackedObservationPageState.loading;
+        refresh.textContent = trackedObservationPageState.loading ? "刷新中…" : "刷新跟踪";
+      }
+      if (status) {
+        status.classList.toggle("is-error", Boolean(trackedObservationPageState.error));
+        status.setAttribute("role", trackedObservationPageState.error ? "alert" : "status");
+        status.textContent = trackedObservationPageState.error
+          ? trackedObservationPageState.error
+          : trackedObservationPageState.loading
+            ? "正在读取本机跟踪档案…"
+            : trackedObservationPageState.total
+              ? `共 ${trackedObservationPageState.total} 个观察点；检查只使用新闻爪已经采集到本机的新闻。`
+              : "";
+      }
+      const items = trackedObservationPageState.items;
+      if (!items.length) {
+        list.replaceChildren();
+        if (empty) empty.hidden = trackedObservationPageState.loading || Boolean(trackedObservationPageState.error);
+        return;
+      }
+      if (empty) empty.hidden = true;
+      const active = items.filter((item) => String(item?.status || "active") === "active");
+      const archived = items.filter((item) => String(item?.status || "active") === "archived");
+      list.innerHTML = [
+        active.length ? `<section class="tracking-group" aria-labelledby="trackingActiveHeading"><div class="tracking-group-head"><h3 id="trackingActiveHeading">正在跟踪</h3><span>${active.length}</span></div>${active.map(trackedObservationCardHtml).join("")}</section>` : "",
+        archived.length ? `<section class="tracking-group is-archived" aria-labelledby="trackingArchivedHeading"><div class="tracking-group-head"><h3 id="trackingArchivedHeading">已停止</h3><span>${archived.length}</span></div>${archived.map((item, index) => trackedObservationCardHtml(item, active.length + index)).join("")}</section>` : "",
+        items.length < trackedObservationPageState.total ? `<button class="tracking-load-more" data-tracking-list-more type="button" ${trackedObservationPageState.loadingMore ? "disabled" : ""}>${trackedObservationPageState.loadingMore ? "正在加载…" : "加载更多观察点"}</button>` : "",
+      ].join("");
+      bindTrackedObservationCards();
+      if (pendingTrackedObservationFocus) {
+        const focusTarget = Array.from(list.querySelectorAll("[data-tracking-id]"))
+          .find((element) => element.dataset.trackingId === pendingTrackedObservationFocus);
+        if (focusTarget) {
+          focusTarget.focus({ preventScroll: true });
+          focusTarget.scrollIntoView({ block: "center", behavior: "smooth" });
+          pendingTrackedObservationFocus = "";
+        }
+      }
+    }
+
+    function updateTrackedObservationItem(nextItem) {
+      const trackingId = trackedObservationId(nextItem);
+      if (!trackingId) return;
+      const index = trackedObservationPageState.items.findIndex((item) => trackedObservationId(item) === trackingId);
+      if (index >= 0) trackedObservationPageState.items[index] = { ...trackedObservationPageState.items[index], ...nextItem };
+      else trackedObservationPageState.items.unshift(nextItem);
+      syncTrackedObservationRegistry([nextItem]);
+    }
+
+    async function loadTrackedObservationTimeline(trackingId, { force = false, append = false } = {}) {
+      if (!trackingId) return;
+      const existing = trackedObservationTimelineState.get(trackingId);
+      if (append && (existing?.loading || existing?.loadingMore || !existing?.hasMore)) return;
+      if (!force && !append && (existing?.loading || Array.isArray(existing?.checks))) return;
+      trackedObservationTimelineState.set(trackingId, {
+        ...existing,
+        loading: !append,
+        loadingMore: append,
+        error: "",
+        moreError: "",
+      });
+      renderTrackedObservations();
+      try {
+        const offset = append ? asArray(existing?.checks).length : 0;
+        const payload = await requestJsonStrict(
+          `${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}/timeline?limit=${TRACKED_OBSERVATION_TIMELINE_LIMIT}&offset=${offset}`,
+          { timeoutMs: 20000 }
+        );
+        if (payload?.item) updateTrackedObservationItem(payload.item);
+        const fetched = asArray(payload?.checks);
+        const combined = append ? [...asArray(existing?.checks), ...fetched] : fetched;
+        const uniqueChecks = Array.from(new Map(combined.map((check) => [String(check?.check_id || ""), check])).values());
+        trackedObservationTimelineState.set(trackingId, {
+          loading: false,
+          loadingMore: false,
+          error: "",
+          moreError: "",
+          item: payload?.item || null,
+          checks: uniqueChecks,
+          hasMore: fetched.length === TRACKED_OBSERVATION_TIMELINE_LIMIT,
+        });
+      } catch (error) {
+        trackedObservationTimelineState.set(trackingId, {
+          ...existing,
+          loading: false,
+          loadingMore: false,
+          error: append ? "" : configErrorMessage(error?.details) || error?.message || "检查记录读取失败，请重试。",
+          moreError: append ? configErrorMessage(error?.details) || error?.message || "更早记录读取失败，请重试。" : "",
+        });
+      }
+      renderTrackedObservations();
+    }
+
+    async function loadMoreTrackedObservations() {
+      if (trackedObservationPageState.loading || trackedObservationPageState.loadingMore) return;
+      const generation = ++trackedObservationListGeneration;
+      trackedObservationPageState.loadingMore = true;
+      trackedObservationPageState.error = "";
+      renderTrackedObservations();
+      try {
+        const payload = await requestJsonStrict(
+          `${ENDPOINTS.trackedObservations}?status=all&limit=${TRACKED_OBSERVATION_LIMIT}&offset=${trackedObservationPageState.items.length}`,
+          { timeoutMs: 20000 }
+        );
+        if (generation !== trackedObservationListGeneration) return;
+        const combined = [...trackedObservationPageState.items, ...trackedObservationList(payload)];
+        trackedObservationPageState.items = Array.from(new Map(combined.map((item) => [trackedObservationId(item), item])).values());
+        trackedObservationPageState.total = payload?.total == null ? trackedObservationPageState.items.length : Math.max(0, Number(payload.total) || 0);
+        syncTrackedObservationRegistry(trackedObservationPageState.items);
+      } catch (error) {
+        if (generation !== trackedObservationListGeneration) return;
+        trackedObservationPageState.error = configErrorMessage(error?.details) || error?.message || "更多观察点读取失败，请重试。";
+      } finally {
+        if (generation === trackedObservationListGeneration) {
+          trackedObservationPageState.loadingMore = false;
+          renderTrackedObservations();
+        }
+      }
+    }
+
+    function mergeTrackedObservationRefresh(existingItems, refreshedItems, total, preserveLoadedTail) {
+      const refreshed = asArray(refreshedItems);
+      const cappedTotal = Math.max(0, Number(total) || 0);
+      if (!preserveLoadedTail || asArray(existingItems).length <= refreshed.length) {
+        return refreshed.slice(0, cappedTotal);
+      }
+      const refreshedIds = new Set(refreshed.map(trackedObservationId));
+      return [
+        ...refreshed,
+        ...asArray(existingItems).filter((item) => !refreshedIds.has(trackedObservationId(item))),
+      ].slice(0, cappedTotal);
+    }
+
+    async function refreshTrackedObservations({ silent = false, focusTrackingId = "" } = {}) {
+      const generation = ++trackedObservationListGeneration;
+      if (focusTrackingId) {
+        pendingTrackedObservationFocus = String(focusTrackingId);
+        trackedObservationExpanded.add(String(focusTrackingId));
+      }
+      trackedObservationPageState.loading = !silent;
+      trackedObservationPageState.loadingMore = false;
+      trackedObservationPageState.error = "";
+      if (!silent) renderTrackedObservations();
+      try {
+        const payload = await requestJsonStrict(
+          `${ENDPOINTS.trackedObservations}?status=all&limit=${Math.min(500, Math.max(TRACKED_OBSERVATION_LIMIT, trackedObservationPageState.items.length))}&offset=0`,
+          { timeoutMs: 20000 }
+        );
+        if (generation !== trackedObservationListGeneration) return;
+        const refreshedItems = trackedObservationList(payload);
+        const total = payload?.total == null ? refreshedItems.length : Math.max(0, Number(payload.total) || 0);
+        const items = mergeTrackedObservationRefresh(
+          trackedObservationPageState.items,
+          refreshedItems,
+          total,
+          silent,
+        );
+        const activeCount = items.filter((item) => String(item?.status || "active") === "active").length;
+        const archivedCount = items.filter((item) => String(item?.status || "active") === "archived").length;
+        const unreadCount = items.reduce((sum, item) => sum + (Number(item?.unread_count) || 0), 0);
+        trackedObservationPageState.items = items;
+        trackedObservationPageState.total = total;
+        trackedObservationPageState.activeCount = payload?.active_count == null ? activeCount : Math.max(0, Number(payload.active_count) || 0);
+        trackedObservationPageState.archivedCount = payload?.archived_count == null ? archivedCount : Math.max(0, Number(payload.archived_count) || 0);
+        trackedObservationPageState.unreadCount = payload?.unread_count == null ? unreadCount : Math.max(0, Number(payload.unread_count) || 0);
+        trackedObservationPageState.error = "";
+        syncTrackedObservationRegistry(items);
+      } catch (error) {
+        if (generation !== trackedObservationListGeneration) return;
+        trackedObservationPageState.error = configErrorMessage(error?.details) || error?.message || "持续跟踪读取失败，请重试。";
+      } finally {
+        if (generation === trackedObservationListGeneration) {
+          trackedObservationPageState.loading = false;
+          renderTrackedObservations();
+          if (focusTrackingId) void loadTrackedObservationTimeline(String(focusTrackingId));
+        }
+      }
+    }
+
+    async function runTrackedObservationAction(action, trackingId) {
+      const busyKey = `${action}:${trackingId}`;
+      if (!trackingId || trackedObservationBusy.has(busyKey)) return;
+      trackedObservationBusy.add(busyKey);
+      trackedObservationCardMessages.set(trackingId, {
+        text: action === "check" ? "正在用本机已采集的新闻检查变化…" : action === "read" ? "正在标记已读…" : action === "restart" ? "正在建立新的跟踪周期…" : "正在停止跟踪…",
+        error: false,
+      });
+      renderTrackedObservations();
+      try {
+        let payload;
+        let focusAfterAction = trackingId;
+        if (action === "check") {
+          payload = await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}/check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: newRequestId() }),
+            timeoutMs: 300000,
+          });
+          if (payload?.item) updateTrackedObservationItem(payload.item);
+          if (payload?.check) {
+            const current = trackedObservationTimelineState.get(trackingId);
+            const checks = asArray(current?.checks).filter((check) => check?.check_id !== payload.check.check_id);
+            trackedObservationTimelineState.set(trackingId, { ...current, loading: false, loadingMore: false, error: "", moreError: "", item: payload.item, checks: [payload.check, ...checks] });
+          }
+          trackedObservationExpanded.add(trackingId);
+          const checkMeta = trackedObservationCheckMeta(payload?.check);
+          trackedObservationCardMessages.set(trackingId, { text: `检查完成：${checkMeta.label}。`, error: false });
+          showToast(`持续跟踪：${checkMeta.label}`);
+        } else if (action === "read") {
+          payload = await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}/read`, {
+            method: "POST",
+            timeoutMs: 20000,
+          });
+          if (payload?.item) updateTrackedObservationItem(payload.item);
+          const timeline = trackedObservationTimelineState.get(trackingId);
+          if (timeline?.checks) {
+            trackedObservationTimelineState.set(trackingId, {
+              ...timeline,
+              checks: timeline.checks.map((check) => ({ ...check, is_read: true })),
+            });
+          }
+          trackedObservationCardMessages.set(trackingId, { text: "变化记录已标为已读。", error: false });
+          showToast("未读变化已标为已读");
+        } else if (action === "restart") {
+          payload = await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}/restart`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: newRequestId() }),
+            timeoutMs: 20000,
+          });
+          const restartedId = trackedObservationId(payload?.item);
+          if (payload?.item) updateTrackedObservationItem(payload.item);
+          if (restartedId) {
+            trackedObservationExpanded.add(restartedId);
+            pendingTrackedObservationFocus = restartedId;
+            focusAfterAction = restartedId;
+          }
+          trackedObservationCardMessages.set(trackingId, { text: "已建立新的跟踪周期；旧时间线仍保留。", error: false });
+          showToast(payload?.created ? "已重新开始持续跟踪" : "这个观察点已经在跟踪中");
+        } else if (action === "stop") {
+          payload = await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}`, {
+            method: "DELETE",
+            timeoutMs: 20000,
+          });
+          if (payload?.item) updateTrackedObservationItem(payload.item);
+          const archived = payload?.item;
+          const itemKey = String(archived?.item_key || "").trim();
+          const observation = String(archived?.observation || "").trim();
+          if (itemKey && observation) trackedObservationRecords.delete(`${itemKey}\u0000${observation}`);
+          trackedObservationCardMessages.set(trackingId, { text: "已停止跟踪；已有检查记录仍保留。", error: false });
+          showToast("已停止持续跟踪");
+        }
+        await refreshTrackedObservations({ silent: true, focusTrackingId: focusAfterAction });
+      } catch (error) {
+        trackedObservationCardMessages.set(trackingId, {
+          text: configErrorMessage(error?.details) || error?.message || "操作失败，请重试。",
+          error: true,
+        });
+      } finally {
+        trackedObservationBusy.delete(busyKey);
+        renderTrackedObservations();
+      }
+    }
+
+    function bindTrackedObservationCards() {
+      const list = document.getElementById("trackingList");
+      list?.querySelectorAll("[data-tracking-toggle]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const card = button.closest("[data-tracking-id]");
+          const trackingId = String(card?.dataset.trackingId || "");
+          if (!trackingId) return;
+          if (trackedObservationExpanded.has(trackingId)) trackedObservationExpanded.delete(trackingId);
+          else trackedObservationExpanded.add(trackingId);
+          renderTrackedObservations();
+          if (trackedObservationExpanded.has(trackingId)) void loadTrackedObservationTimeline(trackingId);
+        });
+      });
+      list?.querySelectorAll("[data-tracking-action]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const card = button.closest("[data-tracking-id]");
+          const trackingId = String(card?.dataset.trackingId || "");
+          const action = String(button.dataset.trackingAction || "");
+          if (action === "timeline-retry") void loadTrackedObservationTimeline(trackingId, { force: true });
+          else if (action === "timeline-more") void loadTrackedObservationTimeline(trackingId, { append: true });
+          else void runTrackedObservationAction(action, trackingId);
+        });
+      });
+      list?.querySelector("[data-tracking-list-more]")?.addEventListener("click", () => {
+        void loadMoreTrackedObservations();
+      });
+    }
+
+    function openTrackedObservationInLibrary(record) {
+      const trackingId = trackedObservationId(record);
+      if (trackingId) {
+        trackedObservationExpanded.add(trackingId);
+        pendingTrackedObservationFocus = trackingId;
+      }
+      openContentLibraryPage("tracking", { forceLoad: true });
+      if (trackingId) void loadTrackedObservationTimeline(trackingId);
+    }
+
     const DESKTOP_CONTENT_LIBRARY_STORAGE_KEY = "openbiliclaw.webui.contentLibraryTab";
-    const DESKTOP_CONTENT_LIBRARY_TABS = ["watchLater", "favorites", "history"];
+    const DESKTOP_CONTENT_LIBRARY_TABS = ["watchLater", "favorites", "tracking", "history"];
     const desktopContentLibraryScroll = new Map();
     let desktopContentLibraryTab = "watchLater";
     let desktopContentLibraryVisible = false;
@@ -3714,6 +4255,9 @@ ${savedCardFeedbackBarHtml(listKind)}
         watch_later: "watchLater",
         favorites: "favorites",
         favorite: "favorites",
+        tracking: "tracking",
+        tracked: "tracking",
+        following: "tracking",
         history: "history"
       }[normalized] || fallback;
     }
@@ -3730,7 +4274,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       const hash = window.location.hash.replace(/^#\/?/, "");
       const [parent, child] = hash.split("/");
       if (parent === "library") return normalizeDesktopContentLibraryTab(child, storedDesktopContentLibraryTab());
-      if (["watchLater", "watch-later", "watch_later", "favorites", "favorite", "history"].includes(parent)) {
+      if (["watchLater", "watch-later", "watch_later", "favorites", "favorite", "tracking", "tracked", "following", "history"].includes(parent)) {
         return normalizeDesktopContentLibraryTab(parent);
       }
       return "";
@@ -3750,6 +4294,7 @@ ${savedCardFeedbackBarHtml(listKind)}
     function loadDesktopContentLibraryTab(tab) {
       if (tab === "watchLater") void refreshWatchLater();
       else if (tab === "favorites") void refreshFavorites();
+      else if (tab === "tracking") void refreshTrackedObservations();
       else void refreshContentHistory();
     }
 
@@ -3762,9 +4307,9 @@ ${savedCardFeedbackBarHtml(listKind)}
       desktopContentLibraryTab = tab;
       storageSet(DESKTOP_CONTENT_LIBRARY_STORAGE_KEY, tab);
       DESKTOP_CONTENT_LIBRARY_TABS.forEach((name) => {
-        const suffix = name === "watchLater" ? "WatchLater" : name === "favorites" ? "Favorites" : "History";
+        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", history: "History" }[name];
         const button = document.getElementById(`contentLibrary${suffix}Tab`);
-        const panel = document.getElementById(name === "watchLater" ? "watchLaterPage" : name === "favorites" ? "favoritesPage" : "historyPage");
+        const panel = document.getElementById({ watchLater: "watchLaterPage", favorites: "favoritesPage", tracking: "trackingPage", history: "historyPage" }[name]);
         const selected = name === tab;
         button?.classList.toggle("is-active", selected);
         button?.setAttribute("aria-selected", String(selected));
@@ -3808,7 +4353,7 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     function bindDesktopContentLibrary() {
       const buttons = DESKTOP_CONTENT_LIBRARY_TABS.map((name) => {
-        const suffix = name === "watchLater" ? "WatchLater" : name === "favorites" ? "Favorites" : "History";
+        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", history: "History" }[name];
         return document.getElementById(`contentLibrary${suffix}Tab`);
       }).filter((button) => button instanceof HTMLButtonElement);
       buttons.forEach((button, index) => {
@@ -3826,6 +4371,9 @@ ${savedCardFeedbackBarHtml(listKind)}
           event.preventDefault();
           openContentLibraryPage(DESKTOP_CONTENT_LIBRARY_TABS[nextIndex], { focus: true });
         });
+      });
+      document.getElementById("trackingRefreshBtn")?.addEventListener("click", () => {
+        void refreshTrackedObservations();
       });
       window.addEventListener("hashchange", () => {
         const tab = desktopContentLibraryHashTab();
@@ -5625,10 +6173,15 @@ ${cardFeedbackBarHtml()}`;
       container.querySelectorAll("[data-detail-track-observation]").forEach((button) => {
         const observation = String(button.dataset.observation || "").trim();
         const record = trackedObservationRecords.get(trackedObservationKey(item, observation));
-        const tracked = Boolean(record);
+        const tracked = Boolean(record) && String(record?.status || "active") === "active";
+        const viewButton = button.closest?.("li")?.querySelector?.("[data-detail-view-tracking]");
         button.setAttribute("aria-pressed", tracked ? "true" : "false");
         button.textContent = tracked ? "移出跟踪" : "加入跟踪";
         button.title = tracked ? "停止在本地持续跟踪这个观察点" : "加入本地持续观察清单";
+        if (viewButton) {
+          viewButton.hidden = !tracked;
+          viewButton.dataset.trackingId = tracked ? trackedObservationId(record) : "";
+        }
       });
     }
 
@@ -5680,12 +6233,14 @@ ${cardFeedbackBarHtml()}`;
         if (previous) {
           const trackingId = previous.tracking_id ?? previous.id;
           if (trackingId == null || trackingId === "") throw new Error("跟踪记录缺少编号，请刷新后重试。");
-          await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}`, {
+          const payload = await requestJsonStrict(`${ENDPOINTS.trackedObservations}/${encodeURIComponent(trackingId)}`, {
             method: "DELETE",
             timeoutMs: 15000,
           });
           trackedObservationRecords.delete(key);
-          if (status) status.textContent = "已移出持续跟踪。";
+          if (payload?.item) updateTrackedObservationItem(payload.item);
+          if (status) status.textContent = "已停止跟踪；已有检查记录会保留在内容库。";
+          showToast("已停止持续跟踪");
         } else {
           const body = {
             request_id: newRequestId(),
@@ -5705,10 +6260,13 @@ ${cardFeedbackBarHtml()}`;
             observation: cleanObservation,
             tracking_id: record?.tracking_id ?? record?.id,
           });
+          updateTrackedObservationItem(trackedObservationRecords.get(key));
           trackedObservationHydratedItems.add(itemKey);
-          if (status) status.textContent = "已加入持续跟踪；后续新证据会沿这个观察点归档。";
+          if (status) status.textContent = "已保存观察点。系统会在本机已采集的后续新闻里检查变化；这不代表已经发现新证据。";
+          showToast("观察点已保存，可到内容库查看跟踪");
         }
         syncObservationTrackingControls(button.closest(".recommendation-detail-pane, .delight") || document, item);
+        void refreshTrackedObservations({ silent: true });
       } catch (error) {
         trackedObservationHydratedItems.delete(itemKey);
         if (status) {
@@ -5724,6 +6282,13 @@ ${cardFeedbackBarHtml()}`;
       container?.querySelectorAll("[data-detail-track-observation]").forEach((button) => {
         button.addEventListener("click", () => {
           void toggleTrackedObservation(item, button.dataset.observation, button, status);
+        });
+      });
+      container?.querySelectorAll("[data-detail-view-tracking]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const observation = String(button.dataset.observation || "").trim();
+          const record = trackedObservationRecords.get(trackedObservationKey(item, observation));
+          if (record) openTrackedObservationInLibrary(record);
         });
       });
       void hydrateTrackedObservations(item, container);
@@ -5742,7 +6307,7 @@ ${cardFeedbackBarHtml()}`;
         sections.push(`<section class="detail-analysis-block" data-analysis-field="impact_chain"><p class="detail-block-label">可能影响链</p><p>${escapeHtml(impact)}</p></section>`);
       }
       if (observations.length) {
-        sections.push(`<section class="detail-analysis-block" data-analysis-field="observation_points"><p class="detail-block-label">后续观察点</p><ul>${observations.map((point) => `<li><span>${escapeHtml(point)}</span><button class="observation-track-btn" data-detail-track-observation data-observation="${escapeHtml(point)}" type="button" aria-pressed="false">加入跟踪</button></li>`).join("")}</ul></section>`);
+        sections.push(`<section class="detail-analysis-block" data-analysis-field="observation_points"><p class="detail-block-label">后续观察点</p><ul>${observations.map((point) => `<li><span>${escapeHtml(point)}</span><span class="observation-track-actions"><button class="observation-track-btn" data-detail-track-observation data-observation="${escapeHtml(point)}" type="button" aria-pressed="false">加入跟踪</button><button class="observation-view-btn" data-detail-view-tracking data-observation="${escapeHtml(point)}" type="button" hidden>查看跟踪</button></span></li>`).join("")}</ul></section>`);
       }
       const structuredComplete = Boolean(why && impact && observations.length);
       if (!structuredComplete) {
@@ -9738,6 +10303,7 @@ ${cardFeedbackBarHtml()}`;
     setInterval(() => {
       if (document.hidden) return;
       void renderSourcesStatus();
+      void refreshTrackedObservations({ silent: true });
     }, 30000);
 
     // LAN password-gate control. The web UI is served from 127.0.0.1, so it is a
@@ -11777,6 +12343,7 @@ ${cardFeedbackBarHtml()}`;
         pendingConfirmationsPromise,
         syncWatchLaterButtons(),
         syncFavoriteButtons(),
+        refreshTrackedObservations({ silent: true }),
         requestJson(ENDPOINTS.health),
         requestJson(ENDPOINTS.initStatus).then(applyInitStatusSnapshot),
         requestJson(`${ENDPOINTS.activityFeed}?limit=5`).then(applyActivitySnapshot),

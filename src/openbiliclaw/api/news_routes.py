@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import os
 import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -41,6 +42,7 @@ from openbiliclaw.news.models import Article, normalize_utc
 from openbiliclaw.news.protocol import FetchWindow, NewsSourceAdapter
 from openbiliclaw.news.reliability import RetryPolicy, SourceRunner, SourceTaskStore
 from openbiliclaw.news.rss import RSSAdapter
+from openbiliclaw.news.tracking import NewsTrackingService
 from openbiliclaw.news.tushare import TushareNewsAdapter
 from openbiliclaw.research.routes import register_research_routes
 from openbiliclaw.research.service import ResearchService
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
 NewsSourceKind = Literal["tushare", "rss"]
 MaybeAwaitable = Callable[..., Awaitable[object] | object]
 RuntimeSettingsApplier = Callable[[Mapping[str, object]], Awaitable[object] | object]
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -389,6 +393,8 @@ class NewsRuntime:
         request_replenishment: MaybeAwaitable,
         client_present: Callable[[], bool] | None = None,
         apply_runtime_settings: RuntimeSettingsApplier | None = None,
+        llm_service_provider: Callable[[], Any] | None = None,
+        llm_concurrency_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.data_path = data_path
         self.database = database
@@ -405,6 +411,12 @@ class NewsRuntime:
         )
         self.task_store = SourceTaskStore(data_path / "newsclaw_source_tasks.db")
         self.command_ledger = SQLiteIdempotencyLedger(data_path / "newsclaw_commands.db")
+        self.tracking_service = NewsTrackingService(
+            database=database,
+            llm_service_provider=llm_service_provider,
+            llm_concurrency_provider=llm_concurrency_provider,
+            background_analysis_allowed=lambda: bool(self.settings().get("background_llm", True)),
+        )
         self.bootstrap_state_path = data_path / "newsclaw_bootstrap.json"
         self.runtime_state_path = data_path / "newsclaw_runtime.json"
         self._refresh_lock = asyncio.Lock()
@@ -414,15 +426,27 @@ class NewsRuntime:
         self._stop_event = asyncio.Event()
         self._effective_settings: dict[str, object] = {}
 
-    def _runner(self) -> SourceRunner:
+    def _runner(self, *, bounded_tracking: bool = False) -> SourceRunner:
         settings = cast("dict[str, object]", self.settings_store.load()["settings"])
+        max_attempts = _as_int(settings["retry_max_attempts"], 3)
+        base_backoff_seconds = _as_float(settings["retry_base_seconds"], 1.0)
+        max_backoff_seconds = _as_float(settings["retry_max_seconds"], 30.0)
+        if bounded_tracking:
+            # A desktop "check now" request has a five-minute client budget.
+            # Keep its source phase below ~64 seconds so the 120-second model
+            # comparison (or 130-second single-flight join) still has room to
+            # return one honest durable receipt.  Scheduled refreshes continue
+            # to use the user's normal reliability settings.
+            max_attempts = min(max_attempts, 3)
+            base_backoff_seconds = min(base_backoff_seconds, 1.0)
+            max_backoff_seconds = min(max_backoff_seconds, 2.0)
         return SourceRunner(
             self.task_store,
             policy=RetryPolicy(
-                max_attempts=_as_int(settings["retry_max_attempts"], 3),
+                max_attempts=max_attempts,
                 timeout_seconds=20.0,
-                base_backoff_seconds=_as_float(settings["retry_base_seconds"], 1.0),
-                max_backoff_seconds=_as_float(settings["retry_max_seconds"], 30.0),
+                base_backoff_seconds=base_backoff_seconds,
+                max_backoff_seconds=max_backoff_seconds,
                 minimum_interval_seconds=0.25,
                 lease_seconds=180.0,
             ),
@@ -757,12 +781,51 @@ class NewsRuntime:
         )
         return state
 
+    async def _run_tracking_batch(
+        self,
+        articles: list[dict[str, object]],
+        *,
+        source_request_id: str,
+        source_status: str,
+        tracking_ids: set[str] | None,
+        force: bool,
+        now: datetime,
+    ) -> dict[str, object]:
+        """Run one bounded tracking pass without leaking failures to refresh."""
+
+        try:
+            return cast(
+                "dict[str, object]",
+                await self.tracking_service.run_due_from_articles(
+                    articles,
+                    source_request_id=source_request_id,
+                    source_status=source_status,
+                    tracking_ids=tracking_ids,
+                    force=force,
+                    now=now,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            safe_error = safe_error_message(error) or type(error).__name__
+            logger.warning("NewsClaw tracking batch failed: %s", safe_error)
+            return {
+                "ran": 0,
+                "changed": 0,
+                "failed": 1,
+                "error": safe_error,
+                "results": [],
+            }
+
     async def refresh(
         self,
         *,
         request_id: str = "",
         hours: int = 72,
         per_source_limit: int = 80,
+        tracking_ids: set[str] | None = None,
+        force_tracking: bool = False,
     ) -> dict[str, object]:
         if not self._profile_ready():
             raise RuntimeError("请先完成新闻爪首次设置并建立画像")
@@ -776,7 +839,7 @@ class NewsRuntime:
                 supplied=request_id,
             )
             adapters, unavailable = self._build_adapters()
-            runner = self._runner()
+            runner = self._runner(bounded_tracking=True) if force_tracking else self._runner()
             window = FetchWindow(started - timedelta(hours=hours), started, per_source_limit)
             try:
                 outcomes = await asyncio.gather(
@@ -811,17 +874,78 @@ class NewsRuntime:
             source_results.extend(unavailable)
             articles = [article for outcome in outcomes for article in outcome.articles]
             dedupe = SemanticDeduplicator().deduplicate(articles)
+            source_status = self._aggregate_source_status(source_results)
             inserted = await self.publish_candidates(dedupe.articles)
+            tracking_articles: list[dict[str, object]] = []
+            for cluster in dedupe.clusters:
+                canonical = cluster.canonical
+                payload: dict[str, object] = {
+                    **canonical.to_dict(),
+                    "item_key": f"news:{canonical.article_id}",
+                    "body_text": canonical.body,
+                    "content_url": canonical.canonical_url,
+                    "tags": [canonical.media, canonical.content_scope, canonical.freshness],
+                    "corroborating_sources": [
+                        {
+                            "source": duplicate.media,
+                            "provider": duplicate.provider,
+                            "url": duplicate.canonical_url,
+                            "published_at": duplicate.published_at,
+                            "content_scope": duplicate.content_scope,
+                        }
+                        for duplicate in cluster.duplicates[:5]
+                    ],
+                }
+                tracking_articles.append(payload)
+            if force_tracking:
+                tracking = await self._run_tracking_batch(
+                    tracking_articles,
+                    source_request_id=normalized_request_id,
+                    source_status=source_status,
+                    tracking_ids=tracking_ids,
+                    force=True,
+                    now=started,
+                )
+            elif not bool(self.settings().get("background_llm", True)):
+                tracking = {
+                    "ran": 0,
+                    "changed": 0,
+                    "failed": 0,
+                    "scheduled": False,
+                    "reason": "background_disabled",
+                    "results": [],
+                }
+            else:
+                tracking_task = asyncio.create_task(
+                    self._run_tracking_batch(
+                        tracking_articles,
+                        source_request_id=normalized_request_id,
+                        source_status=source_status,
+                        tracking_ids=tracking_ids,
+                        force=False,
+                        now=started,
+                    )
+                )
+                self._background_tasks.add(tracking_task)
+                tracking_task.add_done_callback(self._background_tasks.discard)
+                tracking = {
+                    "ran": 0,
+                    "changed": 0,
+                    "failed": 0,
+                    "scheduled": True,
+                    "results": [],
+                }
             completed_at = normalize_utc(_utc_now(), allow_empty=False)
             result = {
                 "ok": bool(dedupe.articles),
                 "request_id": normalized_request_id,
-                "status": self._aggregate_source_status(source_results),
+                "status": source_status,
                 "article_count": len(dedupe.articles),
                 "duplicate_count": max(0, len(articles) - len(dedupe.articles)),
                 "candidate_inserted": inserted,
                 "completed_at": completed_at,
                 "sources": source_results,
+                "tracking": tracking,
             }
             self._merge_runtime_state(
                 {
@@ -1356,6 +1480,8 @@ def register_newsclaw_routes(
     request_replenishment: MaybeAwaitable,
     client_present: Callable[[], bool] | None = None,
     apply_runtime_settings: RuntimeSettingsApplier | None = None,
+    llm_service_provider: Callable[[], Any] | None = None,
+    llm_concurrency_provider: Callable[[], Any] | None = None,
 ) -> NewsRuntime:
     """Register NewsClaw's additive API without altering legacy deployments."""
 
@@ -1367,6 +1493,8 @@ def register_newsclaw_routes(
         request_replenishment=request_replenishment,
         client_present=client_present,
         apply_runtime_settings=apply_runtime_settings,
+        llm_service_provider=llm_service_provider,
+        llm_concurrency_provider=llm_concurrency_provider,
     )
     app.state.newsclaw_runtime = runtime
     register_research_routes(app, runtime=runtime)

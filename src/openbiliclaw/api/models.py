@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import unicodedata
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -413,6 +413,7 @@ class TrackedObservationCreateIn(BaseModel):
     recommendation_id: int | None = Field(default=None, ge=1)
     observation: Annotated[StrictStr, Field(min_length=1, max_length=2000)]
     latest_evidence: Annotated[StrictStr, Field(max_length=4000)] = ""
+    check_interval_minutes: int = Field(default=1440, ge=15, le=10_080)
 
     @field_validator("item_key")
     @classmethod
@@ -454,6 +455,15 @@ class TrackedObservationOut(BaseModel):
     status: Literal["active", "archived"] = "active"
     latest_evidence: str = ""
     original_snapshot: RecommendationSnapshotOut | None = None
+    check_interval_minutes: int = 1440
+    next_check_at: str = ""
+    last_checked_at: str = ""
+    last_check_status: str = "pending"
+    last_check_summary: str = ""
+    last_change_at: str = ""
+    failure_count: int = 0
+    last_error: str = ""
+    unread_count: int = 0
     created_at: str = ""
     updated_at: str = ""
 
@@ -467,9 +477,13 @@ class TrackedObservationCreateResponse(BaseModel):
 
 
 class TrackedObservationListResponse(BaseModel):
-    """Tracked observations for one canonical NewsClaw item."""
+    """Tracked observations globally or for one canonical NewsClaw item."""
 
     items: list[TrackedObservationOut]
+    total: int = 0
+    active_count: int = 0
+    archived_count: int = 0
+    unread_count: int = 0
 
 
 class TrackedObservationArchiveResponse(BaseModel):
@@ -477,6 +491,83 @@ class TrackedObservationArchiveResponse(BaseModel):
 
     item: TrackedObservationOut
     archived: bool
+
+
+class TrackedObservationCheckIn(BaseModel):
+    """Trigger one explicit source refresh and tracking comparison."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: IdempotencyKey
+
+
+class TrackedObservationEvidenceOut(BaseModel):
+    """One append-only piece of evidence that materially changed an observation."""
+
+    evidence_id: str
+    check_id: str
+    tracking_id: str
+    evidence_item_key: str
+    evidence_fingerprint: str
+    change_fingerprint: str
+    recommendation_id: int | None = None
+    match_basis: str = ""
+    match_score: float = 0.0
+    change_type: str = ""
+    previous_state: str = ""
+    new_state: str = ""
+    fact: str = ""
+    inference: str = ""
+    summary: str = ""
+    evidence_quote: str = ""
+    confidence: float = 0.0
+    evidence_snapshot: dict[str, Any] = Field(default_factory=dict)
+    detected_at: str = ""
+
+
+class TrackedObservationCheckOut(BaseModel):
+    """One durable check receipt; no-change rows remain auditable but read."""
+
+    check_id: str
+    request_id: str
+    tracking_id: str
+    status: Literal[
+        "running",
+        "changed",
+        "unchanged",
+        "valid_empty",
+        "retry_wait",
+        "failed",
+        "cancelled",
+    ]
+    source_request_id: str = ""
+    source_status: str = ""
+    summary: str = ""
+    candidate_count: int = 0
+    matched_count: int = 0
+    new_evidence_count: int = 0
+    error: str = ""
+    is_read: bool = True
+    attempt_count: int = 1
+    lease_expires_at: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+    evidence: list[TrackedObservationEvidenceOut] = Field(default_factory=list)
+
+
+class TrackedObservationCheckResponse(BaseModel):
+    item: TrackedObservationOut
+    check: TrackedObservationCheckOut
+
+
+class TrackedObservationTimelineResponse(BaseModel):
+    item: TrackedObservationOut
+    checks: list[TrackedObservationCheckOut]
+
+
+class TrackedObservationReadResponse(BaseModel):
+    item: TrackedObservationOut
+    updated: int = 0
 
 
 class _PlatformScopedRecommendationIn(BaseModel):

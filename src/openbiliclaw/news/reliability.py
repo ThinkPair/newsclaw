@@ -591,7 +591,10 @@ class SourceRunner:
                     self._policy.base_backoff_seconds * (2 ** max(0, attempt - 1)),
                 )
                 if last_error.retry_after_seconds is not None:
-                    backoff = max(backoff, last_error.retry_after_seconds)
+                    backoff = min(
+                        self._policy.max_backoff_seconds,
+                        max(backoff, last_error.retry_after_seconds),
+                    )
                 if backoff:
                     await self._sleep(backoff)
 

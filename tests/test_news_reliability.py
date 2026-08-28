@@ -107,6 +107,30 @@ async def test_transient_retry_dedupes_and_persists_idempotent_replay(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_retry_after_is_capped_by_policy_max_backoff(tmp_path) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    adapter = SequenceAdapter([SourceRateLimited("slow", retry_after_seconds=600), []])
+    runner = SourceRunner(
+        SourceTaskStore(tmp_path / "retry-after-cap.db"),
+        policy=RetryPolicy(
+            max_attempts=2,
+            base_backoff_seconds=1,
+            max_backoff_seconds=2,
+        ),
+        sleep=fake_sleep,
+    )
+
+    result = await runner.run(adapter, _window(), request_id="retry-after-cap")
+
+    assert result.status == "empty"
+    assert sleeps == [2]
+
+
+@pytest.mark.asyncio
 async def test_permission_failure_is_terminal_without_retry_and_marks_unavailable(tmp_path) -> None:
     adapter = SequenceAdapter([SourcePermissionDenied("news endpoint access denied")])
     store = SourceTaskStore(tmp_path / "tasks.db")

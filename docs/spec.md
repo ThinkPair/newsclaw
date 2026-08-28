@@ -313,7 +313,12 @@ NewsClaw judgment workbench
         → bounded stable sort → desktop priority queue / Today Pick → one selected detail
         ├─ explicit feedback → durable event → profile learning
         ├─ save / click / feedback / removal → immutable judgment snapshot → local history
-        └─ observation → tracked_observations active / archived ledger (no automatic Tavily call)
+        └─ observation → tracked_observations active / archived ledger
+             └─ normal Tushare/RSS refresh → deterministic shortlist → structured comparison
+                  ├─ material change → check + evidence ledger → timeline + unread
+                  ├─ unchanged / valid empty → check history only
+                  └─ source/model failure → bounded retry, never false unchanged
+             (no automatic Tavily call; no profile-learning event)
 
 config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate

@@ -137,11 +137,20 @@ result，再经过后端身份门禁转换统一事件和账号分区 Node affin
 
 | 方法与路径 | 契约 |
 | --- | --- |
-| `GET /api/news/tracked-observations?item_key=<news:key>&status=active|archived|all` | 查询某条新闻的本地观察点；默认只返回 active。 |
-| `POST /api/news/tracked-observations` | 提交 `request_id`、`item_key`、可选 `recommendation_id`、`observation` 和可选 `latest_evidence`。同一请求 ID，或同一新闻上语义相同且仍 active 的观察点，均幂等返回原记录。 |
+| `GET /api/news/tracked-observations?item_key=<news:key>&status=active|archived|all&limit=100&offset=0` | 全局或按可选 `item_key` 查询跟踪项；默认只返回 active，并投影最近检查状态和未读数。Phase 1 客户端仍可继续传必填式 `item_key`。 |
+| `POST /api/news/tracked-observations` | 提交 `request_id`、`item_key`、可选 `recommendation_id`、`observation`、可选 `latest_evidence` 和检查间隔。同一请求 ID，或同一新闻上语义相同且仍 active 的观察点，均幂等返回原记录。 |
+| `GET /api/news/tracked-observations/{tracking_id}` | 读取一个跟踪项、调度状态、最近检查摘要和未读数。 |
+| `POST /api/news/tracked-observations/{tracking_id}/check` | 手动立即检查。复用正常新闻刷新产生的规范化、去重批次，并强制该项在本轮参与比较；不调用 Tavily。重复请求必须复用同一检查结果。 |
+| `GET /api/news/tracked-observations/{tracking_id}/timeline?limit=50&offset=0` | 返回检查时间线及其变化证据；事实、模型推断、证据摘录和来源快照分开投影。 |
+| `POST /api/news/tracked-observations/{tracking_id}/read` | 把该跟踪项当前未读检查标为已读。未读以检查账本为唯一真值，不另建通用 pending/ack 队列。 |
+| `POST /api/news/tracked-observations/{tracking_id}/restart` | 从已归档观察点建立新的 active 跟踪周期；旧周期、检查和证据保持不变，并用 `request_id` 保证重试幂等。 |
 | `DELETE /api/news/tracked-observations/{tracking_id}` | 把观察点归档而非物理删除；重复归档返回 `archived=false`，未知 ID 返回 404。 |
 
-观察点只接受 canonical `news:` 条目，并保存创建时的判断快照、主题与故事键。它是本机研究/记忆线索，不自动改变画像，也不等于已经查证或已经建立后台抓取任务。
+查询、创建和归档操作负责建立本地跟踪身份；Phase 2 已补齐调度字段、全局列表、单项详情、立即检查、时间线、已读和重新开始接口，并完成后端回归与本机正式服务接口验证。观察点只接受 canonical `news:` 条目，并保存创建时的判断快照、主题与故事键。
+
+Phase 2 的后台检查随正常 `NewsRuntime.refresh()` 复用同一批本地来源结果，但模型比较由 app-owned task 脱离刷新关键路径运行；普通刷新返回已排队回执，手动 `check` 才等待真实检查结果。同一 tracker 由数据库 partial unique index 和租约形成 single-flight：手动请求遇到有效后台检查时等待并返回同一个 durable receipt，不创建第二条 `running` 或重复调用模型。确定性规则先把候选缩小；没有相关候选时可直接记为 `valid_empty`。存在相关候选时必须通过 120 秒有界的结构化模型核验“实质变化 / 仅相关”；模型失败、输出不合规或来源降级进入重试/失败状态，不能落成 `unchanged`。只有 `changed` 写入未读；失败保持已读并显示原因、降低频率继续自动重试。`unchanged` 和 `valid_empty` 留在时间线但不通知。归档停止后续检查并保留原判断、全部检查和证据。桌面列表通过 `limit/offset` 加载更多观察点，时间线同样可以继续加载更早检查；静默刷新会合并已加载尾页，不把超过 500 条的当前视图截断。
+
+这条链路不自动调用 Tavily，不写画像事件。完整 Phase 2 控制面只属于桌面 Web；手机/PWA、浏览器扩展和 DSH 本阶段没有跟踪中心、时间线或手动检查接口入口。
 
 ### 30 天内容历史（issue #112）
 

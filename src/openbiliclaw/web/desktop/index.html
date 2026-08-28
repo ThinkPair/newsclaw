@@ -248,11 +248,12 @@
         <div class="content-library-page-head">
           <p class="eyebrow">Your library</p>
           <h2 id="desktopContentLibraryTitle">内容库</h2>
-          <p class="video-meta">稍后读、收藏和近 30 天历史，都只保存在这台电脑上。</p>
+          <p class="video-meta">稍后读、收藏、持续跟踪和近 30 天历史，都只保存在这台电脑上。</p>
         </div>
         <div class="content-library-tabs" role="tablist" aria-label="内容库分类">
           <button id="contentLibraryWatchLaterTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="watchLaterPage" tabindex="-1"><span>稍后读</span><span class="nav-count-badge" id="watchLaterCountBadge" hidden></span></button>
           <button id="contentLibraryFavoritesTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="favoritesPage" tabindex="-1"><span>收藏</span><span class="nav-count-badge" id="favoritesCountBadge" hidden></span></button>
+          <button id="contentLibraryTrackingTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="trackingPage" tabindex="-1"><span>持续跟踪</span><span class="nav-count-badge" id="trackedObservationsUnreadBadge" aria-label="未读跟踪更新" hidden></span></button>
           <button id="contentLibraryHistoryTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="historyPage" tabindex="-1">历史记录</button>
         </div>
 
@@ -282,6 +283,25 @@
         <p class="saved-sync-status" id="favoritesSyncStatus" aria-live="polite"></p>
         <div class="saved-grid" id="favoritesList"></div>
         <div class="saved-empty" id="favoritesEmpty" hidden>还没有收藏的内容，去推荐里点星标收藏吧。</div>
+      </section>
+
+      <section class="tracking-page content-library-panel" id="trackingPage" role="tabpanel" aria-labelledby="contentLibraryTrackingTab" hidden>
+        <div class="content-page-head tracking-page-head">
+          <div>
+            <p class="eyebrow">Change tracking</p>
+            <h2 id="trackingPageTitle" tabindex="-1">持续跟踪</h2>
+            <p class="video-meta">把新闻里的观察点留在本机；新闻源出现新证据后，新闻爪会记录检查结果和真正发生的变化。</p>
+          </div>
+          <button class="pill-btn" id="trackingRefreshBtn" type="button">刷新跟踪</button>
+        </div>
+        <div class="tracking-summary" aria-label="持续跟踪摘要">
+          <div><span>正在跟踪</span><strong id="trackingActiveCount">0</strong></div>
+          <div><span>未读变化</span><strong id="trackingUnreadCount">0</strong></div>
+          <div><span>已停止</span><strong id="trackingArchivedCount">0</strong></div>
+        </div>
+        <p class="tracking-page-status" id="trackingPageStatus" aria-live="polite"></p>
+        <div class="tracking-list" id="trackingList" aria-live="polite" aria-busy="false"></div>
+        <div class="saved-empty tracking-empty" id="trackingEmpty" hidden>还没有持续跟踪的观察点。去推荐详情里的“后续观察点”开始跟踪吧。</div>
       </section>
 
       <section class="history-page content-library-panel" id="historyPage" role="tabpanel" aria-labelledby="contentLibraryHistoryTab" hidden>

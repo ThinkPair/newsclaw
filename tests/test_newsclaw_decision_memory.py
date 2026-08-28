@@ -355,6 +355,66 @@ def test_tracking_api_enforces_news_gate_and_keeps_stopped_rows_queryable(
     assert response.json()["item"]["original_snapshot"]["snapshot_version"]
 
     tracking_id = response.json()["item"]["tracking_id"]
+    global_list = client.get(
+        "/api/news/tracked-observations",
+        params={"status": "all"},
+    )
+    assert global_list.status_code == 200
+    assert global_list.json()["active_count"] == 1
+    assert global_list.json()["archived_count"] == 0
+    assert global_list.json()["total"] == 1
+
+    check, claimed = db.begin_tracked_observation_check(
+        tracking_id=tracking_id,
+        request_id="tracking-api-check-1",
+        started_at="2026-08-28T08:00:00+00:00",
+        lease_expires_at="2026-08-28T08:10:00+00:00",
+        source_request_id="refresh-api-1",
+        source_status="online",
+    )
+    assert claimed is True
+    db.complete_tracked_observation_check(
+        check_id=check["check_id"],
+        tracking_id=tracking_id,
+        completed_at="2026-08-28T08:01:00+00:00",
+        outcome="changed",
+        matched_count=1,
+        changes=[
+            {
+                "item_key": "news:article-2",
+                "evidence_fingerprint": "evidence-fingerprint-2",
+                "change_fingerprint": "change-fingerprint-2",
+                "match_basis": "story_key",
+                "match_score": 0.98,
+                "change_type": "progress",
+                "previous_state": "实施细则尚未发布",
+                "new_state": "实施细则已经正式发布",
+                "fact": "来源明确宣布实施细则正式发布。",
+                "inference": "政策进入执行阶段。",
+                "summary": "实施细则已经发布。",
+                "evidence_quote": "实施细则正式发布",
+                "confidence": 0.94,
+                "title": "实施细则发布",
+                "content_url": "https://example.com/policy/detail",
+                "media": "测试媒体",
+                "published_at": "2026-08-28T07:50:00+00:00",
+                "content_scope": "full_text",
+            }
+        ],
+    )
+    detail = client.get(f"/api/news/tracked-observations/{tracking_id}")
+    assert detail.status_code == 200
+    assert detail.json()["last_check_status"] == "changed"
+    assert detail.json()["unread_count"] == 1
+    timeline = client.get(f"/api/news/tracked-observations/{tracking_id}/timeline")
+    assert timeline.status_code == 200
+    assert timeline.json()["checks"][0]["status"] == "changed"
+    assert timeline.json()["checks"][0]["evidence"][0]["change_type"] == "progress"
+    marked_read = client.post(f"/api/news/tracked-observations/{tracking_id}/read")
+    assert marked_read.status_code == 200
+    assert marked_read.json()["updated"] == 1
+    assert marked_read.json()["item"]["unread_count"] == 0
+
     archived = client.delete(f"/api/news/tracked-observations/{tracking_id}")
     assert archived.status_code == 200
     assert archived.json()["item"]["status"] == "archived"
@@ -363,6 +423,34 @@ def test_tracking_api_enforces_news_gate_and_keeps_stopped_rows_queryable(
         params={"item_key": "news:article-1", "status": "all"},
     )
     assert [item["status"] for item in listed.json()["items"]] == ["archived"]
+    assert listed.json()["total"] == 1
+    assert listed.json()["active_count"] == 0
+    assert listed.json()["archived_count"] == 1
+    unmatched = client.get(
+        "/api/news/tracked-observations",
+        params={"item_key": "news:another-article", "status": "all"},
+    ).json()
+    assert unmatched["items"] == []
+    assert unmatched["total"] == 0
+    assert unmatched["active_count"] == 0
+    assert unmatched["archived_count"] == 0
+    assert unmatched["unread_count"] == 0
+
+    restarted = client.post(
+        f"/api/news/tracked-observations/{tracking_id}/restart",
+        json={"request_id": "track-api-restart-1"},
+    )
+    assert restarted.status_code == 200
+    assert restarted.json()["created"] is True
+    assert restarted.json()["item"]["status"] == "active"
+    assert restarted.json()["item"]["tracking_id"] != tracking_id
+    cycles = client.get(
+        "/api/news/tracked-observations",
+        params={"item_key": "news:article-1", "status": "all"},
+    ).json()
+    assert {item["status"] for item in cycles["items"]} == {"active", "archived"}
+    assert cycles["active_count"] == 1
+    assert cycles["archived_count"] == 1
 
     rejected = client.post(
         "/api/news/tracked-observations",
@@ -374,6 +462,66 @@ def test_tracking_api_enforces_news_gate_and_keeps_stopped_rows_queryable(
         json={**payload, "request_id": "blank", "observation": "   "},
     )
     assert blank.status_code == 422
+
+
+def test_tracking_api_manual_check_returns_durable_receipt(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tracking-api-manual-check.db")
+    db.initialize()
+    _cache_news(db)
+    client = TestClient(create_app(database=db, memory_manager=object(), soul_engine=object()))
+    created = client.post(
+        "/api/news/tracked-observations",
+        json={
+            "request_id": "track-manual-api-1",
+            "item_key": "news:article-1",
+            "observation": "核验实施细则",
+            "latest_evidence": "第一版公告",
+        },
+    )
+    assert created.status_code == 200
+    tracking_id = created.json()["item"]["tracking_id"]
+
+    class FakeRuntime:
+        async def refresh(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs["tracking_ids"] == {tracking_id}
+            assert kwargs["force_tracking"] is True
+            check, claimed = db.begin_tracked_observation_check(
+                tracking_id=tracking_id,
+                request_id="manual-refresh-receipt",
+                started_at="2026-08-28T08:00:00+00:00",
+                lease_expires_at="2026-08-28T08:10:00+00:00",
+                source_request_id=str(kwargs["request_id"]),
+                source_status="online",
+                candidate_count=0,
+            )
+            assert claimed is True
+            completed, _item = db.complete_tracked_observation_check(
+                check_id=check["check_id"],
+                tracking_id=tracking_id,
+                completed_at="2026-08-28T08:01:00+00:00",
+                outcome="valid_empty",
+                matched_count=0,
+                changes=[],
+            )
+            return {
+                "tracking": {
+                    "ran": 1,
+                    "changed": 0,
+                    "failed": 0,
+                    "results": [{"ran": True, "check": completed}],
+                }
+            }
+
+    client.app.state.newsclaw_runtime = FakeRuntime()
+    response = client.post(
+        f"/api/news/tracked-observations/{tracking_id}/check",
+        json={"request_id": "manual-check-api-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["check"]["status"] == "valid_empty"
+    assert response.json()["item"]["last_check_status"] == "valid_empty"
+    assert response.json()["item"]["unread_count"] == 0
 
 
 def test_recommendations_are_stably_sorted_by_decision_priority() -> None:

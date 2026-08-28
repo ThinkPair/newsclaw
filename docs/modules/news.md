@@ -30,6 +30,7 @@ candidate pool.
 | Feedback/event idempotency | Implemented | SQLite first-write ledger rejects event-ID payload conflicts |
 | Semantic dedupe | Implemented | Exact URL/hash/title plus offline headline similarity; local embedding similarity can be injected |
 | From-zero onboarding | Implemented | Explicit manual interests/avoid terms, initial source fetch, cross-source dedupe, candidate callback, four-stage result |
+| Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; the live desktop list/route/empty state and API schema were verified locally, while populated-card and change paths are covered by automated contracts |
 
 ## Canonical article contract
 
@@ -88,6 +89,32 @@ that a multi-source refresh succeeded.
 The idempotency ledger returns `True` only for the first write, `False` for an
 identical retry, and raises `IdempotencyConflict` if an event ID is reused for a
 different payload.
+
+### Phase 2 continuous tracking contract
+
+`NewsTrackingService` is the source-agnostic comparison lane for
+tracked observation points. It does not own source collection. After
+`NewsRuntime.refresh()` has normalized and cross-source deduplicated an article
+batch, the same batch is offered to due active trackers in an app-owned task,
+so scheduled model work cannot hold the news-refresh lock. A deterministic local
+prefilter bounds plausible candidates; if none remain, the check can complete
+as a valid empty result without a model call. Plausible candidates require a
+bounded structured model comparison against the original and latest verified
+state. Provider failure or invalid structure is retry/degraded, never a false
+“unchanged”.
+
+Only a newly inserted material-change fingerprint creates unread state.
+Unchanged and valid-empty checks remain durable timeline facts without a change
+notification. Failures remain read, expose their redacted cause, and continue
+automatic backoff; newly sorted corroborating-source metadata is part of the
+candidate revision fingerprint. The manual check-now API enters this same refresh and comparison
+path; it does not invoke the separate Tavily research module. Archiving a
+tracker retains checks/evidence and prevents future claims. No tracking outcome
+is a profile-learning event.
+
+The complete control surface is desktop-only for Phase 2. Mobile/PWA, the
+browser extension and DSH deliberately omit the tracking center, timeline and
+manual check-now action until they can consume this same backend ledger.
 
 ### From-zero onboarding
 

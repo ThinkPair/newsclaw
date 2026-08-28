@@ -127,7 +127,8 @@ test("desktop observation points expose an executable local tracking contract", 
   const keySource = functionSource("trackedObservationKey");
   const syncSource = functionSource("syncObservationTrackingControls");
   const explanationSource = functionSource("recommendationDetailExplanationHtml");
-  assert.ok(keySource && syncSource && explanationSource);
+  const mergeSource = functionSource("mergeTrackedObservationRefresh");
+  assert.ok(keySource && syncSource && explanationSource && mergeSource);
 
   const renderExplanation = new Function(
     "asArray", "escapeHtml",
@@ -155,10 +156,31 @@ test("desktop observation points expose an executable local tracking contract", 
   assert.equal(button.attrs["aria-pressed"], "true");
   assert.equal(button.textContent, "移出跟踪");
 
+  const mergeRefresh = new Function(
+    "asArray", "trackedObservationId",
+    `${mergeSource}; return mergeTrackedObservationRefresh;`,
+  )(
+    (value) => Array.isArray(value) ? value : [],
+    (value) => String(value?.tracking_id || ""),
+  );
+  const existing = Array.from({ length: 600 }, (_, index) => ({ tracking_id: `track-${index + 1}`, version: "old" }));
+  const refreshed = Array.from({ length: 500 }, (_, index) => ({ tracking_id: `track-${index + 1}`, version: "new" }));
+  const merged = mergeRefresh(existing, refreshed, 600, true);
+  assert.equal(merged.length, 600);
+  assert.equal(merged[0].version, "new");
+  assert.equal(merged[599].tracking_id, "track-600");
+
   assert.match(js, /trackedObservations:\s*"\/news\/tracked-observations"/);
   assert.match(js, /const body = \{[\s\S]{0,180}?item_key:\s*itemKey[\s\S]{0,180}?observation:\s*cleanObservation/);
   assert.match(js, /requestJsonStrict\(ENDPOINTS\.trackedObservations,[\s\S]{0,120}?method:\s*"POST"/);
   assert.match(js, /`\$\{ENDPOINTS\.trackedObservations\}\/\$\{encodeURIComponent\(trackingId\)\}`[\s\S]{0,120}?method:\s*"DELETE"/);
+  assert.match(js, /data-tracking-list-more/);
+  assert.match(js, /data-tracking-action="timeline-more"/);
+  assert.match(js, /class="tracking-check-error"/);
+  assert.match(js, /有新变化/);
+  assert.match(js, /timeoutMs:\s*300000/);
+  assert.match(js, /mergeTrackedObservationRefresh\([\s\S]{0,220}?silent/);
+  assert.doesNotMatch(js, /有待查看更新/);
 });
 
 test("desktop selection, local filters and mutations keep honest state", async () => {

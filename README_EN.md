@@ -33,6 +33,17 @@ not require another product at runtime.
 - Respect title-, summary-, and full-text evidence levels.
 - Treat one failed source as degraded operation, not a successful global
   refresh.
+- **Phase 2 continuous tracking is implemented against an explicit acceptance
+  contract.** A completed normal refresh reuses the same normalized,
+  deduplicated local article batch for due observations, while model comparison
+  runs outside the refresh critical path. Deterministic local rules bound the
+  candidate set, then a structured model distinguishes merely related news from
+  a material change. Only a material change creates an unread timeline update;
+  failures stay read, expose a safe reason, and retry with backoff. “Check now”
+  waits for the same refresh/comparison path and joins an already-running check
+  for that tracker instead of issuing a second model call. Stopping a tracker preserves its history, and a
+  restart creates a new cycle without rewriting the archived one. This lane
+  never calls Tavily automatically and never updates the user profile.
 
 ## Sources
 
@@ -52,10 +63,15 @@ buttons and never hold the key.
 ## Data flow
 
 ```text
-Tushare / RSS → news evidence → evaluation and composite ranking → judgment workbench / four clients
-                                                                  ├→ explicit feedback → profile
-                                                                  ├→ save/click/feedback → immutable judgment snapshot → local history
-                                                                  └→ observation → local tracking ledger (no automatic web research)
+Tushare / RSS → news evidence → normalized, deduplicated local batch → evaluation/ranking → workbench
+                                      │
+                                      └→ [Phase 2] due observation → local-rule shortlist
+                                                                         → structured model check
+                                                                         ├→ material change → timeline + unread
+                                                                         └→ no change → check history only
+
+Workbench → explicit feedback → profile
+          └→ save/click/feedback → immutable judgment snapshot → local history
 
 DSH Agent / REST research request → fresh local cache or Tavily Search/Extract
                                   → cited evidence + separate research history
@@ -71,6 +87,12 @@ evidence stays in a separate SQLite ledger under the same private data
 directory, so it is not mixed with profile or pool state. The extension never
 reads news pages or cookies. The DSH panel defaults to 380px, supports 280–560px,
 and keeps at least 400px for the conversation area.
+
+The complete Phase 2 tracking surface is desktop-only. Mobile/PWA, the browser
+extension, and DSH keep their existing news capabilities in this phase, but do
+not expose a tracking center, change timeline, or manual check-now action. A
+future client must consume the same backend truth rather than create a second
+tracking state.
 
 ## Local preview
 
