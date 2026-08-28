@@ -9,9 +9,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import sqlite3
@@ -20,15 +22,17 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from zoneinfo import ZoneInfo
 
 from openbiliclaw.discovery.admission import (
     DEFAULT_ADMISSION_MIN_SCORE,
@@ -59,6 +63,7 @@ from openbiliclaw.discovery.temporal import (
     parse_temporal_evaluation,
     schedule_temporal_evaluation,
 )
+from openbiliclaw.news.evidence import verified_content_scope
 from openbiliclaw.published_time import normalize_published_time
 from openbiliclaw.saved_sync.identity import (
     canonical_source_platform,
@@ -101,6 +106,83 @@ if TYPE_CHECKING:
     from openbiliclaw.saved_sync.extension_broker import ExtensionNativeSaveJob
 
 logger = logging.getLogger(__name__)
+
+_DATABASE_SCHEMA_LOCKS_GUARD = threading.Lock()
+_DATABASE_SCHEMA_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _database_schema_thread_lock(db_path: Path) -> threading.RLock:
+    """Return one process-local migration lock for a canonical database path."""
+
+    key = str(db_path.resolve())
+    with _DATABASE_SCHEMA_LOCKS_GUARD:
+        lock = _DATABASE_SCHEMA_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DATABASE_SCHEMA_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _database_schema_migration_lock(
+    db_path: Path,
+    *,
+    timeout_seconds: float = 60.0,
+) -> Iterator[None]:
+    """Serialize check-then-ALTER migrations across facades and processes."""
+
+    thread_lock = _database_schema_thread_lock(db_path)
+    lock_path = db_path.with_name(f".{db_path.name}.schema.lock")
+    with thread_lock, lock_path.open("a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.1)
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                while not acquired:
+                    try:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for database schema lock: {db_path}"
+                            ) from None
+                        time.sleep(0.05)
+            else:
+                fcntl = importlib.import_module("fcntl")
+                flock = fcntl.flock
+                lock_ex = int(fcntl.LOCK_EX)
+                lock_nb = int(fcntl.LOCK_NB)
+
+                while not acquired:
+                    try:
+                        flock(lock_file.fileno(), lock_ex | lock_nb)
+                        acquired = True
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for database schema lock: {db_path}"
+                            ) from None
+                        time.sleep(0.05)
+            yield
+        finally:
+            if acquired:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl = importlib.import_module("fcntl")
+                    flock = fcntl.flock
+                    flock(lock_file.fileno(), int(fcntl.LOCK_UN))
 
 
 def _normalize_content_history_source_platform(value: object) -> str:
@@ -978,9 +1060,33 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-# Schema version for migrations.  V4 adds the atomic temporal-evidence and
-# review lifecycle fields to both discovery candidates and cached content.
-_SCHEMA_VERSION = 6
+# Schema version for migrations.  V7 adds the additive NewsClaw event projection
+# while preserving the pre-existing ``events`` behavioral log unchanged.
+_SCHEMA_VERSION = 7
+
+_NEWS_EVENT_CONTRACT_VERSION = "news-event-v1"
+_NEWS_EVENT_FACT_GATE_MIGRATION_VERSION = "news-event-fact-gate-v4"
+_NEWS_EVENT_ORIGIN_REPAIR_VERSION = "news-event-origin-v2"
+_NEWS_EVENT_LINEAGE_LEDGER_VERSION = "news-event-lineage-ledger-v1"
+_NEWS_EVENT_DATE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_NEWS_EVENT_KEY_VERSION = "news-event-key-v2"
+_NEWS_EVENT_CHANGE_FINGERPRINT_VERSION = "news-event-change-v3"
+_NEWS_EVENT_STATUSES = frozenset({"active", "resolved", "merged", "archived"})
+_NEWS_EVENT_RELATION_KINDS = frozenset(
+    {"origin", "supports_change", "related_no_change", "contradicts_change"}
+)
+_NEWS_EVENT_CONTENT_SCOPES = frozenset({"unknown", "title_only", "summary", "full_text"})
+_NEWS_EVENT_SOURCE_SCOPES = frozenset({"unknown", "single_source", "multi_source"})
+_NEWS_EVENT_EVIDENCE_STATUSES = frozenset(
+    {"provisional", "source_supported", "cross_source_supported", "contested"}
+)
+_NEWS_EVENT_CHANGE_LIFECYCLES = frozenset({"active", "superseded", "invalidated"})
+_NEWS_EVENT_CHANGE_ROLES = frozenset({"objective_change", "expectation", "sentiment", "analysis"})
+_NEWS_EVENT_OBJECTIVITY_STATUSES = frozenset(
+    {"confirmed", "unconfirmed", "disputed", "not_applicable"}
+)
+_NEWS_EVENT_CONFLICT_STATUSES = frozenset({"none", "contested", "resolved"})
+_NEWS_EVENT_LINEAGE_CLAIM_STATUSES = frozenset({"active", "contested", "resolved", "rejected"})
 
 _SCHEMA_SQL = """
 -- Event log (behavioral data from browser extension)
@@ -1994,6 +2100,16 @@ class Database:
     def initialize(self) -> None:
         """Initialize the database and run migrations if needed."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Most legacy migrations use a safe check-then-ALTER pattern, but SQLite
+        # cannot make that pair atomic across two independently constructed
+        # facades.  Serialize the complete migration phase both inside this
+        # process and across desktop/background processes.
+        with _database_schema_migration_lock(self._db_path):
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
+        """Run initialization while the path-scoped migration fence is held."""
+
         # Preserve the long-lived facade connection's legacy schema semantics:
         # foreign-key enforcement has historically been enabled only for
         # explicit transaction connections.  Turning it on here would
@@ -2003,7 +2119,18 @@ class Database:
         with self._connection_registry_lock:
             self._connection_owner_thread_id = owner_thread_id
             self._connections_by_thread = {owner_thread_id: self._conn}
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        for attempt in range(20):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt >= 19:
+                    raise
+                # Several facades can discover a brand-new database at once
+                # during desktop startup.  WAL negotiation briefly needs a
+                # schema lock; retry the idempotent pragma instead of failing a
+                # healthy peer merely because it won the first race.
+                time.sleep(min(0.01 * (attempt + 1), 0.1))
         self._conn.executescript(_SCHEMA_SQL)
         self._ensure_event_satisfaction_columns()
         self._ensure_event_ingest_key_column()
@@ -2035,6 +2162,7 @@ class Database:
         self._ensure_saved_sync_tables()
         self._ensure_content_history_tables()
         self._ensure_tracked_observations_table()
+        self._ensure_news_event_projection_tables()
         self._ensure_user_visual_clusters_table()
         self._ensure_auth_state_table()
         self._ensure_init_runs_table()
@@ -16849,6 +16977,721 @@ class Database:
             """
         )
 
+    def _ensure_news_event_projection_tables(self) -> None:
+        """Create the additive NewsClaw event, membership, and change projection."""
+
+        tracked_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(tracked_observations)").fetchall()
+        }
+        # Opening an already-upgraded database is a hot path: the desktop app,
+        # background workers, and tests may initialize several facades at once.
+        # Avoid taking SQLite's schema-write lock when the complete Phase 3
+        # contract and migration marker are already present.
+        if "event_id" in tracked_columns:
+            schema_objects = {
+                str(row["name"]): (
+                    str(row["type"] or ""),
+                    str(row["sql"] or ""),
+                )
+                for row in self.conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')"
+                ).fetchall()
+            }
+            required_tables = {
+                "news_events",
+                "news_event_aliases",
+                "news_event_changes",
+                "news_event_change_aliases",
+                "news_event_lineage_claims",
+                "news_event_memberships",
+                "news_event_backfill_state",
+            }
+            required_indexes = {
+                "idx_news_events_active_key",
+                "idx_news_events_origin_tracking",
+                "idx_news_events_status_change",
+                "idx_news_event_aliases_canonical",
+                "idx_news_event_changes_fingerprint",
+                "idx_news_event_changes_origin_evidence",
+                "idx_news_event_changes_default_feed",
+                "idx_news_event_changes_event_timeline",
+                "idx_news_event_changes_objective_feed",
+                "idx_news_event_change_aliases_canonical",
+                "idx_news_event_lineage_successor",
+                "idx_news_event_lineage_predecessor",
+                "idx_news_event_lineage_source_claim",
+                "idx_news_event_memberships_event_evidence",
+                "idx_news_event_memberships_change_evidence",
+                "idx_news_event_memberships_event_seen",
+                "idx_news_event_memberships_change",
+                "idx_news_event_memberships_event_origin",
+                "idx_tracked_observations_event",
+            }
+            has_schema_contract = all(
+                schema_objects.get(name, ("", ""))[0] == "table" for name in required_tables
+            ) and all(schema_objects.get(name, ("", ""))[0] == "index" for name in required_indexes)
+            if has_schema_contract:
+                change_columns = {
+                    str(row["name"])
+                    for row in self.conn.execute("PRAGMA table_info(news_event_changes)").fetchall()
+                }
+                membership_columns = {
+                    str(row["name"])
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(news_event_memberships)"
+                    ).fetchall()
+                }
+                lineage_columns = {
+                    str(row["name"])
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(news_event_lineage_claims)"
+                    ).fetchall()
+                }
+                required_change_columns = {
+                    "role",
+                    "objectivity_status",
+                    "conflict_status",
+                    "is_objective_default",
+                    "supersedes_lifecycle",
+                    "effective_precision",
+                    "fingerprint_version",
+                }
+                required_membership_columns = {
+                    "evidence_completeness",
+                    "origin_tracking_id",
+                    "origin_candidate_record_id",
+                    "origin_evidence_id",
+                }
+                required_lineage_columns = {
+                    "claim_id",
+                    "event_id",
+                    "successor_change_id",
+                    "predecessor_change_id",
+                    "supersedes_lifecycle",
+                    "source_event_id",
+                    "source_change_id",
+                    "status",
+                    "created_at",
+                    "updated_at",
+                }
+                evidence_index_sql = schema_objects["idx_news_event_memberships_event_evidence"][
+                    1
+                ].lower()
+                origin_index_sql = schema_objects["idx_news_event_memberships_event_origin"][
+                    1
+                ].lower()
+                fact_gate_state = self.conn.execute(
+                    "SELECT completed FROM news_event_backfill_state WHERE contract_version = ?",
+                    (_NEWS_EVENT_FACT_GATE_MIGRATION_VERSION,),
+                ).fetchone()
+                lineage_ledger_state = self.conn.execute(
+                    "SELECT completed FROM news_event_backfill_state WHERE contract_version = ?",
+                    (_NEWS_EVENT_LINEAGE_LEDGER_VERSION,),
+                ).fetchone()
+                missing_lineage_claim = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM news_event_changes successor
+                    JOIN news_event_changes predecessor
+                      ON predecessor.change_id = successor.supersedes_change_id
+                     AND predecessor.event_id = successor.event_id
+                    WHERE successor.supersedes_change_id IS NOT NULL
+                      AND successor.supersedes_change_id != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM news_event_lineage_claims claim
+                          WHERE claim.successor_change_id = successor.change_id
+                            AND claim.predecessor_change_id = predecessor.change_id
+                            AND claim.supersedes_lifecycle =
+                                successor.supersedes_lifecycle
+                            AND claim.status != 'rejected'
+                      )
+                    LIMIT 1
+                    """
+                ).fetchone()
+                unreconciled_lineage_conflict = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM news_event_lineage_claims claim
+                    JOIN news_event_changes successor
+                      ON successor.change_id = claim.successor_change_id
+                    WHERE claim.status != 'rejected'
+                    GROUP BY claim.successor_change_id
+                    HAVING COUNT(DISTINCT (
+                        claim.predecessor_change_id || char(31) ||
+                        claim.supersedes_lifecycle
+                    )) > 1
+                       AND MAX(successor.conflict_status) != 'contested'
+                    LIMIT 1
+                    """
+                ).fetchone()
+                unsafe_lineage_endpoint = (
+                    self.conn.execute(
+                        """
+                        SELECT 1
+                        FROM news_event_lineage_claims claim
+                        LEFT JOIN news_event_changes successor
+                          ON successor.change_id = claim.successor_change_id
+                        LEFT JOIN news_event_changes predecessor
+                          ON predecessor.change_id = claim.predecessor_change_id
+                        WHERE claim.status IN ('active', 'resolved')
+                          AND (
+                              successor.change_id IS NULL
+                              OR predecessor.change_id IS NULL
+                              OR claim.event_id != successor.event_id
+                              OR claim.event_id != predecessor.event_id
+                          )
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if "event_id" in lineage_columns
+                    else True
+                )
+                stale_change_identity = (
+                    self.conn.execute(
+                        "SELECT 1 FROM news_event_changes WHERE fingerprint_version != ? LIMIT 1",
+                        (_NEWS_EVENT_CHANGE_FINGERPRINT_VERSION,),
+                    ).fetchone()
+                    if "fingerprint_version" in change_columns
+                    else None
+                )
+                if (
+                    required_change_columns <= change_columns
+                    and required_membership_columns <= membership_columns
+                    and required_lineage_columns <= lineage_columns
+                    and "relation_kind != 'origin'" in evidence_index_sql
+                    and "origin_tracking_id" in origin_index_sql
+                    and "relation_kind = 'origin'" in origin_index_sql
+                    and fact_gate_state is not None
+                    and bool(int(fact_gate_state["completed"] or 0))
+                    and lineage_ledger_state is not None
+                    and bool(int(lineage_ledger_state["completed"] or 0))
+                    and missing_lineage_claim is None
+                    and unreconciled_lineage_conflict is None
+                    and unsafe_lineage_endpoint is None
+                    and stale_change_identity is None
+                ):
+                    return
+        if "event_id" not in tracked_columns:
+            # SQLite cannot add a foreign-key constraint with this compatibility
+            # ALTER.  Every writer below validates the referenced event inside
+            # the same BEGIN IMMEDIATE transaction instead.
+            self.conn.execute("ALTER TABLE tracked_observations ADD COLUMN event_id TEXT")
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS news_events (
+                event_id             TEXT PRIMARY KEY,
+                event_key            TEXT NOT NULL DEFAULT '',
+                event_key_version    TEXT NOT NULL DEFAULT 'news-event-key-v2',
+                canonical_title      TEXT NOT NULL,
+                event_type           TEXT NOT NULL DEFAULT 'unknown',
+                topic_group          TEXT NOT NULL DEFAULT '',
+                story_key            TEXT NOT NULL DEFAULT '',
+                entities_json        TEXT NOT NULL DEFAULT '[]',
+                current_state        TEXT NOT NULL DEFAULT '',
+                state_version        INTEGER NOT NULL DEFAULT 0,
+                status               TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'resolved', 'merged', 'archived')),
+                merged_into_event_id TEXT,
+                origin_tracking_id   TEXT NOT NULL DEFAULT '',
+                first_seen_at        TEXT NOT NULL DEFAULT '',
+                last_seen_at         TEXT NOT NULL DEFAULT '',
+                last_change_at       TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merged_into_event_id) REFERENCES news_events(event_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_events_active_key
+                ON news_events(event_key)
+                WHERE event_key != '' AND status != 'merged';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_events_origin_tracking
+                ON news_events(origin_tracking_id)
+                WHERE origin_tracking_id != '';
+            CREATE INDEX IF NOT EXISTS idx_news_events_status_change
+                ON news_events(status, last_change_at DESC, event_id DESC);
+
+            CREATE TABLE IF NOT EXISTS news_event_aliases (
+                alias_event_key       TEXT PRIMARY KEY,
+                canonical_event_id    TEXT NOT NULL,
+                source_event_id       TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (canonical_event_id) REFERENCES news_events(event_id),
+                FOREIGN KEY (source_event_id) REFERENCES news_events(event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_news_event_aliases_canonical
+                ON news_event_aliases(canonical_event_id, alias_event_key);
+
+            CREATE TABLE IF NOT EXISTS news_event_changes (
+                change_id            TEXT PRIMARY KEY,
+                event_id             TEXT NOT NULL,
+                change_fingerprint   TEXT NOT NULL,
+                fingerprint_version  TEXT NOT NULL DEFAULT 'news-event-change-v3',
+                change_type          TEXT NOT NULL,
+                previous_state       TEXT NOT NULL,
+                new_state            TEXT NOT NULL,
+                fact                 TEXT NOT NULL DEFAULT '',
+                inference            TEXT NOT NULL DEFAULT '',
+                summary              TEXT NOT NULL DEFAULT '',
+                evidence_quote       TEXT NOT NULL DEFAULT '',
+                confidence           REAL NOT NULL DEFAULT 0.0,
+                role                 TEXT NOT NULL DEFAULT 'analysis'
+                    CHECK (role IN (
+                        'objective_change', 'expectation', 'sentiment', 'analysis'
+                    )),
+                objectivity_status   TEXT NOT NULL DEFAULT 'unconfirmed'
+                    CHECK (objectivity_status IN (
+                        'confirmed', 'unconfirmed', 'disputed', 'not_applicable'
+                    )),
+                conflict_status      TEXT NOT NULL DEFAULT 'none'
+                    CHECK (conflict_status IN ('none', 'contested', 'resolved')),
+                source_scope         TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (source_scope IN ('unknown', 'single_source', 'multi_source')),
+                evidence_status      TEXT NOT NULL DEFAULT 'provisional'
+                    CHECK (evidence_status IN (
+                        'provisional', 'source_supported',
+                        'cross_source_supported', 'contested'
+                    )),
+                lifecycle            TEXT NOT NULL DEFAULT 'active'
+                    CHECK (lifecycle IN ('active', 'superseded', 'invalidated')),
+                is_objective_default INTEGER NOT NULL DEFAULT 0
+                    CHECK (is_objective_default IN (0, 1)),
+                supersedes_change_id TEXT,
+                supersedes_lifecycle TEXT NOT NULL DEFAULT 'superseded'
+                    CHECK (supersedes_lifecycle IN ('superseded', 'invalidated')),
+                is_read              INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+                origin_check_id      TEXT NOT NULL DEFAULT '',
+                origin_evidence_id   TEXT NOT NULL DEFAULT '',
+                effective_at         TEXT NOT NULL DEFAULT '',
+                effective_precision  TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (effective_precision IN ('unknown', 'date', 'minute')),
+                detected_at          TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (event_id) REFERENCES news_events(event_id),
+                FOREIGN KEY (supersedes_change_id) REFERENCES news_event_changes(change_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_event_changes_fingerprint
+                ON news_event_changes(event_id, change_fingerprint);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_event_changes_origin_evidence
+                ON news_event_changes(origin_evidence_id)
+                WHERE origin_evidence_id != '';
+            CREATE INDEX IF NOT EXISTS idx_news_event_changes_default_feed
+                ON news_event_changes(
+                    lifecycle, is_read, detected_at DESC, change_id DESC
+                );
+            CREATE INDEX IF NOT EXISTS idx_news_event_changes_event_timeline
+                ON news_event_changes(event_id, detected_at DESC, change_id DESC);
+
+            CREATE TABLE IF NOT EXISTS news_event_change_aliases (
+                alias_change_id       TEXT PRIMARY KEY,
+                canonical_change_id   TEXT NOT NULL,
+                source_event_id       TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (canonical_change_id) REFERENCES news_event_changes(change_id),
+                FOREIGN KEY (source_event_id) REFERENCES news_events(event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_news_event_change_aliases_canonical
+                ON news_event_change_aliases(canonical_change_id, alias_change_id);
+
+            CREATE TABLE IF NOT EXISTS news_event_lineage_claims (
+                claim_id                TEXT PRIMARY KEY,
+                event_id                TEXT NOT NULL,
+                successor_change_id     TEXT NOT NULL,
+                predecessor_change_id   TEXT NOT NULL,
+                supersedes_lifecycle    TEXT NOT NULL DEFAULT 'superseded'
+                    CHECK (supersedes_lifecycle IN ('superseded', 'invalidated')),
+                source_event_id         TEXT NOT NULL DEFAULT '',
+                source_change_id        TEXT NOT NULL DEFAULT '',
+                status                  TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'contested', 'resolved', 'rejected')),
+                created_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_news_event_lineage_successor
+                ON news_event_lineage_claims(
+                    successor_change_id, status, created_at, claim_id
+                );
+            CREATE INDEX IF NOT EXISTS idx_news_event_lineage_predecessor
+                ON news_event_lineage_claims(
+                    predecessor_change_id, status, created_at, claim_id
+                );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_event_lineage_source_claim
+                ON news_event_lineage_claims(
+                    source_event_id, source_change_id,
+                    predecessor_change_id, supersedes_lifecycle
+                );
+
+            CREATE TABLE IF NOT EXISTS news_event_memberships (
+                membership_id             TEXT PRIMARY KEY,
+                event_id                  TEXT NOT NULL,
+                change_id                 TEXT,
+                evidence_item_key         TEXT NOT NULL,
+                evidence_fingerprint      TEXT NOT NULL,
+                relation_kind             TEXT NOT NULL
+                    CHECK (relation_kind IN (
+                        'origin', 'supports_change',
+                        'related_no_change', 'contradicts_change'
+                    )),
+                relation_basis            TEXT NOT NULL DEFAULT '',
+                relation_score            REAL NOT NULL DEFAULT 0.0,
+                content_scope             TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (content_scope IN (
+                        'unknown', 'title_only', 'summary', 'full_text'
+                    )),
+                media                     TEXT NOT NULL DEFAULT '',
+                provider                  TEXT NOT NULL DEFAULT '',
+                title                     TEXT NOT NULL DEFAULT '',
+                canonical_url             TEXT NOT NULL DEFAULT '',
+                published_at              TEXT NOT NULL DEFAULT '',
+                retrieved_at              TEXT NOT NULL DEFAULT '',
+                evidence_snapshot         TEXT NOT NULL DEFAULT '{}',
+                evidence_completeness     TEXT NOT NULL DEFAULT 'complete'
+                    CHECK (evidence_completeness IN ('complete', 'partial_legacy')),
+                origin_tracking_id        TEXT NOT NULL DEFAULT '',
+                origin_check_id           TEXT NOT NULL DEFAULT '',
+                origin_candidate_record_id TEXT NOT NULL DEFAULT '',
+                origin_evidence_id        TEXT NOT NULL DEFAULT '',
+                first_seen_at             TEXT NOT NULL DEFAULT '',
+                last_seen_at              TEXT NOT NULL DEFAULT '',
+                created_at                TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at                TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (event_id) REFERENCES news_events(event_id),
+                FOREIGN KEY (change_id) REFERENCES news_event_changes(change_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_event_memberships_event_evidence
+                ON news_event_memberships(
+                    event_id, evidence_item_key, evidence_fingerprint, relation_kind
+                ) WHERE change_id IS NULL AND relation_kind != 'origin';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_event_memberships_change_evidence
+                ON news_event_memberships(
+                    event_id, change_id, evidence_item_key,
+                    evidence_fingerprint, relation_kind
+                ) WHERE change_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_news_event_memberships_event_seen
+                ON news_event_memberships(event_id, last_seen_at DESC, membership_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_news_event_memberships_change
+                ON news_event_memberships(change_id, membership_id);
+
+            CREATE TABLE IF NOT EXISTS news_event_backfill_state (
+                contract_version    TEXT PRIMARY KEY,
+                last_tracking_rowid INTEGER NOT NULL DEFAULT 0,
+                completed           INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+                completed_at        TEXT NOT NULL DEFAULT '',
+                updated_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT OR IGNORE INTO news_event_backfill_state (
+                contract_version, last_tracking_rowid
+            ) VALUES ('news-event-v1', 0);
+
+            CREATE INDEX IF NOT EXISTS idx_tracked_observations_event
+                ON tracked_observations(event_id, status, updated_at DESC, tracking_id);
+            """
+        )
+        lineage_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(news_event_lineage_claims)").fetchall()
+        }
+        # A short-lived pre-release ledger omitted the event owner while all
+        # endpoint/source columns and indexes were already present.  Repair it
+        # additively before the seed/backfill helper reads the column.
+        if "event_id" not in lineage_columns:
+            self.conn.execute(
+                "ALTER TABLE news_event_lineage_claims ADD COLUMN event_id TEXT NOT NULL DEFAULT ''"
+            )
+            self.conn.execute(
+                """
+                UPDATE news_event_lineage_claims
+                SET event_id = COALESCE((
+                    SELECT event_id FROM news_event_changes
+                    WHERE change_id = successor_change_id
+                ), '')
+                WHERE event_id = ''
+                """
+            )
+        change_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(news_event_changes)").fetchall()
+        }
+        additive_change_columns = {
+            "fingerprint_version": ("TEXT NOT NULL DEFAULT 'news-event-change-v3'"),
+            "role": "TEXT NOT NULL DEFAULT 'analysis'",
+            "objectivity_status": "TEXT NOT NULL DEFAULT 'unconfirmed'",
+            "conflict_status": "TEXT NOT NULL DEFAULT 'none'",
+            "is_objective_default": "INTEGER NOT NULL DEFAULT 0",
+            "supersedes_lifecycle": "TEXT NOT NULL DEFAULT 'superseded'",
+            "effective_precision": "TEXT NOT NULL DEFAULT 'unknown'",
+        }
+        added_fingerprint_version = "fingerprint_version" not in change_columns
+        for column, declaration in additive_change_columns.items():
+            if column not in change_columns:
+                self.conn.execute(
+                    f"ALTER TABLE news_event_changes ADD COLUMN {column} {declaration}"
+                )
+        if added_fingerprint_version:
+            # Existing rows predate an explicit identity contract.  Mark them
+            # stale once so the v3 migration re-keys and folds them; the column
+            # default remains v3 for any future writer that omits the field.
+            self.conn.execute(
+                "UPDATE news_event_changes SET fingerprint_version = 'news-event-change-v2'"
+            )
+        membership_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(news_event_memberships)").fetchall()
+        }
+        origin_index = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_news_event_memberships_event_origin'"
+        ).fetchone()
+        origin_index_sql = str(origin_index["sql"] or "") if origin_index else ""
+        evidence_index = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_news_event_memberships_event_evidence'"
+        ).fetchone()
+        evidence_index_sql = str(evidence_index["sql"] or "") if evidence_index else ""
+        repair_origin_index = (
+            "origin_tracking_id" not in membership_columns
+            or "origin_tracking_id" not in origin_index_sql
+            or "relation_kind = 'origin'" not in origin_index_sql
+        )
+        repair_evidence_index = "relation_kind != 'origin'" not in evidence_index_sql
+        additive_membership_columns = {
+            # Unknown evidence retained by a pre-release projection is not
+            # silently promoted during migration.
+            "evidence_completeness": "TEXT NOT NULL DEFAULT 'partial_legacy'",
+            "origin_tracking_id": "TEXT NOT NULL DEFAULT ''",
+            "origin_candidate_record_id": "TEXT NOT NULL DEFAULT ''",
+            "origin_evidence_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, declaration in additive_membership_columns.items():
+            if column not in membership_columns:
+                self.conn.execute(
+                    f"ALTER TABLE news_event_memberships ADD COLUMN {column} {declaration}"
+                )
+        # A pre-release Phase 3 snapshot used an origin index that collapsed
+        # two trackers when they began from the same article.  Add the new
+        # lineage column before any index references it, then recreate both
+        # partial indexes with disjoint origin/non-origin contracts.
+        if repair_evidence_index:
+            self.conn.execute("DROP INDEX IF EXISTS idx_news_event_memberships_event_evidence")
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX idx_news_event_memberships_event_evidence
+                ON news_event_memberships(
+                    event_id, evidence_item_key, evidence_fingerprint, relation_kind
+                ) WHERE change_id IS NULL AND relation_kind != 'origin'
+                """
+            )
+        if repair_origin_index:
+            self.conn.execute("DROP INDEX IF EXISTS idx_news_event_memberships_event_origin")
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX idx_news_event_memberships_event_origin
+                ON news_event_memberships(
+                    event_id, origin_tracking_id, evidence_item_key, evidence_fingerprint
+                ) WHERE change_id IS NULL AND relation_kind = 'origin'
+                """
+            )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_event_changes_objective_feed
+            ON news_event_changes(
+                is_objective_default, lifecycle, is_read,
+                detected_at DESC, change_id DESC
+            )
+            """
+        )
+        fact_gate_state = self.conn.execute(
+            "SELECT completed FROM news_event_backfill_state WHERE contract_version = ?",
+            (_NEWS_EVENT_FACT_GATE_MIGRATION_VERSION,),
+        ).fetchone()
+        repair_fact_gate = fact_gate_state is None or not bool(
+            int(fact_gate_state["completed"] or 0)
+        )
+        stale_change_identity = self.conn.execute(
+            "SELECT 1 FROM news_event_changes WHERE fingerprint_version != ? LIMIT 1",
+            (_NEWS_EVENT_CHANGE_FINGERPRINT_VERSION,),
+        ).fetchone()
+        # A stale identity can be introduced after the fact-gate marker was
+        # completed (for example by opening the database with a pre-release
+        # writer).  Folding it changes classification and memberships, so it
+        # must trigger the same evidence/default/conflict/state reprojection,
+        # not only the key rewrite.
+        repair_fact_gate = repair_fact_gate or stale_change_identity is not None
+        if repair_fact_gate:
+            # Capture every pre-migration pointer before v3 identity folding can
+            # delete a duplicate successor.  Its immutable source ids are the
+            # only way to retain two genuinely different predecessor claims
+            # that happened to collapse onto one canonical successor.
+            self._seed_news_event_lineage_claims_from_pointers_on(self.conn)
+            self._migrate_news_event_change_identity_on(self.conn)
+            # Conflict is a durable three-field invariant.  Any legacy row that
+            # expressed one side of it is safer as a visible contested item than
+            # as an invisible secondary record.
+            self.conn.execute(
+                """
+                UPDATE news_event_changes
+                SET objectivity_status = 'disputed',
+                    conflict_status = 'contested',
+                    evidence_status = 'contested',
+                    is_objective_default = 0,
+                    is_read = CASE WHEN lifecycle = 'active' THEN 0 ELSE 1 END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE objectivity_status = 'disputed'
+                   OR conflict_status = 'contested'
+                   OR evidence_status = 'contested'
+                """
+            )
+            memberships = self.conn.execute(
+                """
+                SELECT membership_id, content_scope, evidence_snapshot, title
+                FROM news_event_memberships
+                """
+            ).fetchall()
+            for membership in memberships:
+                verified_scope = self._news_event_verified_content_scope(
+                    membership["content_scope"],
+                    membership["evidence_snapshot"],
+                    membership["title"],
+                )
+                if verified_scope != str(membership["content_scope"] or "unknown"):
+                    self.conn.execute(
+                        "UPDATE news_event_memberships SET content_scope = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE membership_id = ?",
+                        (verified_scope, str(membership["membership_id"])),
+                    )
+            changes = self.conn.execute(
+                "SELECT change_id, is_read FROM news_event_changes ORDER BY created_at, change_id"
+            ).fetchall()
+            for change in changes:
+                change_id = str(change["change_id"])
+                legacy_is_read = int(change["is_read"] or 0)
+                self._recompute_news_event_change_evidence_on(self.conn, change_id)
+                refreshed, _ = self._refresh_news_event_change_default_on(self.conn, change_id)
+                is_active_conflict = (
+                    str(refreshed["conflict_status"] or "none") == "contested"
+                    and str(refreshed["lifecycle"] or "active") == "active"
+                )
+                self.conn.execute(
+                    "UPDATE news_event_changes SET is_read = ? WHERE change_id = ?",
+                    (
+                        0
+                        if is_active_conflict
+                        else legacy_is_read
+                        if bool(int(refreshed["is_objective_default"] or 0))
+                        else 1,
+                        change_id,
+                    ),
+                )
+            for change in changes:
+                self._contest_divergent_news_event_changes_on(
+                    self.conn,
+                    str(change["change_id"]),
+                )
+            events = self.conn.execute(
+                "SELECT event_id, event_type, state_version FROM news_events"
+            ).fetchall()
+            for event in events:
+                event_id = str(event["event_id"])
+                has_default = self.conn.execute(
+                    "SELECT 1 FROM news_event_changes "
+                    "WHERE event_id = ? AND is_objective_default = 1 LIMIT 1",
+                    (event_id,),
+                ).fetchone()
+                if (
+                    has_default is None
+                    and str(event["event_type"] or "") == "tracked_observation"
+                    and int(event["state_version"] or 0) == 0
+                ):
+                    self.conn.execute(
+                        "UPDATE news_events SET current_state = '' WHERE event_id = ?",
+                        (event_id,),
+                    )
+                self._recompute_news_event_state_on(self.conn, event_id)
+            self.conn.execute(
+                """
+                INSERT INTO news_event_backfill_state (
+                    contract_version, last_tracking_rowid, completed, completed_at
+                ) VALUES (?, 0, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(contract_version) DO UPDATE SET
+                    completed = 1,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (_NEWS_EVENT_FACT_GATE_MIGRATION_VERSION,),
+            )
+        # The claim ledger was added after the first Phase 3 projection build.
+        # Seed every still-addressable canonical pointer exactly once so an
+        # upgraded database gains the same audit and resolution semantics as a
+        # newly created one.
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO news_event_backfill_state (
+                contract_version, last_tracking_rowid, completed, completed_at
+            ) VALUES (?, 0, 0, '')
+            """,
+            (_NEWS_EVENT_LINEAGE_LEDGER_VERSION,),
+        )
+        self._seed_news_event_lineage_claims_from_pointers_on(self.conn)
+        lineage_successors = self.conn.execute(
+            """
+            SELECT successor_change_id
+            FROM news_event_lineage_claims
+            WHERE status != 'rejected'
+            UNION
+            SELECT change_id AS successor_change_id
+            FROM news_event_changes
+            WHERE supersedes_change_id IS NOT NULL
+              AND supersedes_change_id != ''
+            ORDER BY successor_change_id
+            """
+        ).fetchall()
+        normalized_lineage_events: set[str] = set()
+        for lineage_successor in lineage_successors:
+            successor_id = str(lineage_successor["successor_change_id"])
+            successor = self.conn.execute(
+                "SELECT event_id FROM news_event_changes WHERE change_id = ?",
+                (successor_id,),
+            ).fetchone()
+            if successor is not None:
+                normalized_lineage_events.add(str(successor["event_id"] or ""))
+            self._normalize_news_event_lineage_claims_on(
+                self.conn,
+                successor_id,
+            )
+        for normalized_lineage_event_id in sorted(normalized_lineage_events):
+            if normalized_lineage_event_id:
+                self._recompute_news_event_state_on(
+                    self.conn,
+                    normalized_lineage_event_id,
+                )
+        self.conn.execute(
+            """
+            INSERT INTO news_event_backfill_state (
+                contract_version, last_tracking_rowid, completed, completed_at
+            ) VALUES (?, 0, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(contract_version) DO UPDATE SET
+                completed = 1,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (_NEWS_EVENT_LINEAGE_LEDGER_VERSION,),
+        )
+        if repair_origin_index:
+            self.conn.execute(
+                """
+                INSERT INTO news_event_backfill_state (
+                    contract_version, last_tracking_rowid, completed, completed_at
+                ) VALUES (?, 0, 0, '')
+                ON CONFLICT(contract_version) DO UPDATE SET
+                    completed = 0,
+                    completed_at = '',
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (_NEWS_EVENT_ORIGIN_REPAIR_VERSION,),
+            )
+
     @staticmethod
     def _tracked_observation_dict(row: Mapping[str, Any]) -> dict[str, Any]:
         item = dict(row)
@@ -16980,6 +17823,13 @@ class Database:
                 )
                 if not same_payload:
                     raise ValueError("request_id was already used for a different observation")
+                self._ensure_tracked_observation_event_on(conn, existing)
+                existing = conn.execute(
+                    "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                    (str(existing["tracking_id"]),),
+                ).fetchone()
+                if existing is None:  # pragma: no cover
+                    raise RuntimeError("tracked observation disappeared during event bind")
                 conn.commit()
                 return self._tracked_observation_dict(existing), False
 
@@ -16993,6 +17843,13 @@ class Database:
                 (normalized_item_key, observation_key),
             ).fetchone()
             if matching_active is not None:
+                self._ensure_tracked_observation_event_on(conn, matching_active)
+                matching_active = conn.execute(
+                    "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                    (str(matching_active["tracking_id"]),),
+                ).fetchone()
+                if matching_active is None:  # pragma: no cover
+                    raise RuntimeError("tracked observation disappeared during event bind")
                 conn.commit()
                 return self._tracked_observation_dict(matching_active), False
 
@@ -17018,6 +17875,17 @@ class Database:
                     snapshot_json,
                     normalized_interval,
                 ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                (tracking_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise RuntimeError("tracked observation disappeared before event bind")
+            self._ensure_tracked_observation_event_on(
+                conn,
+                row,
+                origin_completeness="complete",
             )
             row = conn.execute(
                 "SELECT * FROM tracked_observations WHERE tracking_id = ?",
@@ -17312,8 +18180,10 @@ class Database:
             "corroborating_sources": [
                 {
                     "source": str(item.get("source") or item.get("media") or "")[:200],
+                    "provider": str(item.get("provider") or "")[:200],
                     "url": str(item.get("url") or item.get("content_url") or "")[:2_048],
                     "published_at": str(item.get("published_at") or "")[:120],
+                    "content_scope": str(item.get("content_scope") or "unknown")[:40],
                 }
                 for item in sources[:5]
                 if isinstance(item, Mapping)
@@ -17338,6 +18208,8 @@ class Database:
         normalized_outcome = str(outcome or "").strip().lower()
         if normalized_outcome not in {"changed", "unchanged", "valid_empty"}:
             raise ValueError("unsupported tracking check outcome")
+        if normalized_outcome != "changed" and changes:
+            raise ValueError("only a changed check may append change evidence")
         conn = self.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -17379,8 +18251,11 @@ class Database:
                     raise RuntimeError("cancelled tracking result disappeared")
                 return self._tracked_check_dict(check_row), item
 
+            event, _ = self._ensure_tracked_observation_event_on(conn, tracker)
+            event_id = str(event["event_id"])
             inserted = 0
             newest_summary = ""
+            candidate_record_by_identity: dict[tuple[str, str], str] = {}
             decision_by_key = {
                 str(decision.get("evidence_item_key") or "").strip(): str(
                     decision.get("decision") or ""
@@ -17399,7 +18274,8 @@ class Database:
                     or decision not in {"changed", "related_no_change", "irrelevant"}
                 ):
                     continue
-                conn.execute(
+                candidate_record_id = str(uuid4())
+                candidate_cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO tracked_observation_candidates (
                         candidate_record_id, check_id, tracking_id,
@@ -17408,7 +18284,7 @@ class Database:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        str(uuid4()),
+                        candidate_record_id,
                         str(check_id or "").strip(),
                         str(tracking_id or "").strip(),
                         evidence_item_key,
@@ -17420,6 +18296,57 @@ class Database:
                         str(completed_at or "").strip(),
                     ),
                 )
+                if int(candidate_cursor.rowcount or 0) == 0:
+                    existing_candidate = conn.execute(
+                        """
+                        SELECT candidate_record_id
+                        FROM tracked_observation_candidates
+                        WHERE tracking_id = ? AND evidence_item_key = ?
+                          AND evidence_fingerprint = ?
+                        """,
+                        (
+                            str(tracking_id or "").strip(),
+                            evidence_item_key,
+                            evidence_fingerprint,
+                        ),
+                    ).fetchone()
+                    if existing_candidate is not None:
+                        candidate_record_id = str(existing_candidate["candidate_record_id"])
+                candidate_record_by_identity[(evidence_item_key, evidence_fingerprint)] = (
+                    candidate_record_id
+                )
+                if decision == "related_no_change":
+                    if normalized_outcome == "valid_empty":
+                        raise ValueError("valid_empty checks cannot contain related evidence")
+                    self._upsert_news_event_membership_on(
+                        conn,
+                        event_id=event_id,
+                        evidence_item_key=evidence_item_key,
+                        evidence_fingerprint=evidence_fingerprint,
+                        relation_kind="related_no_change",
+                        relation_basis=str(candidate.get("match_basis") or ""),
+                        relation_score=float(candidate.get("match_score") or 0.0),
+                        content_scope=str(candidate.get("content_scope") or "title_only"),
+                        media=str(
+                            candidate.get("media")
+                            or candidate.get("source")
+                            or candidate.get("up_name")
+                            or ""
+                        ),
+                        provider=str(candidate.get("provider") or ""),
+                        title=str(candidate.get("title") or ""),
+                        canonical_url=str(
+                            candidate.get("canonical_url") or candidate.get("content_url") or ""
+                        ),
+                        published_at=str(candidate.get("published_at") or ""),
+                        retrieved_at=str(completed_at or "").strip(),
+                        evidence_snapshot=candidate,
+                        origin_tracking_id=str(tracking_id or "").strip(),
+                        origin_check_id=str(check_id or "").strip(),
+                        origin_candidate_record_id=candidate_record_id,
+                        first_seen_at=str(completed_at or "").strip(),
+                        last_seen_at=str(completed_at or "").strip(),
+                    )
             for raw_change in changes:
                 change = dict(raw_change)
                 evidence_item_key = str(change.get("item_key") or "").strip()
@@ -17467,6 +18394,64 @@ class Database:
                 if int(cursor.rowcount or 0) > 0:
                     inserted += 1
                     newest_summary = newest_summary or str(change.get("summary") or "").strip()
+                else:
+                    existing_evidence = conn.execute(
+                        """
+                        SELECT evidence_id FROM tracked_observation_evidence
+                        WHERE tracking_id = ? AND (
+                            change_fingerprint = ? OR (
+                                evidence_item_key = ? AND evidence_fingerprint = ?
+                            )
+                        )
+                        ORDER BY detected_at, evidence_id LIMIT 1
+                        """,
+                        (
+                            str(tracking_id or "").strip(),
+                            change_fingerprint,
+                            evidence_item_key,
+                            evidence_fingerprint,
+                        ),
+                    ).fetchone()
+                    evidence_id = (
+                        str(existing_evidence["evidence_id"])
+                        if existing_evidence is not None
+                        else ""
+                    )
+                corroborating_sources = change.get("corroborating_sources")
+                has_corroboration = bool(
+                    isinstance(corroborating_sources, list) and corroborating_sources
+                )
+                primary_scope = str(change.get("content_scope") or "title_only").strip().lower()
+                projected_change = dict(change)
+                projected_change.update(
+                    {
+                        "source_scope": str(
+                            change.get("source_scope")
+                            or ("multi_source" if has_corroboration else "single_source")
+                        ),
+                        "evidence_status": str(
+                            change.get("evidence_status")
+                            or (
+                                "source_supported"
+                                if primary_scope in {"summary", "full_text"}
+                                else "provisional"
+                            )
+                        ),
+                        "origin_tracking_id": str(tracking_id or "").strip(),
+                        "origin_check_id": str(check_id or "").strip(),
+                        "origin_evidence_id": evidence_id,
+                        "origin_candidate_record_id": candidate_record_by_identity.get(
+                            (evidence_item_key, evidence_fingerprint), ""
+                        ),
+                    }
+                )
+                self._upsert_news_event_change_on(
+                    conn,
+                    event_id=event_id,
+                    change=projected_change,
+                    check_id=str(check_id or "").strip(),
+                    detected_at=str(completed_at or "").strip(),
+                )
 
             final_status = (
                 "changed"
@@ -17837,6 +18822,4694 @@ class Database:
             original_snapshot=cast("Mapping[str, Any]", previous.get("original_snapshot") or {}),
             check_interval_minutes=int(previous.get("check_interval_minutes") or 1440),
         )
+
+    @staticmethod
+    def _normalize_news_event_effective_at(value: object) -> str:
+        normalized = " ".join(str(value or "").split()).strip()[:120]
+        if not normalized:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            try:
+                datetime.fromisoformat(normalized)
+            except ValueError:
+                return ""
+            return normalized
+        try:
+            parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        if parsed.tzinfo is None:
+            return ""
+        return parsed.astimezone(UTC).isoformat(timespec="seconds")
+
+    @classmethod
+    def _news_event_effective_has_started(
+        cls,
+        effective_at: object,
+        detected_at: object,
+    ) -> bool:
+        normalized_effective = cls._normalize_news_event_effective_at(effective_at)
+        if not normalized_effective:
+            return False
+        now = datetime.now(UTC)
+        reference = now
+        normalized_detected = " ".join(str(detected_at or "").split()).strip()[:120]
+        if normalized_detected:
+            try:
+                parsed_reference = datetime.fromisoformat(
+                    normalized_detected.replace("Z", "+00:00")
+                )
+            except ValueError:
+                parsed_reference = None
+            if parsed_reference is not None and parsed_reference.tzinfo is not None:
+                # The durable fact gate is bounded by both confirmation time
+                # and the real clock.  A future-dated import cannot promote a
+                # not-yet-effective state into the objective feed.
+                reference = min(parsed_reference.astimezone(UTC), now)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized_effective):
+            return (
+                datetime.fromisoformat(normalized_effective).date()
+                <= reference.astimezone(_NEWS_EVENT_DATE_TIMEZONE).date()
+            )
+        parsed_effective = datetime.fromisoformat(normalized_effective)
+        return parsed_effective.astimezone(UTC) <= reference
+
+    @classmethod
+    def _news_event_effective_bucket(
+        cls,
+        value: object,
+        precision: object = "",
+    ) -> str:
+        raw_value = " ".join(str(value or "").split()).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_value):
+            return raw_value
+        normalized = cls._normalize_news_event_effective_at(value)
+        if not normalized:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
+        parsed_raw = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        normalized_precision = str(precision or "").strip().lower()
+        if normalized_precision == "date":
+            # Timestamp-to-date folding is explicit.  Guessing from local
+            # midnight would break equivalence with the same instant written
+            # in another timezone.
+            return parsed_raw.date().isoformat()
+        parsed = parsed_raw.astimezone(UTC)
+        # Exact dates stay date-level.  Precise timestamps retain minute-level
+        # identity so two genuinely separate intraday transitions are not
+        # silently collapsed, while equivalent timezone spellings still dedupe.
+        return parsed.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+
+    @classmethod
+    def _news_event_effective_sort_key(
+        cls,
+        value: object,
+        precision: object = "",
+    ) -> datetime:
+        """Compare date and minute facts on one absolute business-time axis."""
+
+        raw_value = " ".join(str(value or "").split()).strip()
+        normalized_precision = str(precision or "").strip().lower()
+        if normalized_precision == "date" or re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_value):
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_value):
+                local_date = datetime.fromisoformat(raw_value).date()
+            else:
+                parsed_raw = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+                local_date = parsed_raw.date()
+            return datetime.combine(
+                local_date,
+                datetime.min.time(),
+                tzinfo=_NEWS_EVENT_DATE_TIMEZONE,
+            ).astimezone(UTC)
+        normalized = cls._normalize_news_event_effective_at(raw_value)
+        if not normalized or re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return datetime.min.replace(tzinfo=UTC)
+        return datetime.fromisoformat(normalized).astimezone(UTC)
+
+    @staticmethod
+    def _news_event_change_type_family(value: object) -> str:
+        """Normalize producer labels without erasing meaningful dimensions."""
+
+        normalized = unicodedata.normalize(
+            "NFKC", " ".join(str(value or "").split()).strip()
+        ).casefold()
+        generic_transition_labels = {
+            "change",
+            "confirmation",
+            "confirmed",
+            "fact",
+            "new_fact",
+            "progress",
+            "state_change",
+            "status_change",
+            "update",
+            "变化",
+            "事实确认",
+            "新事实",
+            "进展",
+            "状态变化",
+        }
+        return "state_transition" if normalized in generic_transition_labels else normalized
+
+    @staticmethod
+    def _news_event_state_semantic_signature(value: object) -> tuple[str, str]:
+        """Return a conservative state family and its remaining event detail."""
+
+        normalized = unicodedata.normalize(
+            "NFKC",
+            " ".join(str(value or "").split()).strip(),
+        ).casefold()
+        compact = re.sub(r"[^0-9a-z\u3400-\u4dbf\u4e00-\u9fff]+", "", normalized)
+        if not compact:
+            return "", ""
+        polarity_markers: tuple[tuple[str, tuple[str, ...]], ...] = (
+            (
+                "stopped",
+                (
+                    "不再",
+                    "停止",
+                    "终止",
+                    "取消",
+                    "暂停",
+                    "暂缓",
+                    "撤回",
+                    "废止",
+                    "叫停",
+                ),
+            ),
+            (
+                "negative",
+                (
+                    "尚不具备",
+                    "不具备",
+                    "尚不能",
+                    "尚无法",
+                    "尚未能",
+                    "未能",
+                    "不能",
+                    "无法",
+                    "禁止",
+                    "拒绝",
+                    "否决",
+                    "不予",
+                    "暂不",
+                    "不得",
+                ),
+            ),
+            ("pending", ("尚未", "仍未", "还未", "暂未", "没有", "尚无", "未", "待")),
+        )
+        state_families: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("cancelled", ("正式废止", "已经废止", "已废止", "废止", "取消", "终止", "撤回")),
+            ("paused", ("暂停执行", "暂停实施", "暂缓执行", "暂缓实施", "叫停", "暂停")),
+            ("completed", ("执行完成", "实施完成", "已经完成", "已完成", "完成")),
+            ("approved", ("审批通过", "获得批准", "已经批准", "已批准", "获批", "批准")),
+            ("published", ("正式发布", "已经发布", "已发布", "发布", "公布", "印发", "出台")),
+            (
+                "effective",
+                (
+                    "开始执行",
+                    "正式执行",
+                    "已经执行",
+                    "已执行",
+                    "启动执行",
+                    "开始实施",
+                    "正式实施",
+                    "已经实施",
+                    "已实施",
+                    "启动实施",
+                    "正式生效",
+                    "已经生效",
+                    "已生效",
+                    "生效",
+                    "施行",
+                    "落地",
+                    "执行",
+                    "实施",
+                ),
+            ),
+            ("increased", ("大幅上涨", "显著上涨", "上涨", "上升", "增加", "增长")),
+            ("decreased", ("大幅下跌", "显著下跌", "下跌", "下降", "减少", "下调")),
+        )
+        family = ""
+        aliases: tuple[str, ...] = ()
+        for candidate_family, candidate_aliases in state_families:
+            if any(alias in compact for alias in candidate_aliases):
+                family = candidate_family
+                aliases = candidate_aliases
+                break
+        if not family:
+            return "", compact
+
+        def phrase_spans(phrase: str) -> tuple[tuple[int, int], ...]:
+            spans: list[tuple[int, int]] = []
+            start = 0
+            while True:
+                index = compact.find(phrase, start)
+                if index < 0:
+                    break
+                spans.append((index, index + len(phrase)))
+                start = index + 1
+            return tuple(spans)
+
+        polarity_matches: dict[str, list[tuple[str, int, int]]] = {}
+        for candidate_polarity, markers in polarity_markers:
+            candidate_phrases = tuple(
+                f"{marker}{alias}" for marker in markers for alias in aliases
+            )
+            matches = [
+                (phrase, start, end)
+                for phrase in candidate_phrases
+                for start, end in phrase_spans(phrase)
+            ]
+            if matches:
+                polarity_matches[candidate_polarity] = matches
+
+        positive_markers = (
+            "目前已",
+            "当前已",
+            "已经",
+            "现已",
+            "正式",
+            "开始",
+            "启动",
+            "已",
+        )
+        positive_phrases = tuple(
+            f"{marker}{alias}" for marker in positive_markers for alias in aliases
+        )
+        nonpositive_spans = [
+            (start, end)
+            for matches in polarity_matches.values()
+            for _, start, end in matches
+        ]
+        decorated_positive_matches = [
+            (phrase, start, end)
+            for phrase in positive_phrases
+            for start, end in phrase_spans(phrase)
+            if not any(
+                nonpositive_start <= start and end <= nonpositive_end
+                for nonpositive_start, nonpositive_end in nonpositive_spans
+            )
+        ]
+        bare_positive_matches = [
+            (alias, start, end)
+            for alias in aliases
+            for start, end in phrase_spans(alias)
+            if not any(
+                nonpositive_start <= start and end <= nonpositive_end
+                for nonpositive_start, nonpositive_end in nonpositive_spans
+            )
+        ]
+        positive_matches = [*decorated_positive_matches, *bare_positive_matches]
+        if positive_matches:
+            polarity_matches["positive"] = positive_matches
+        if len(polarity_matches) > 1:
+            # A sentence such as “待发布政策已发布” contains both the old
+            # condition and the new result.  Never collapse it into a
+            # single-polarity state such as “政策尚未发布”.
+            return f"mixed_{family}", compact
+
+        polarity = next(iter(polarity_matches), "positive")
+        matched_polarity_phrases = tuple(
+            match[0] for match in polarity_matches.get(polarity, [])
+        )
+        if polarity != "positive":
+            polarity_decorators = (
+                "目前已被",
+                "当前已被",
+                "已经被",
+                "现已被",
+                "已被",
+                "曾经被",
+                "曾被",
+                "目前已",
+                "当前已",
+                "已经",
+                "现已",
+                "已",
+                "被",
+            )
+            decorated_phrases = tuple(
+                f"{decorator}{phrase}"
+                for decorator in polarity_decorators
+                for phrase in matched_polarity_phrases
+            )
+            matched_polarity_phrases = (
+                *(phrase for phrase in decorated_phrases if phrase in compact),
+                *matched_polarity_phrases,
+            )
+        residual = compact
+        for phrase in (
+            *matched_polarity_phrases,
+            *aliases,
+        ):
+            residual = residual.replace(phrase, "")
+        semantic_family = family if polarity == "positive" else f"{polarity}_{family}"
+        return semantic_family, residual
+
+    @classmethod
+    def _news_event_states_semantically_equivalent(
+        cls,
+        left: object,
+        right: object,
+    ) -> bool:
+        """Match paraphrases only when both map to one conservative state family."""
+
+        normalized_left = unicodedata.normalize(
+            "NFKC", " ".join(str(left or "").split()).strip()
+        ).casefold()
+        normalized_right = unicodedata.normalize(
+            "NFKC", " ".join(str(right or "").split()).strip()
+        ).casefold()
+        if normalized_left == normalized_right:
+            return True
+
+        def semantic_symbols(value: str) -> tuple[str, ...]:
+            tokens: list[str] = []
+            for character in value:
+                category = unicodedata.category(character)
+                if (
+                    category.startswith("S")
+                    or category in {"Ps", "Pe", "Pd"}
+                    or character in {"/", ":"}
+                ):
+                    tokens.append(character)
+            return tuple(tokens)
+
+        if semantic_symbols(normalized_left) != semantic_symbols(normalized_right):
+            return False
+        numeric_token = re.compile(
+            r"[-+]?[$¥€£₩₹₽]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?:%|‰)?"
+            r"(?:[:/][-+]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?:%|‰)?)?"
+        )
+        if tuple(numeric_token.findall(normalized_left)) != tuple(
+            numeric_token.findall(normalized_right)
+        ):
+            return False
+        left_family, left_residual = cls._news_event_state_semantic_signature(left)
+        right_family, right_residual = cls._news_event_state_semantic_signature(right)
+        if not left_family or left_family != right_family:
+            return False
+        # Event identity must fail closed. Shared long subjects must never hide a
+        # decisive residual difference such as 7.5%/7.0% or 方案甲/方案乙.
+        return left_residual == right_residual
+
+    @classmethod
+    def news_event_change_fingerprint(
+        cls,
+        *,
+        change_type: object,
+        previous_state: object,
+        new_state: object,
+        effective_at: object = "",
+        effective_precision: object = "",
+    ) -> str:
+        """Return the source-independent identity of one semantic event change."""
+
+        def normalize(value: object) -> str:
+            return unicodedata.normalize(
+                "NFKC", " ".join(str(value or "").split()).strip()
+            ).casefold()
+
+        payload = {
+            "change_family": cls._news_event_change_type_family(change_type),
+            "previous_state": normalize(previous_state),
+            "new_state": normalize(new_state),
+            "effective_bucket": cls._news_event_effective_bucket(
+                effective_at,
+                effective_precision,
+            ),
+            "version": _NEWS_EVENT_CHANGE_FINGERPRINT_VERSION,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _news_event_evidence_fingerprint(
+        *,
+        item_key: object,
+        snapshot: object,
+    ) -> str:
+        """Build a stable revision identity when a producer has no fingerprint."""
+
+        if isinstance(snapshot, Mapping):
+            payload: object = dict(snapshot)
+        else:
+            try:
+                decoded = json.loads(str(snapshot or "{}"))
+            except (TypeError, ValueError):
+                decoded = {}
+            payload = dict(decoded) if isinstance(decoded, Mapping) else {}
+        encoded = json.dumps(
+            {
+                "item_key": str(item_key or "").strip(),
+                "snapshot": payload,
+                "version": _NEWS_EVENT_CONTRACT_VERSION,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _news_event_snapshot_json(value: object) -> str:
+        if isinstance(value, Mapping):
+            payload = dict(value)
+        else:
+            try:
+                decoded = json.loads(str(value or "{}"))
+            except (TypeError, ValueError):
+                decoded = {}
+            payload = dict(decoded) if isinstance(decoded, Mapping) else {}
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _news_event_verified_content_scope(
+        declared_scope: object,
+        snapshot: object,
+        title: object = "",
+    ) -> str:
+        """Cap declared depth at the source text actually retained locally."""
+
+        return verified_content_scope(
+            declared_scope,
+            snapshot,
+            title=title,
+            derive_when_unknown=False,
+        )
+
+    def _news_event_durable_support_membership_on(
+        self,
+        conn: sqlite3.Connection,
+        change_id: str,
+        *,
+        relation_kind: str = "supports_change",
+    ) -> sqlite3.Row | None:
+        """Return one retained summary/body for a durable support or contradiction."""
+
+        normalized_relation = str(relation_kind or "").strip().lower()
+        if normalized_relation not in {"supports_change", "contradicts_change"}:
+            raise ValueError("durable evidence lookup requires support or contradiction")
+
+        rows = conn.execute(
+            """
+            SELECT * FROM news_event_memberships
+            WHERE change_id = ? AND relation_kind = ?
+              AND evidence_completeness = 'complete'
+            ORDER BY CASE content_scope
+                         WHEN 'full_text' THEN 0
+                         WHEN 'summary' THEN 1
+                         ELSE 2
+                     END,
+                     membership_id
+            """,
+            (str(change_id or "").strip(), normalized_relation),
+        ).fetchall()
+        for row in rows:
+            verified_scope = self._news_event_verified_content_scope(
+                row["content_scope"],
+                row["evidence_snapshot"],
+                row["title"],
+            )
+            if verified_scope in {"summary", "full_text"}:
+                return cast("sqlite3.Row", row)
+        return None
+
+    @staticmethod
+    def _news_event_entities_json(values: Sequence[object] | None) -> str:
+        entities: list[object] = []
+        for value in values or ():
+            if isinstance(value, Mapping):
+                entities.append(dict(value))
+            else:
+                normalized = " ".join(str(value or "").split()).strip()
+                if normalized:
+                    entities.append(normalized)
+        return json.dumps(
+            entities,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _news_event_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            entities = json.loads(str(item.pop("entities_json", "[]") or "[]"))
+        except (TypeError, ValueError):
+            entities = []
+        item["entities"] = entities if isinstance(entities, list) else []
+        item["state_version"] = int(item.get("state_version") or 0)
+        for field in (
+            "total_change_count",
+            "change_count",
+            "unread_change_count",
+            "conflict_count",
+            "unread_conflict_count",
+            "evidence_count",
+        ):
+            if field in item:
+                item[field] = int(item.get(field) or 0)
+        return item
+
+    @staticmethod
+    def _news_event_change_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["confidence"] = float(item.get("confidence") or 0.0)
+        item["is_read"] = bool(int(item.get("is_read") or 0))
+        item["is_objective_default"] = bool(int(item.get("is_objective_default") or 0))
+        item["evidence_count"] = int(item.get("evidence_count") or 0)
+        return item
+
+    @staticmethod
+    def _news_event_membership_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            snapshot = json.loads(str(item.get("evidence_snapshot") or "{}"))
+        except (TypeError, ValueError):
+            snapshot = {}
+        item["evidence_snapshot"] = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+        item["relation_score"] = float(item.get("relation_score") or 0.0)
+        return item
+
+    @staticmethod
+    def _news_event_source_scope(existing: object, incoming: object) -> str:
+        normalized_existing = str(existing or "unknown").strip().lower()
+        normalized_incoming = str(incoming or "unknown").strip().lower()
+        if normalized_existing not in _NEWS_EVENT_SOURCE_SCOPES:
+            normalized_existing = "unknown"
+        if normalized_incoming not in _NEWS_EVENT_SOURCE_SCOPES:
+            raise ValueError("unsupported news event source scope")
+        order = {"unknown": 0, "single_source": 1, "multi_source": 2}
+        return max((normalized_existing, normalized_incoming), key=order.__getitem__)
+
+    @staticmethod
+    def _news_event_evidence_status(existing: object, incoming: object) -> str:
+        normalized_existing = str(existing or "provisional").strip().lower()
+        normalized_incoming = str(incoming or "provisional").strip().lower()
+        if normalized_existing not in _NEWS_EVENT_EVIDENCE_STATUSES:
+            normalized_existing = "provisional"
+        if normalized_incoming not in _NEWS_EVENT_EVIDENCE_STATUSES:
+            raise ValueError("unsupported news event evidence status")
+        if "contested" in {normalized_existing, normalized_incoming}:
+            return "contested"
+        order = {
+            "provisional": 0,
+            "source_supported": 1,
+            "cross_source_supported": 2,
+        }
+        return max((normalized_existing, normalized_incoming), key=order.__getitem__)
+
+    @classmethod
+    def _news_event_change_is_default(
+        cls,
+        *,
+        role: object,
+        objectivity_status: object,
+        conflict_status: object,
+        previous_state: object,
+        new_state: object,
+        evidence_status: object,
+        effective_at: object,
+        detected_at: object = "",
+        lifecycle: object = "active",
+    ) -> bool:
+        """Gate the default feed to confirmed changes that already happened."""
+
+        previous = " ".join(str(previous_state or "").split()).strip().casefold()
+        current = " ".join(str(new_state or "").split()).strip().casefold()
+        return bool(
+            str(role or "").strip().lower() == "objective_change"
+            and str(objectivity_status or "").strip().lower() == "confirmed"
+            and str(conflict_status or "none").strip().lower() in {"none", "resolved"}
+            and str(evidence_status or "").strip().lower()
+            in {"source_supported", "cross_source_supported"}
+            and str(lifecycle or "active").strip().lower() == "active"
+            and cls._news_event_effective_has_started(effective_at, detected_at)
+            and previous
+            and current
+            and previous != current
+        )
+
+    def _recompute_news_event_state_on(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+    ) -> None:
+        """Project current state by effective order, never by arrival order."""
+
+        normalized_event_id = str(event_id or "").strip()
+        event = conn.execute(
+            "SELECT current_state, state_version, last_change_at "
+            "FROM news_events WHERE event_id = ?",
+            (normalized_event_id,),
+        ).fetchone()
+        if event is None:
+            raise KeyError(normalized_event_id)
+        has_contested = conn.execute(
+            "SELECT 1 FROM news_event_changes "
+            "WHERE event_id = ? AND lifecycle = 'active' "
+            "AND role = 'objective_change' "
+            "AND objectivity_status = 'disputed' "
+            "AND conflict_status = 'contested' "
+            "AND evidence_status = 'contested' LIMIT 1",
+            (normalized_event_id,),
+        ).fetchone()
+        default_rows = conn.execute(
+            """
+            SELECT change_id, previous_state, new_state, effective_at,
+                   effective_precision, detected_at
+            FROM news_event_changes
+            WHERE event_id = ? AND lifecycle = 'active'
+              AND is_objective_default = 1
+            """,
+            (normalized_event_id,),
+        ).fetchall()
+        eligible = [
+            row
+            for row in default_rows
+            if self._news_event_effective_has_started(row["effective_at"], row["detected_at"])
+        ]
+        if has_contested is not None:
+            # A downstream transition is not trustworthy while any state it may
+            # depend on is disputed.  Freeze the whole event instead of showing
+            # a descendant whose prerequisite may later be invalidated.
+            current_state = ""
+            last_change_at = ""
+        elif eligible:
+            ordered = sorted(
+                eligible,
+                key=lambda row: (
+                    self._news_event_effective_sort_key(
+                        row["effective_at"], row["effective_precision"]
+                    ),
+                    str(row["detected_at"] or ""),
+                    str(row["change_id"] or ""),
+                ),
+            )
+
+            current_state = str(ordered[0]["previous_state"] or "")
+            last_change_at = ""
+            for transition in ordered:
+                if not self._news_event_states_semantically_equivalent(
+                    transition["previous_state"],
+                    current_state,
+                ):
+                    continue
+                current_state = str(transition["new_state"] or "")
+                last_change_at = str(transition["effective_at"] or "")
+        elif int(event["state_version"] or 0) > 0:
+            # A formerly objective state was invalidated or became disputed.
+            # Blank is safer than continuing to display the revoked state.
+            current_state = ""
+            last_change_at = ""
+        else:
+            current_state = str(event["current_state"] or "")
+            last_change_at = ""
+        previous_state = str(event["current_state"] or "")
+        previous_change_at = str(event["last_change_at"] or "")
+        previous_version = int(event["state_version"] or 0)
+        state_version = previous_version + int(
+            (current_state, last_change_at) != (previous_state, previous_change_at)
+        )
+        conn.execute(
+            """
+            UPDATE news_events
+            SET current_state = ?, state_version = ?, last_change_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE event_id = ?
+            """,
+            (current_state, state_version, last_change_at, normalized_event_id),
+        )
+
+    def _recompute_news_event_change_evidence_on(
+        self,
+        conn: sqlite3.Connection,
+        change_id: str,
+    ) -> None:
+        """Derive evidence strength from durable memberships, not metadata claims."""
+
+        normalized_change_id = str(change_id or "").strip()
+        change = conn.execute(
+            "SELECT conflict_status, evidence_status, source_scope "
+            "FROM news_event_changes WHERE change_id = ?",
+            (normalized_change_id,),
+        ).fetchone()
+        if change is None:
+            raise KeyError(normalized_change_id)
+        memberships = conn.execute(
+            """
+            SELECT media, content_scope, evidence_completeness
+            FROM news_event_memberships
+            WHERE change_id = ? AND relation_kind = 'supports_change'
+              AND content_scope IN ('summary', 'full_text')
+              AND evidence_completeness = 'complete'
+            """,
+            (normalized_change_id,),
+        ).fetchall()
+        publisher_ids = {
+            unicodedata.normalize("NFKC", str(row["media"] or "")).strip().casefold()
+            for row in memberships
+            if str(row["media"] or "").strip()
+        }
+        if (
+            str(change["conflict_status"] or "none") == "contested"
+            or str(change["evidence_status"] or "") == "contested"
+        ):
+            evidence_status = "contested"
+        elif len(publisher_ids) >= 2:
+            evidence_status = "cross_source_supported"
+        elif memberships:
+            evidence_status = "source_supported"
+        else:
+            evidence_status = "provisional"
+        source_scope = (
+            "multi_source"
+            if len(publisher_ids) >= 2
+            else "single_source"
+            if memberships
+            else "unknown"
+        )
+        conn.execute(
+            """
+            UPDATE news_event_changes
+            SET source_scope = ?, evidence_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE change_id = ?
+            """,
+            (source_scope, evidence_status, normalized_change_id),
+        )
+
+    def _migrate_news_event_change_identity_on(self, conn: sqlite3.Connection) -> None:
+        """Re-key pre-release change rows and fold semantic duplicates safely."""
+
+        rows = conn.execute(
+            "SELECT * FROM news_event_changes ORDER BY created_at, change_id"
+        ).fetchall()
+        groups_by_scope: dict[
+            tuple[str, str, str],
+            list[tuple[str, list[sqlite3.Row]]],
+        ] = defaultdict(list)
+        for row in rows:
+            effective_at = str(row["effective_at"] or "")
+            precision = str(row["effective_precision"] or "unknown")
+            if precision == "unknown" and effective_at:
+                precision = "date" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", effective_at) else "minute"
+                conn.execute(
+                    "UPDATE news_event_changes SET effective_precision = ? WHERE change_id = ?",
+                    (precision, str(row["change_id"])),
+                )
+            fingerprint = self.news_event_change_fingerprint(
+                change_type=row["change_type"],
+                previous_state=row["previous_state"],
+                new_state=row["new_state"],
+                effective_at=effective_at,
+                effective_precision=precision,
+            )
+            event_id = str(row["event_id"])
+            scope = (
+                event_id,
+                self._news_event_change_type_family(row["change_type"]),
+                self._news_event_effective_bucket(effective_at, precision),
+            )
+            matching_groups = [
+                candidate
+                for candidate in groups_by_scope[scope]
+                if self._news_event_states_semantically_equivalent(
+                    candidate[1][0]["previous_state"],
+                    row["previous_state"],
+                )
+                and self._news_event_states_semantically_equivalent(
+                    candidate[1][0]["new_state"],
+                    row["new_state"],
+                )
+            ]
+            if len(matching_groups) == 1:
+                matching_groups[0][1].append(row)
+            else:
+                # Ambiguity fails closed, matching the live upsert path.  The
+                # canonical row keeps its exact v3 fingerprint; semantic
+                # aliases resolve to it without inventing a fuzzy database key.
+                groups_by_scope[scope].append((fingerprint, [row]))
+        groups = [
+            (scope[0], fingerprint, group)
+            for scope_groups in groups_by_scope.values()
+            for fingerprint, group in scope_groups
+        ]
+        for event_id, fingerprint, group in groups:
+            canonical = group[0]
+            canonical_id = str(canonical["change_id"])
+            group_ids = {str(row["change_id"]) for row in group}
+            if str(canonical["supersedes_change_id"] or "") in group_ids:
+                # Folding equivalent rows must never leave the keeper pointing
+                # at itself or at an alias that is about to be deleted.
+                conn.execute(
+                    "UPDATE news_event_changes SET supersedes_change_id = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE change_id = ?",
+                    (canonical_id,),
+                )
+            for duplicate in group[1:]:
+                duplicate_id = str(duplicate["change_id"])
+                memberships = conn.execute(
+                    "SELECT * FROM news_event_memberships WHERE change_id = ?",
+                    (duplicate_id,),
+                ).fetchall()
+                for membership in memberships:
+                    self._upsert_news_event_membership_on(
+                        conn,
+                        event_id=event_id,
+                        change_id=canonical_id,
+                        evidence_item_key=str(membership["evidence_item_key"]),
+                        evidence_fingerprint=str(membership["evidence_fingerprint"]),
+                        relation_kind=str(membership["relation_kind"]),
+                        relation_basis=str(membership["relation_basis"] or ""),
+                        relation_score=float(membership["relation_score"] or 0.0),
+                        content_scope=str(membership["content_scope"] or "unknown"),
+                        media=str(membership["media"] or ""),
+                        provider=str(membership["provider"] or ""),
+                        title=str(membership["title"] or ""),
+                        canonical_url=str(membership["canonical_url"] or ""),
+                        published_at=str(membership["published_at"] or ""),
+                        retrieved_at=str(membership["retrieved_at"] or ""),
+                        evidence_snapshot=str(membership["evidence_snapshot"] or "{}"),
+                        evidence_completeness=str(
+                            membership["evidence_completeness"] or "partial_legacy"
+                        ),
+                        origin_tracking_id=str(membership["origin_tracking_id"] or ""),
+                        origin_check_id=str(membership["origin_check_id"] or ""),
+                        origin_candidate_record_id=str(
+                            membership["origin_candidate_record_id"] or ""
+                        ),
+                        origin_evidence_id=str(membership["origin_evidence_id"] or ""),
+                        first_seen_at=str(membership["first_seen_at"] or ""),
+                        last_seen_at=str(membership["last_seen_at"] or ""),
+                    )
+                conn.execute(
+                    "DELETE FROM news_event_memberships WHERE change_id = ?",
+                    (duplicate_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO news_event_change_aliases (
+                        alias_change_id, canonical_change_id, source_event_id
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(alias_change_id) DO UPDATE SET
+                        canonical_change_id = excluded.canonical_change_id,
+                        source_event_id = excluded.source_event_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (duplicate_id, canonical_id, event_id),
+                )
+                conn.execute(
+                    "UPDATE news_event_change_aliases SET canonical_change_id = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE canonical_change_id = ?",
+                    (canonical_id, duplicate_id),
+                )
+                supersedes_id = str(duplicate["supersedes_change_id"] or "")
+                if supersedes_id in group_ids:
+                    supersedes_id = ""
+                elif supersedes_id:
+                    # ``rows`` is a pre-migration snapshot.  An earlier fold
+                    # may already have deleted this predecessor and installed
+                    # an alias, so never write the stale snapshot id back into
+                    # a later canonical group.
+                    supersedes_id = self._resolve_news_event_change_id_on(
+                        conn,
+                        supersedes_id,
+                    )
+                conn.execute(
+                    """
+                    UPDATE news_event_changes
+                    SET role = CASE
+                            WHEN role = 'objective_change' OR ? = 'objective_change'
+                            THEN 'objective_change' ELSE role END,
+                        objectivity_status = CASE
+                            WHEN objectivity_status = 'disputed' OR ? = 'disputed'
+                            THEN 'disputed'
+                            WHEN objectivity_status = 'confirmed' OR ? = 'confirmed'
+                            THEN 'confirmed' ELSE objectivity_status END,
+                        conflict_status = CASE
+                            WHEN conflict_status = 'contested' OR ? = 'contested'
+                            THEN 'contested'
+                            WHEN conflict_status = 'resolved' OR ? = 'resolved'
+                            THEN 'resolved' ELSE conflict_status END,
+                        lifecycle = CASE
+                            WHEN lifecycle = 'active' OR ? = 'active'
+                            THEN 'active' ELSE lifecycle END,
+                        is_read = MIN(is_read, ?),
+                        confidence = MAX(confidence, ?),
+                        fact = CASE WHEN fact = '' THEN ? ELSE fact END,
+                        inference = CASE WHEN inference = '' THEN ? ELSE inference END,
+                        summary = CASE WHEN summary = '' THEN ? ELSE summary END,
+                        evidence_quote = CASE
+                            WHEN evidence_quote = '' THEN ? ELSE evidence_quote END,
+                        supersedes_change_id = CASE
+                            WHEN supersedes_change_id IS NULL AND ? != '' THEN ?
+                            ELSE supersedes_change_id END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE change_id = ?
+                    """,
+                    (
+                        str(duplicate["role"] or "analysis"),
+                        str(duplicate["objectivity_status"] or "unconfirmed"),
+                        str(duplicate["objectivity_status"] or "unconfirmed"),
+                        str(duplicate["conflict_status"] or "none"),
+                        str(duplicate["conflict_status"] or "none"),
+                        str(duplicate["lifecycle"] or "active"),
+                        int(duplicate["is_read"] or 0),
+                        float(duplicate["confidence"] or 0.0),
+                        str(duplicate["fact"] or ""),
+                        str(duplicate["inference"] or ""),
+                        str(duplicate["summary"] or ""),
+                        str(duplicate["evidence_quote"] or ""),
+                        supersedes_id,
+                        supersedes_id,
+                        canonical_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE news_event_changes SET supersedes_change_id = ? "
+                    "WHERE supersedes_change_id = ? AND change_id != ?",
+                    (canonical_id, duplicate_id, canonical_id),
+                )
+                self._remap_news_event_lineage_change_on(
+                    conn,
+                    old_change_id=duplicate_id,
+                    canonical_change_id=canonical_id,
+                )
+                conn.execute(
+                    "DELETE FROM news_event_changes WHERE change_id = ?",
+                    (duplicate_id,),
+                )
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET change_fingerprint = ?, fingerprint_version = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ?
+                """,
+                (fingerprint, _NEWS_EVENT_CHANGE_FINGERPRINT_VERSION, canonical_id),
+            )
+
+    def _refresh_news_event_change_default_on(
+        self,
+        conn: sqlite3.Connection,
+        change_id: str,
+    ) -> tuple[sqlite3.Row, bool]:
+        """Persist the single fact-gate result consumed by every read path."""
+
+        normalized_change_id = str(change_id or "").strip()
+        row = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (normalized_change_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(normalized_change_id)
+        was_default = bool(int(row["is_objective_default"] or 0))
+        is_default = self._news_event_change_is_default(
+            role=row["role"],
+            objectivity_status=row["objectivity_status"],
+            conflict_status=row["conflict_status"],
+            previous_state=row["previous_state"],
+            new_state=row["new_state"],
+            evidence_status=row["evidence_status"],
+            effective_at=row["effective_at"],
+            detected_at=row["detected_at"],
+            lifecycle=row["lifecycle"],
+        )
+        is_contested = (
+            str(row["conflict_status"] or "none") == "contested"
+            and str(row["lifecycle"] or "active") == "active"
+        )
+        became_default = is_default and not was_default
+        conn.execute(
+            """
+            UPDATE news_event_changes
+            SET is_objective_default = ?,
+                is_read = CASE
+                    WHEN ? THEN 0
+                    WHEN ? THEN is_read
+                    WHEN ? = 0 THEN 1
+                    ELSE is_read
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE change_id = ?
+            """,
+            (
+                int(is_default),
+                int(became_default),
+                int(is_contested),
+                int(is_default),
+                normalized_change_id,
+            ),
+        )
+        refreshed = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (normalized_change_id,),
+        ).fetchone()
+        if refreshed is None:  # pragma: no cover
+            raise RuntimeError("news event change disappeared during fact-gate refresh")
+        return refreshed, became_default
+
+    def _restore_news_event_predecessor_if_unopposed_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        predecessor_id: str,
+    ) -> bool:
+        """Release a revoked predecessor when every remaining edge is disputed."""
+
+        normalized_event_id = str(event_id or "").strip()
+        canonical_predecessor_id = self._resolve_news_event_change_id_on(
+            conn,
+            predecessor_id,
+        )
+        if not normalized_event_id or not canonical_predecessor_id:
+            return False
+        accepted_successor = conn.execute(
+            """
+            SELECT 1 FROM news_event_changes
+            WHERE event_id = ? AND supersedes_change_id = ?
+              AND conflict_status != 'contested'
+              AND lifecycle != 'invalidated'
+              AND role = 'objective_change'
+              AND objectivity_status = 'confirmed'
+              AND evidence_status IN (
+                  'source_supported', 'cross_source_supported'
+              )
+            LIMIT 1
+            """,
+            (normalized_event_id, canonical_predecessor_id),
+        ).fetchone()
+        if accepted_successor is not None:
+            return False
+        predecessor = conn.execute(
+            "SELECT lifecycle, is_read FROM news_event_changes "
+            "WHERE change_id = ? AND event_id = ?",
+            (canonical_predecessor_id, normalized_event_id),
+        ).fetchone()
+        if predecessor is None or str(predecessor["lifecycle"] or "") == "active":
+            return False
+        preserved_is_read = int(predecessor["is_read"] or 0)
+        conn.execute(
+            "UPDATE news_event_changes SET lifecycle = 'active', "
+            "updated_at = CURRENT_TIMESTAMP WHERE change_id = ?",
+            (canonical_predecessor_id,),
+        )
+        self._recompute_news_event_change_evidence_on(conn, canonical_predecessor_id)
+        self._refresh_news_event_change_default_on(conn, canonical_predecessor_id)
+        conn.execute(
+            "UPDATE news_event_changes SET is_read = ? WHERE change_id = ?",
+            (preserved_is_read, canonical_predecessor_id),
+        )
+        return True
+
+    def _contest_divergent_news_event_changes_on(
+        self,
+        conn: sqlite3.Connection,
+        change_id: str,
+    ) -> bool:
+        """Quarantine mutually exclusive, equally durable state transitions."""
+
+        normalized_change_id = str(change_id or "").strip()
+        row = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (normalized_change_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(normalized_change_id)
+        if not bool(int(row["is_objective_default"] or 0)):
+            return False
+        effective_bucket = self._news_event_effective_bucket(
+            row["effective_at"],
+            row["effective_precision"],
+        )
+        candidates = conn.execute(
+            """
+            SELECT * FROM news_event_changes
+            WHERE event_id = ? AND change_id != ? AND lifecycle = 'active'
+              AND is_objective_default = 1
+            """,
+            (str(row["event_id"]), normalized_change_id),
+        ).fetchall()
+        conflicting_ids = [
+            str(candidate["change_id"])
+            for candidate in candidates
+            if self._news_event_effective_bucket(
+                candidate["effective_at"],
+                candidate["effective_precision"],
+            )
+            == effective_bucket
+            and self._news_event_states_semantically_equivalent(
+                candidate["previous_state"],
+                row["previous_state"],
+            )
+            and not self._news_event_states_semantically_equivalent(
+                candidate["new_state"],
+                row["new_state"],
+            )
+        ]
+        if not conflicting_ids:
+            return False
+        contested_ids = [normalized_change_id, *conflicting_ids]
+        placeholders = ", ".join("?" for _ in contested_ids)
+        conn.execute(
+            f"""
+            UPDATE news_event_changes
+            SET objectivity_status = 'disputed', conflict_status = 'contested',
+                evidence_status = 'contested', is_objective_default = 0,
+                is_read = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE change_id IN ({placeholders})
+            """,
+            contested_ids,
+        )
+        conn.execute(
+            f"""
+            UPDATE news_event_lineage_claims
+            SET status = 'contested', updated_at = CURRENT_TIMESTAMP
+            WHERE successor_change_id IN ({placeholders})
+              AND status != 'rejected'
+            """,
+            contested_ids,
+        )
+        # A contested successor no longer has authority to suppress the fact it
+        # claimed to replace.  Restore that predecessor unless another accepted
+        # (possibly historical-but-superseded) successor still carries the same
+        # edge.  This matters when an event merge introduces new contradictory
+        # evidence after a supersede had already been applied.
+        contested_edges = conn.execute(
+            f"""
+            SELECT DISTINCT supersedes_change_id
+            FROM news_event_changes
+            WHERE change_id IN ({placeholders})
+              AND supersedes_change_id IS NOT NULL
+              AND supersedes_change_id != ''
+            """,
+            contested_ids,
+        ).fetchall()
+        for edge in contested_edges:
+            self._restore_news_event_predecessor_if_unopposed_on(
+                conn,
+                event_id=str(row["event_id"]),
+                predecessor_id=str(edge["supersedes_change_id"] or ""),
+            )
+        return True
+
+    @staticmethod
+    def _resolve_news_event_row_on(
+        conn: sqlite3.Connection,
+        event_id: str,
+    ) -> sqlite3.Row | None:
+        current_id = str(event_id or "").strip()
+        seen: set[str] = set()
+        while current_id:
+            if current_id in seen:
+                raise RuntimeError("news event merge cycle detected")
+            seen.add(current_id)
+            row = conn.execute(
+                "SELECT * FROM news_events WHERE event_id = ?",
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["status"] or "") != "merged":
+                return cast("sqlite3.Row", row)
+            current_id = str(row["merged_into_event_id"] or "").strip()
+        return None
+
+    @staticmethod
+    def _resolve_news_event_change_id_on(
+        conn: sqlite3.Connection,
+        change_id: str,
+    ) -> str:
+        """Resolve a merge-time change alias to its durable canonical id."""
+
+        current_id = str(change_id or "").strip()
+        seen: set[str] = set()
+        while current_id:
+            if current_id in seen:
+                raise RuntimeError("news event change alias cycle detected")
+            seen.add(current_id)
+            direct = conn.execute(
+                "SELECT change_id FROM news_event_changes WHERE change_id = ?",
+                (current_id,),
+            ).fetchone()
+            if direct is not None:
+                return str(direct["change_id"])
+            alias = conn.execute(
+                "SELECT canonical_change_id FROM news_event_change_aliases "
+                "WHERE alias_change_id = ?",
+                (current_id,),
+            ).fetchone()
+            if alias is None:
+                return ""
+            current_id = str(alias["canonical_change_id"] or "").strip()
+        return ""
+
+    def _upsert_news_event_lineage_claim_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        successor_change_id: str,
+        predecessor_change_id: str,
+        supersedes_lifecycle: str,
+        source_event_id: str,
+        source_change_id: str,
+        status: str,
+    ) -> sqlite3.Row:
+        """Persist one auditable candidate predecessor edge.
+
+        The canonical endpoints may change when events are folded together, but
+        ``source_event_id`` and ``source_change_id`` remain the immutable origin
+        of the claim.  That lets a later conflict resolution reject one edge
+        without erasing why it was ever considered.
+        """
+
+        normalized_event_id = str(event_id or "").strip()
+        normalized_successor_id = self._resolve_news_event_change_id_on(
+            conn,
+            successor_change_id,
+        )
+        normalized_predecessor_id = self._resolve_news_event_change_id_on(
+            conn,
+            predecessor_change_id,
+        )
+        normalized_lifecycle = str(supersedes_lifecycle or "superseded").strip().lower()
+        normalized_source_event_id = str(source_event_id or normalized_event_id).strip()
+        normalized_source_change_id = str(
+            source_change_id or successor_change_id or normalized_successor_id
+        ).strip()
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_lifecycle not in {"superseded", "invalidated"}:
+            raise ValueError("unsupported lineage supersedes lifecycle")
+        if normalized_status not in _NEWS_EVENT_LINEAGE_CLAIM_STATUSES:
+            raise ValueError("unsupported news event lineage claim status")
+        if not (
+            normalized_event_id
+            and normalized_successor_id
+            and normalized_predecessor_id
+            and normalized_source_event_id
+            and normalized_source_change_id
+        ):
+            raise ValueError("complete news event lineage claim identity is required")
+        if normalized_successor_id == normalized_predecessor_id:
+            raise ValueError("a news event lineage claim cannot point to itself")
+        endpoints = conn.execute(
+            "SELECT change_id, event_id FROM news_event_changes WHERE change_id IN (?, ?)",
+            (normalized_successor_id, normalized_predecessor_id),
+        ).fetchall()
+        endpoint_events = {str(row["change_id"]): str(row["event_id"] or "") for row in endpoints}
+        if endpoint_events != {
+            normalized_successor_id: normalized_event_id,
+            normalized_predecessor_id: normalized_event_id,
+        }:
+            raise ValueError("lineage claim endpoints must belong to event_id")
+        existing = conn.execute(
+            """
+            SELECT * FROM news_event_lineage_claims
+            WHERE source_event_id = ? AND source_change_id = ?
+              AND predecessor_change_id = ? AND supersedes_lifecycle = ?
+            """,
+            (
+                normalized_source_event_id,
+                normalized_source_change_id,
+                normalized_predecessor_id,
+                normalized_lifecycle,
+            ),
+        ).fetchone()
+        if existing is None:
+            claim_identity = json.dumps(
+                {
+                    "source_event_id": normalized_source_event_id,
+                    "source_change_id": normalized_source_change_id,
+                    "predecessor_change_id": normalized_predecessor_id,
+                    "supersedes_lifecycle": normalized_lifecycle,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            claim_id = str(uuid5(NAMESPACE_URL, f"newsclaw:lineage:{claim_identity}"))
+            conn.execute(
+                """
+                INSERT INTO news_event_lineage_claims (
+                    claim_id, event_id, successor_change_id,
+                    predecessor_change_id, supersedes_lifecycle,
+                    source_event_id, source_change_id, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    claim_id,
+                    normalized_event_id,
+                    normalized_successor_id,
+                    normalized_predecessor_id,
+                    normalized_lifecycle,
+                    normalized_source_event_id,
+                    normalized_source_change_id,
+                    normalized_status,
+                ),
+            )
+        else:
+            claim_id = str(existing["claim_id"])
+            existing_status = str(existing["status"] or "active")
+            # Replaying an ordinary observation must not undo an explicit
+            # resolution.  A new contest or explicit decision may, however,
+            # advance the edge again.
+            durable_status = (
+                existing_status
+                if normalized_status == "active"
+                and existing_status in {"contested", "resolved", "rejected"}
+                else normalized_status
+            )
+            conn.execute(
+                """
+                UPDATE news_event_lineage_claims
+                SET event_id = ?, successor_change_id = ?, status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE claim_id = ?
+                """,
+                (
+                    normalized_event_id,
+                    normalized_successor_id,
+                    durable_status,
+                    claim_id,
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM news_event_lineage_claims WHERE claim_id = ?",
+            (claim_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("news event lineage claim disappeared after upsert")
+        return cast("sqlite3.Row", row)
+
+    def _seed_news_event_lineage_claims_from_pointers_on(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Persist every addressable pointer before identity folding can erase it."""
+
+        canonical_lineage_edges = conn.execute(
+            """
+            SELECT successor.*
+            FROM news_event_changes successor
+            JOIN news_event_changes predecessor
+              ON predecessor.change_id = successor.supersedes_change_id
+             AND predecessor.event_id = successor.event_id
+            WHERE successor.supersedes_change_id IS NOT NULL
+              AND successor.supersedes_change_id != ''
+            ORDER BY successor.created_at, successor.change_id
+            """
+        ).fetchall()
+        for edge in canonical_lineage_edges:
+            conflict = str(edge["conflict_status"] or "none")
+            has_authority = (
+                str(edge["role"] or "") == "objective_change"
+                and str(edge["objectivity_status"] or "") == "confirmed"
+                and str(edge["evidence_status"] or "")
+                in {"source_supported", "cross_source_supported"}
+                and str(edge["lifecycle"] or "active") != "invalidated"
+            )
+            claim_status = (
+                "contested"
+                if conflict == "contested"
+                else "resolved"
+                if conflict == "resolved"
+                else "active"
+                if has_authority
+                else "rejected"
+            )
+            self._upsert_news_event_lineage_claim_on(
+                conn,
+                event_id=str(edge["event_id"]),
+                successor_change_id=str(edge["change_id"]),
+                predecessor_change_id=str(edge["supersedes_change_id"]),
+                supersedes_lifecycle=str(edge["supersedes_lifecycle"] or "superseded"),
+                source_event_id=str(edge["event_id"]),
+                source_change_id=str(edge["change_id"]),
+                status=claim_status,
+            )
+
+    @staticmethod
+    def _merge_news_event_lineage_claim_status(left: object, right: object) -> str:
+        """Choose the safest status when identity folding coalesces claims."""
+
+        statuses = {str(left or "active"), str(right or "active")}
+        for status in ("contested", "resolved", "active", "rejected"):
+            if status in statuses:
+                return status
+        return "active"
+
+    def _remap_news_event_lineage_change_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        old_change_id: str,
+        canonical_change_id: str,
+    ) -> None:
+        """Rebind candidate edges before a duplicate change row is deleted."""
+
+        old_id = str(old_change_id or "").strip()
+        canonical_id = str(canonical_change_id or "").strip()
+        if not old_id or not canonical_id or old_id == canonical_id:
+            return
+        claims = conn.execute(
+            """
+            SELECT * FROM news_event_lineage_claims
+            WHERE successor_change_id = ? OR predecessor_change_id = ?
+            ORDER BY created_at, claim_id
+            """,
+            (old_id, old_id),
+        ).fetchall()
+        for claim in claims:
+            claim_id = str(claim["claim_id"])
+            successor_id = (
+                canonical_id
+                if str(claim["successor_change_id"]) == old_id
+                else str(claim["successor_change_id"])
+            )
+            predecessor_id = (
+                canonical_id
+                if str(claim["predecessor_change_id"]) == old_id
+                else str(claim["predecessor_change_id"])
+            )
+            status = str(claim["status"] or "active")
+            if successor_id == predecessor_id:
+                status = "rejected"
+            collision = conn.execute(
+                """
+                SELECT * FROM news_event_lineage_claims
+                WHERE claim_id != ? AND source_event_id = ?
+                  AND source_change_id = ? AND predecessor_change_id = ?
+                  AND supersedes_lifecycle = ?
+                """,
+                (
+                    claim_id,
+                    str(claim["source_event_id"]),
+                    str(claim["source_change_id"]),
+                    predecessor_id,
+                    str(claim["supersedes_lifecycle"]),
+                ),
+            ).fetchone()
+            if collision is not None:
+                merged_status = self._merge_news_event_lineage_claim_status(
+                    collision["status"],
+                    status,
+                )
+                conn.execute(
+                    """
+                    UPDATE news_event_lineage_claims
+                    SET successor_change_id = ?, status = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE claim_id = ?
+                    """,
+                    (successor_id, merged_status, str(collision["claim_id"])),
+                )
+                conn.execute(
+                    "DELETE FROM news_event_lineage_claims WHERE claim_id = ?",
+                    (claim_id,),
+                )
+                continue
+            conn.execute(
+                """
+                UPDATE news_event_lineage_claims
+                SET successor_change_id = ?, predecessor_change_id = ?,
+                    status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE claim_id = ?
+                """,
+                (successor_id, predecessor_id, status, claim_id),
+            )
+
+    def _reconcile_news_event_lineage_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        successor_change_id: str,
+        predecessor_change_id: str,
+        supersedes_lifecycle: str,
+        source_event_id: str,
+        source_change_id: str,
+        explicit_resolution: bool,
+        force_contested: bool = False,
+    ) -> bool:
+        """Accept, contest, or explicitly resolve one predecessor edge.
+
+        Returns ``True`` only when the canonical edge is accepted and may apply
+        its lifecycle effect.  Every loser remains in the ledger as rejected.
+        """
+
+        normalized_event_id = str(event_id or "").strip()
+        successor_id = self._resolve_news_event_change_id_on(
+            conn,
+            successor_change_id,
+        )
+        predecessor_id = self._resolve_news_event_change_id_on(
+            conn,
+            predecessor_change_id,
+        )
+        if not successor_id or not predecessor_id or successor_id == predecessor_id:
+            raise ValueError("invalid news event lineage endpoints")
+        successor = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ? AND event_id = ?",
+            (successor_id, normalized_event_id),
+        ).fetchone()
+        if successor is None:
+            raise ValueError("lineage successor does not belong to event_id")
+        existing_pointer = self._resolve_news_event_change_id_on(
+            conn,
+            str(successor["supersedes_change_id"] or ""),
+        )
+        if existing_pointer:
+            existing_claim = conn.execute(
+                """
+                SELECT 1 FROM news_event_lineage_claims
+                WHERE successor_change_id = ? AND predecessor_change_id = ?
+                  AND supersedes_lifecycle = ?
+                  AND status != 'rejected'
+                LIMIT 1
+                """,
+                (
+                    successor_id,
+                    existing_pointer,
+                    str(successor["supersedes_lifecycle"] or "superseded"),
+                ),
+            ).fetchone()
+            if existing_claim is None:
+                self._upsert_news_event_lineage_claim_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    successor_change_id=successor_id,
+                    predecessor_change_id=existing_pointer,
+                    supersedes_lifecycle=str(successor["supersedes_lifecycle"] or "superseded"),
+                    source_event_id=normalized_event_id,
+                    source_change_id=successor_id,
+                    status=(
+                        "resolved"
+                        if str(successor["conflict_status"] or "none") == "resolved"
+                        else "contested"
+                        if str(successor["conflict_status"] or "none") == "contested"
+                        else "active"
+                    ),
+                )
+        replayed_claim = conn.execute(
+            """
+            SELECT status FROM news_event_lineage_claims
+            WHERE source_event_id = ? AND source_change_id = ?
+              AND predecessor_change_id = ? AND supersedes_lifecycle = ?
+            """,
+            (
+                str(source_event_id or normalized_event_id).strip(),
+                str(source_change_id or successor_change_id).strip(),
+                predecessor_id,
+                str(supersedes_lifecycle or "superseded").strip().lower(),
+            ),
+        ).fetchone()
+        if (
+            not explicit_resolution
+            and replayed_claim is not None
+            and str(replayed_claim["status"] or "") == "rejected"
+        ):
+            # An already adjudicated loser is immutable for this source claim.
+            # Replaying the same evidence is idempotent; only a distinct source
+            # claim or a new explicit resolution may reopen the question.
+            return False
+        if explicit_resolution:
+            self._upsert_news_event_lineage_claim_on(
+                conn,
+                event_id=normalized_event_id,
+                successor_change_id=successor_id,
+                predecessor_change_id=predecessor_id,
+                supersedes_lifecycle=supersedes_lifecycle,
+                source_event_id=source_event_id,
+                source_change_id=source_change_id,
+                status="resolved",
+            )
+            losers = conn.execute(
+                """
+                SELECT DISTINCT predecessor_change_id
+                FROM news_event_lineage_claims
+                WHERE successor_change_id = ?
+                  AND NOT (
+                      predecessor_change_id = ? AND supersedes_lifecycle = ?
+                  )
+                  AND status != 'rejected'
+                """,
+                (successor_id, predecessor_id, supersedes_lifecycle),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE news_event_lineage_claims
+                SET status = CASE
+                        WHEN predecessor_change_id = ?
+                         AND supersedes_lifecycle = ? THEN 'resolved'
+                        ELSE 'rejected' END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE successor_change_id = ?
+                """,
+                (predecessor_id, supersedes_lifecycle, successor_id),
+            )
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET supersedes_change_id = ?, supersedes_lifecycle = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ?
+                """,
+                (predecessor_id, supersedes_lifecycle, successor_id),
+            )
+            for loser in losers:
+                self._restore_news_event_predecessor_if_unopposed_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    predecessor_id=str(loser["predecessor_change_id"]),
+                )
+            return True
+        active_alternatives = conn.execute(
+            """
+            SELECT DISTINCT predecessor_change_id
+            FROM news_event_lineage_claims
+            WHERE successor_change_id = ?
+              AND NOT (
+                  predecessor_change_id = ? AND supersedes_lifecycle = ?
+              )
+              AND status != 'rejected'
+            """,
+            (successor_id, predecessor_id, supersedes_lifecycle),
+        ).fetchall()
+        contested = force_contested or bool(active_alternatives)
+        self._upsert_news_event_lineage_claim_on(
+            conn,
+            event_id=normalized_event_id,
+            successor_change_id=successor_id,
+            predecessor_change_id=predecessor_id,
+            supersedes_lifecycle=supersedes_lifecycle,
+            source_event_id=source_event_id,
+            source_change_id=source_change_id,
+            status="contested" if contested else "active",
+        )
+        if contested:
+            conn.execute(
+                """
+                UPDATE news_event_lineage_claims
+                SET status = 'contested', updated_at = CURRENT_TIMESTAMP
+                WHERE successor_change_id = ? AND status != 'rejected'
+                """,
+                (successor_id,),
+            )
+            candidates = conn.execute(
+                """
+                SELECT DISTINCT predecessor_change_id
+                FROM news_event_lineage_claims
+                WHERE successor_change_id = ? AND status = 'contested'
+                """,
+                (successor_id,),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET supersedes_change_id = NULL,
+                    objectivity_status = 'disputed',
+                    conflict_status = 'contested',
+                    evidence_status = 'contested',
+                    is_objective_default = 0, is_read = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ?
+                """,
+                (successor_id,),
+            )
+            for candidate in candidates:
+                self._restore_news_event_predecessor_if_unopposed_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    predecessor_id=str(candidate["predecessor_change_id"]),
+                )
+            return False
+        conn.execute(
+            """
+            UPDATE news_event_changes
+            SET supersedes_change_id = ?, supersedes_lifecycle = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE change_id = ?
+            """,
+            (predecessor_id, supersedes_lifecycle, successor_id),
+        )
+        return True
+
+    def _repair_collapsed_news_event_lineage_conflict_on(
+        self,
+        conn: sqlite3.Connection,
+        successor_change_id: str,
+    ) -> bool:
+        """Release a lineage conflict whose candidates folded to one edge."""
+
+        successor_id = self._resolve_news_event_change_id_on(
+            conn,
+            successor_change_id,
+        )
+        if not successor_id:
+            return False
+        successor = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (successor_id,),
+        ).fetchone()
+        if successor is None or str(successor["conflict_status"] or "none") != "contested":
+            return False
+        claims = conn.execute(
+            """
+            SELECT * FROM news_event_lineage_claims
+            WHERE successor_change_id = ? AND status != 'rejected'
+            ORDER BY created_at, claim_id
+            """,
+            (successor_id,),
+        ).fetchall()
+        candidate_pairs = {
+            (
+                str(claim["predecessor_change_id"]),
+                str(claim["supersedes_lifecycle"] or "superseded"),
+            )
+            for claim in claims
+        }
+        if len(candidate_pairs) != 1:
+            return False
+        predecessor_id, supersedes_lifecycle = next(iter(candidate_pairs))
+        predecessor = conn.execute(
+            "SELECT event_id FROM news_event_changes WHERE change_id = ?",
+            (predecessor_id,),
+        ).fetchone()
+        event_id = str(successor["event_id"] or "")
+        if predecessor is None or str(predecessor["event_id"] or "") != event_id:
+            return False
+        durable_support = self._news_event_durable_support_membership_on(
+            conn,
+            successor_id,
+        )
+        if durable_support is None:
+            return False
+        durable_contradiction = self._news_event_durable_support_membership_on(
+            conn,
+            successor_id,
+            relation_kind="contradicts_change",
+        )
+        if durable_contradiction is not None:
+            return False
+
+        effective_bucket = self._news_event_effective_bucket(
+            successor["effective_at"],
+            successor["effective_precision"],
+        )
+        peers = conn.execute(
+            """
+            SELECT * FROM news_event_changes
+            WHERE event_id = ? AND change_id != ? AND lifecycle = 'active'
+              AND role = 'objective_change'
+            """,
+            (event_id, successor_id),
+        ).fetchall()
+        for peer in peers:
+            if (
+                self._news_event_effective_bucket(
+                    peer["effective_at"],
+                    peer["effective_precision"],
+                )
+                == effective_bucket
+                and self._news_event_states_semantically_equivalent(
+                    peer["previous_state"],
+                    successor["previous_state"],
+                )
+                and not self._news_event_states_semantically_equivalent(
+                    peer["new_state"],
+                    successor["new_state"],
+                )
+                and self._news_event_durable_support_membership_on(
+                    conn,
+                    str(peer["change_id"]),
+                )
+                is not None
+            ):
+                return False
+        resolved = any(str(claim["status"] or "") == "resolved" for claim in claims)
+        durable_claim_status = "resolved" if resolved else "active"
+        durable_conflict_status = "resolved" if resolved else "none"
+        conn.execute(
+            """
+            UPDATE news_event_lineage_claims
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE successor_change_id = ? AND predecessor_change_id = ?
+              AND supersedes_lifecycle = ? AND status != 'rejected'
+            """,
+            (
+                durable_claim_status,
+                successor_id,
+                predecessor_id,
+                supersedes_lifecycle,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE news_event_changes
+            SET objectivity_status = 'confirmed', conflict_status = ?,
+                evidence_status = 'provisional', supersedes_change_id = ?,
+                supersedes_lifecycle = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE change_id = ?
+            """,
+            (
+                durable_conflict_status,
+                predecessor_id,
+                supersedes_lifecycle,
+                successor_id,
+            ),
+        )
+        self._recompute_news_event_change_evidence_on(conn, successor_id)
+        refreshed, _ = self._refresh_news_event_change_default_on(conn, successor_id)
+        has_lineage_authority = (
+            str(refreshed["role"] or "") == "objective_change"
+            and str(refreshed["objectivity_status"] or "") == "confirmed"
+            and str(refreshed["conflict_status"] or "none") != "contested"
+            and str(refreshed["evidence_status"] or "")
+            in {"source_supported", "cross_source_supported"}
+            and str(refreshed["lifecycle"] or "active") != "invalidated"
+        )
+        if has_lineage_authority:
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET lifecycle = ?, is_objective_default = 0, is_read = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ?
+                """,
+                (supersedes_lifecycle, predecessor_id),
+            )
+        else:
+            self._restore_news_event_predecessor_if_unopposed_on(
+                conn,
+                event_id=event_id,
+                predecessor_id=predecessor_id,
+            )
+        return True
+
+    def _normalize_news_event_lineage_claims_on(
+        self,
+        conn: sqlite3.Connection,
+        successor_change_id: str,
+    ) -> bool:
+        """Reconcile all durable candidate edges after an identity or event fold."""
+
+        successor_id = self._resolve_news_event_change_id_on(
+            conn,
+            successor_change_id,
+        )
+        if not successor_id:
+            return False
+        successor = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (successor_id,),
+        ).fetchone()
+        if successor is None:
+            return False
+        claims = conn.execute(
+            """
+            SELECT * FROM news_event_lineage_claims
+            WHERE successor_change_id = ? AND status != 'rejected'
+            ORDER BY created_at, claim_id
+            """,
+            (successor_id,),
+        ).fetchall()
+        current_pointer = self._resolve_news_event_change_id_on(
+            conn,
+            str(successor["supersedes_change_id"] or ""),
+        )
+        if not claims:
+            if not str(successor["supersedes_change_id"] or ""):
+                return False
+            # The pointer no longer has any accepted durable claim (for example
+            # its once-declared full text was revalidated as title repetition).
+            # Retain rejected audit rows, but revoke the pointer's lifecycle
+            # authority and restore the last trustworthy predecessor state.
+            conn.execute(
+                "UPDATE news_event_changes SET supersedes_change_id = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE change_id = ?",
+                (successor_id,),
+            )
+            if current_pointer:
+                self._restore_news_event_predecessor_if_unopposed_on(
+                    conn,
+                    event_id=str(successor["event_id"] or ""),
+                    predecessor_id=current_pointer,
+                )
+            return True
+        candidate_pairs = {
+            (
+                str(claim["predecessor_change_id"]),
+                str(claim["supersedes_lifecycle"] or "superseded"),
+            )
+            for claim in claims
+        }
+        event_id = str(successor["event_id"] or "")
+        candidate_predecessor_ids = {pair[0] for pair in candidate_pairs}
+        valid_predecessors: set[str] = set()
+        for predecessor_id in sorted(candidate_predecessor_ids):
+            predecessor = conn.execute(
+                "SELECT event_id FROM news_event_changes WHERE change_id = ?",
+                (predecessor_id,),
+            ).fetchone()
+            if predecessor is not None and str(predecessor["event_id"] or "") == event_id:
+                valid_predecessors.add(predecessor_id)
+        has_invalid_event_owner = any(str(claim["event_id"] or "") != event_id for claim in claims)
+        has_broken_endpoint = (
+            valid_predecessors != candidate_predecessor_ids or has_invalid_event_owner
+        )
+        pointer_pair = (
+            current_pointer,
+            str(successor["supersedes_lifecycle"] or "superseded"),
+        )
+        has_pointer_mismatch = bool(current_pointer and pointer_pair not in candidate_pairs)
+        if len(candidate_pairs) <= 1 and not has_broken_endpoint:
+            if has_pointer_mismatch:
+                has_broken_endpoint = True
+            else:
+                return self._repair_collapsed_news_event_lineage_conflict_on(
+                    conn,
+                    successor_id,
+                )
+        if not candidate_pairs:
+            return False
+        # More than one semantic edge is a real ambiguity, including two
+        # lifecycles for the same predecessor.  A missing/misowned endpoint is
+        # equally unsafe: preserve it for audit but quarantine the successor
+        # instead of silently accepting the one surviving pointer.
+        conn.execute(
+            """
+            UPDATE news_event_lineage_claims
+            SET status = 'contested', updated_at = CURRENT_TIMESTAMP
+            WHERE successor_change_id = ? AND status != 'rejected'
+            """,
+            (successor_id,),
+        )
+        conn.execute(
+            """
+            UPDATE news_event_changes
+            SET supersedes_change_id = NULL,
+                objectivity_status = 'disputed',
+                conflict_status = 'contested',
+                evidence_status = 'contested',
+                is_objective_default = 0,
+                is_read = CASE WHEN lifecycle = 'active' THEN 0 ELSE 1 END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE change_id = ?
+            """,
+            (successor_id,),
+        )
+        for predecessor_id in sorted(valid_predecessors):
+            self._restore_news_event_predecessor_if_unopposed_on(
+                conn,
+                event_id=event_id,
+                predecessor_id=predecessor_id,
+            )
+        return True
+
+    def _create_news_event_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        event_key: str,
+        canonical_title: str,
+        event_type: str = "unknown",
+        topic_group: str = "",
+        story_key: str = "",
+        entities: Sequence[object] = (),
+        current_state: str = "",
+        status: str = "active",
+        merged_into_event_id: str = "",
+        origin_tracking_id: str = "",
+        first_seen_at: str = "",
+        last_seen_at: str = "",
+    ) -> tuple[sqlite3.Row, bool]:
+        normalized_id = str(event_id or "").strip()
+        normalized_key = str(event_key or "").strip()[:512]
+        normalized_title = " ".join(str(canonical_title or "").split()).strip()[:1_000]
+        normalized_status = str(status or "active").strip().lower()
+        normalized_origin = str(origin_tracking_id or "").strip()
+        normalized_merge_target = str(merged_into_event_id or "").strip()
+        if not normalized_id or not normalized_title:
+            raise ValueError("event_id and canonical_title are required")
+        if normalized_status not in _NEWS_EVENT_STATUSES:
+            raise ValueError("unsupported news event status")
+        if (normalized_status == "merged") != bool(normalized_merge_target):
+            raise ValueError("merged events require exactly one merge target")
+        if normalized_merge_target:
+            merge_target = conn.execute(
+                "SELECT event_id FROM news_events WHERE event_id = ?",
+                (normalized_merge_target,),
+            ).fetchone()
+            if merge_target is None or normalized_merge_target == normalized_id:
+                raise ValueError("invalid merged_into_event_id")
+        if normalized_origin:
+            origin = conn.execute(
+                "SELECT * FROM news_events WHERE origin_tracking_id = ?",
+                (normalized_origin,),
+            ).fetchone()
+            if origin is not None:
+                resolved_origin = self._resolve_news_event_row_on(
+                    conn,
+                    str(origin["event_id"]),
+                )
+                if resolved_origin is not None:
+                    return resolved_origin, False
+        if normalized_key:
+            alias = conn.execute(
+                "SELECT canonical_event_id FROM news_event_aliases WHERE alias_event_key = ?",
+                (normalized_key,),
+            ).fetchone()
+            if alias is not None:
+                resolved_alias = self._resolve_news_event_row_on(
+                    conn,
+                    str(alias["canonical_event_id"]),
+                )
+                if resolved_alias is None:
+                    raise RuntimeError("news event alias target is missing")
+                return resolved_alias, False
+            existing_key = conn.execute(
+                """
+                SELECT * FROM news_events
+                WHERE event_key = ?
+                ORDER BY created_at, event_id
+                LIMIT 1
+                """,
+                (normalized_key,),
+            ).fetchone()
+            if existing_key is not None:
+                resolved_key = self._resolve_news_event_row_on(
+                    conn,
+                    str(existing_key["event_id"]),
+                )
+                if resolved_key is None:
+                    raise RuntimeError("news event merge target is missing")
+                if str(resolved_key["event_id"]) != str(existing_key["event_id"]):
+                    conn.execute(
+                        """
+                        INSERT INTO news_event_aliases (
+                            alias_event_key, canonical_event_id, source_event_id
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(alias_event_key) DO UPDATE SET
+                            canonical_event_id = excluded.canonical_event_id,
+                            source_event_id = excluded.source_event_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            normalized_key,
+                            str(resolved_key["event_id"]),
+                            str(existing_key["event_id"]),
+                        ),
+                    )
+                return resolved_key, False
+        existing_id = self._resolve_news_event_row_on(conn, normalized_id)
+        if existing_id is not None:
+            return existing_id, False
+        observed_at = str(last_seen_at or first_seen_at or "").strip()
+        conn.execute(
+            """
+            INSERT INTO news_events (
+                event_id, event_key, event_key_version, canonical_title,
+                event_type, topic_group, story_key, entities_json, current_state,
+                status, merged_into_event_id, origin_tracking_id,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_id,
+                normalized_key,
+                _NEWS_EVENT_KEY_VERSION,
+                normalized_title,
+                str(event_type or "unknown").strip()[:120] or "unknown",
+                str(topic_group or "").strip()[:300],
+                str(story_key or "").strip()[:512],
+                self._news_event_entities_json(entities),
+                str(current_state or "").strip()[:8_000],
+                normalized_status,
+                normalized_merge_target or None,
+                normalized_origin,
+                str(first_seen_at or observed_at).strip(),
+                observed_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM news_events WHERE event_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("news event disappeared after insert")
+        return row, True
+
+    def _upsert_news_event_membership_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        evidence_item_key: str,
+        evidence_fingerprint: str,
+        relation_kind: str,
+        change_id: str = "",
+        relation_basis: str = "",
+        relation_score: float = 0.0,
+        content_scope: str = "unknown",
+        media: str = "",
+        provider: str = "",
+        title: str = "",
+        canonical_url: str = "",
+        published_at: str = "",
+        retrieved_at: str = "",
+        evidence_snapshot: object = None,
+        evidence_completeness: str = "complete",
+        origin_tracking_id: str = "",
+        origin_check_id: str = "",
+        origin_candidate_record_id: str = "",
+        origin_evidence_id: str = "",
+        first_seen_at: str = "",
+        last_seen_at: str = "",
+    ) -> tuple[sqlite3.Row, bool]:
+        normalized_event_id = str(event_id or "").strip()
+        normalized_change_id = str(change_id or "").strip()
+        normalized_item_key = str(evidence_item_key or "").strip()
+        normalized_fingerprint = str(evidence_fingerprint or "").strip()
+        normalized_relation = str(relation_kind or "").strip().lower()
+        normalized_scope = self._news_event_verified_content_scope(
+            content_scope,
+            evidence_snapshot,
+            title,
+        )
+        normalized_completeness = str(evidence_completeness or "complete").strip().lower()
+        if not normalized_event_id or not normalized_item_key or not normalized_fingerprint:
+            raise ValueError("event_id, evidence_item_key, and evidence_fingerprint are required")
+        if normalized_relation not in _NEWS_EVENT_RELATION_KINDS:
+            raise ValueError("unsupported news event membership relation")
+        if normalized_completeness not in {"complete", "partial_legacy"}:
+            raise ValueError("unsupported news event evidence completeness")
+        event = conn.execute(
+            "SELECT event_id FROM news_events WHERE event_id = ?",
+            (normalized_event_id,),
+        ).fetchone()
+        if event is None:
+            raise KeyError(normalized_event_id)
+        if normalized_change_id:
+            change = conn.execute(
+                "SELECT event_id FROM news_event_changes WHERE change_id = ?",
+                (normalized_change_id,),
+            ).fetchone()
+            if change is None or str(change["event_id"]) != normalized_event_id:
+                raise ValueError("change_id does not belong to event_id")
+        where = """
+            event_id = ? AND evidence_item_key = ? AND evidence_fingerprint = ?
+            AND relation_kind = ?
+        """
+        params: list[object] = [
+            normalized_event_id,
+            normalized_item_key,
+            normalized_fingerprint,
+            normalized_relation,
+        ]
+        if normalized_change_id:
+            where += " AND change_id = ?"
+            params.append(normalized_change_id)
+        else:
+            where += " AND change_id IS NULL"
+            if normalized_relation == "origin":
+                where += " AND origin_tracking_id = ?"
+                params.append(str(origin_tracking_id or "").strip())
+        existing = conn.execute(
+            "SELECT * FROM news_event_memberships WHERE " + where,
+            params,
+        ).fetchone()
+        observed_at = str(last_seen_at or retrieved_at or published_at or "").strip()
+        snapshot_json = self._news_event_snapshot_json(evidence_snapshot)
+        if existing is not None:
+            depth = {"unknown": 0, "title_only": 1, "summary": 2, "full_text": 3}
+            existing_scope = str(existing["content_scope"] or "unknown")
+            existing_completeness = str(existing["evidence_completeness"] or "partial_legacy")
+            existing_bundle_rank = depth.get(existing_scope, 0) + (
+                100 if existing_completeness == "complete" else 0
+            )
+            incoming_bundle_rank = depth.get(normalized_scope, 0) + (
+                100 if normalized_completeness == "complete" else 0
+            )
+            replace_bundle = incoming_bundle_rank > existing_bundle_rank
+            durable_scope = normalized_scope if replace_bundle else existing_scope
+            durable_snapshot = (
+                snapshot_json if replace_bundle else str(existing["evidence_snapshot"] or "{}")
+            )
+            durable_completeness = (
+                normalized_completeness if replace_bundle else existing_completeness
+            )
+            conn.execute(
+                """
+                UPDATE news_event_memberships
+                SET relation_basis = CASE WHEN relation_basis = '' THEN ? ELSE relation_basis END,
+                    relation_score = MAX(relation_score, ?),
+                    content_scope = ?,
+                    media = CASE WHEN media = '' THEN ? ELSE media END,
+                    provider = CASE WHEN provider = '' THEN ? ELSE provider END,
+                    title = CASE WHEN title = '' THEN ? ELSE title END,
+                    canonical_url = CASE
+                        WHEN canonical_url = '' THEN ? ELSE canonical_url END,
+                    published_at = CASE
+                        WHEN published_at = '' THEN ? ELSE published_at END,
+                    retrieved_at = CASE
+                        WHEN retrieved_at = '' THEN ? ELSE retrieved_at END,
+                    evidence_snapshot = ?,
+                    evidence_completeness = ?,
+                    origin_tracking_id = CASE
+                        WHEN origin_tracking_id = '' THEN ? ELSE origin_tracking_id END,
+                    origin_check_id = CASE
+                        WHEN origin_check_id = '' THEN ? ELSE origin_check_id END,
+                    origin_candidate_record_id = CASE
+                        WHEN origin_candidate_record_id = '' THEN ?
+                        ELSE origin_candidate_record_id END,
+                    origin_evidence_id = CASE
+                        WHEN origin_evidence_id = '' THEN ? ELSE origin_evidence_id END,
+                    first_seen_at = CASE
+                        WHEN first_seen_at = '' THEN ? ELSE first_seen_at END,
+                    last_seen_at = CASE
+                        WHEN ? > last_seen_at THEN ? ELSE last_seen_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE membership_id = ?
+                """,
+                (
+                    str(relation_basis or "").strip()[:500],
+                    max(0.0, min(1.0, float(relation_score or 0.0))),
+                    durable_scope,
+                    str(media or "").strip()[:300],
+                    str(provider or "").strip()[:300],
+                    str(title or "").strip()[:1_000],
+                    str(canonical_url or "").strip()[:4_096],
+                    str(published_at or "").strip()[:120],
+                    str(retrieved_at or "").strip()[:120],
+                    durable_snapshot,
+                    durable_completeness,
+                    str(origin_tracking_id or "").strip(),
+                    str(origin_check_id or "").strip(),
+                    str(origin_candidate_record_id or "").strip(),
+                    str(origin_evidence_id or "").strip(),
+                    str(first_seen_at or observed_at).strip(),
+                    observed_at,
+                    observed_at,
+                    str(existing["membership_id"]),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM news_event_memberships WHERE membership_id = ?",
+                (str(existing["membership_id"]),),
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise RuntimeError("news event membership disappeared after update")
+            return row, False
+        membership_id = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO news_event_memberships (
+                membership_id, event_id, change_id, evidence_item_key,
+                evidence_fingerprint, relation_kind, relation_basis, relation_score,
+                content_scope, media, provider, title, canonical_url, published_at,
+                retrieved_at, evidence_snapshot, evidence_completeness,
+                origin_tracking_id, origin_check_id, origin_candidate_record_id,
+                origin_evidence_id, first_seen_at, last_seen_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                membership_id,
+                normalized_event_id,
+                normalized_change_id or None,
+                normalized_item_key,
+                normalized_fingerprint,
+                normalized_relation,
+                str(relation_basis or "").strip()[:500],
+                max(0.0, min(1.0, float(relation_score or 0.0))),
+                normalized_scope,
+                str(media or "").strip()[:300],
+                str(provider or "").strip()[:300],
+                str(title or "").strip()[:1_000],
+                str(canonical_url or "").strip()[:4_096],
+                str(published_at or "").strip()[:120],
+                str(retrieved_at or "").strip()[:120],
+                snapshot_json,
+                normalized_completeness,
+                str(origin_tracking_id or "").strip(),
+                str(origin_check_id or "").strip(),
+                str(origin_candidate_record_id or "").strip(),
+                str(origin_evidence_id or "").strip(),
+                str(first_seen_at or observed_at).strip(),
+                observed_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM news_event_memberships WHERE membership_id = ?",
+            (membership_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("news event membership disappeared after insert")
+        return row, True
+
+    def _upsert_news_event_change_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        change: Mapping[str, Any],
+        check_id: str = "",
+        detected_at: str = "",
+        evidence_completeness: str = "complete",
+    ) -> tuple[sqlite3.Row, bool, int, bool]:
+        normalized_event_id = str(event_id or "").strip()
+        change_type = str(change.get("change_type") or "").strip().lower()[:120]
+        previous_state = str(change.get("previous_state") or "").strip()[:8_000]
+        new_state = str(change.get("new_state") or "").strip()[:8_000]
+        if not normalized_event_id or not change_type:
+            raise ValueError("event_id and change_type are required")
+        source_scope = str(change.get("source_scope") or "single_source").strip().lower()
+        evidence_status = str(change.get("evidence_status") or "source_supported").strip().lower()
+        lifecycle = str(change.get("lifecycle") or "active").strip().lower()
+        role = str(change.get("role") or "analysis").strip().lower()
+        objectivity_status = str(change.get("objectivity_status") or "unconfirmed").strip().lower()
+        conflict_status = str(change.get("conflict_status") or "none").strip().lower()
+        if source_scope not in _NEWS_EVENT_SOURCE_SCOPES:
+            raise ValueError("unsupported news event source scope")
+        if evidence_status not in _NEWS_EVENT_EVIDENCE_STATUSES:
+            raise ValueError("unsupported news event evidence status")
+        if lifecycle not in _NEWS_EVENT_CHANGE_LIFECYCLES:
+            raise ValueError("unsupported news event change lifecycle")
+        if role not in _NEWS_EVENT_CHANGE_ROLES:
+            raise ValueError("unsupported news event change role")
+        if objectivity_status not in _NEWS_EVENT_OBJECTIVITY_STATUSES:
+            raise ValueError("unsupported news event objectivity status")
+        if conflict_status not in _NEWS_EVENT_CONFLICT_STATUSES:
+            raise ValueError("unsupported news event conflict status")
+        declared_conflict = (
+            objectivity_status == "disputed"
+            or conflict_status == "contested"
+            or evidence_status == "contested"
+        )
+        incoming_snapshot = change.get("evidence_snapshot") or change
+        incoming_verified_scope = self._news_event_verified_content_scope(
+            change.get("content_scope") or "unknown",
+            incoming_snapshot,
+            change.get("title") or "",
+        )
+        incoming_has_durable_depth = (
+            evidence_completeness == "complete"
+            and incoming_verified_scope in {"summary", "full_text"}
+        )
+        supersedes_change_id = str(change.get("supersedes_change_id") or "").strip()
+        supersedes_lifecycle = (
+            str(change.get("supersedes_lifecycle") or "superseded").strip().lower()
+        )
+        if supersedes_lifecycle not in {"superseded", "invalidated"}:
+            raise ValueError("unsupported supersedes lifecycle")
+        if supersedes_change_id:
+            supersedes_change_id = self._resolve_news_event_change_id_on(
+                conn,
+                supersedes_change_id,
+            )
+            superseded = (
+                conn.execute(
+                    "SELECT event_id FROM news_event_changes WHERE change_id = ?",
+                    (supersedes_change_id,),
+                ).fetchone()
+                if supersedes_change_id
+                else None
+            )
+            if superseded is None or str(superseded["event_id"]) != normalized_event_id:
+                raise ValueError("supersedes_change_id does not belong to event_id")
+        event = conn.execute(
+            "SELECT * FROM news_events WHERE event_id = ?",
+            (normalized_event_id,),
+        ).fetchone()
+        if event is None:
+            raise KeyError(normalized_event_id)
+        if str(event["status"] or "") == "merged":
+            raise ValueError("cannot append changes to a merged news event")
+        normalized_detected_at = str(
+            detected_at or change.get("detected_at") or change.get("retrieved_at") or ""
+        ).strip()
+        raw_effective_at = " ".join(str(change.get("effective_at") or "").split()).strip()
+        effective_precision = str(change.get("effective_precision") or "").strip().lower()
+        effective_basis = str(change.get("effective_basis") or "").strip().lower()
+        raw_published_at = " ".join(str(change.get("published_at") or "").split()).strip()
+        normalized_published_at = self._normalize_news_event_effective_at(raw_published_at)
+        effective_is_publication_fallback = effective_basis == "published_at_fallback" or bool(
+            raw_effective_at
+            and normalized_published_at
+            and self._normalize_news_event_effective_at(raw_effective_at) == normalized_published_at
+        )
+        if effective_is_publication_fallback:
+            published_date_match = re.match(
+                r"^(\d{4}-\d{2}-\d{2})(?:$|T|\s)",
+                raw_published_at or raw_effective_at,
+            )
+            if published_date_match is not None:
+                try:
+                    datetime.fromisoformat(published_date_match.group(1))
+                except ValueError:
+                    pass
+                else:
+                    raw_effective_at = published_date_match.group(1)
+                    effective_precision = "date"
+        if not effective_precision:
+            effective_precision = (
+                "date"
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_effective_at)
+                else "minute"
+                if raw_effective_at
+                else "unknown"
+            )
+        if effective_precision not in {"unknown", "date", "minute"}:
+            raise ValueError("unsupported news event effective precision")
+        if effective_precision == "date" and raw_effective_at:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_effective_at):
+                effective_at = self._normalize_news_event_effective_at(raw_effective_at)
+            else:
+                try:
+                    parsed_local_effective = datetime.fromisoformat(
+                        raw_effective_at.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    effective_at = ""
+                else:
+                    effective_at = (
+                        parsed_local_effective.date().isoformat()
+                        if parsed_local_effective.tzinfo is not None
+                        else ""
+                    )
+        else:
+            effective_at = self._normalize_news_event_effective_at(raw_effective_at)
+        normalized_previous_state = unicodedata.normalize(
+            "NFKC",
+            " ".join(previous_state.split()).strip(),
+        ).casefold()
+        normalized_new_state = unicodedata.normalize(
+            "NFKC",
+            " ".join(new_state.split()).strip(),
+        ).casefold()
+        durable_declared_conflict = bool(
+            declared_conflict
+            and incoming_has_durable_depth
+            and role == "objective_change"
+            and normalized_previous_state
+            and normalized_new_state
+            and normalized_previous_state != normalized_new_state
+            and effective_at
+            and self._news_event_effective_has_started(
+                effective_at,
+                normalized_detected_at,
+            )
+        )
+        if durable_declared_conflict:
+            # Storage is the final integrity boundary: only a durable factual
+            # transition may freeze an event.  Canonicalize all three conflict
+            # fields so conflict counts, unread state, and the audit endpoint
+            # cannot disagree.
+            objectivity_status = "disputed"
+            conflict_status = "contested"
+            evidence_status = "contested"
+        elif declared_conflict:
+            # Expectations, sentiment, analysis, future claims, and shallow
+            # evidence remain useful secondary context.  A producer label alone
+            # cannot let them enter the durable conflict ledger or freeze facts.
+            objectivity_status = "unconfirmed" if role == "objective_change" else "not_applicable"
+            conflict_status = "none"
+            if evidence_status == "contested":
+                evidence_status = (
+                    "cross_source_supported"
+                    if incoming_has_durable_depth and source_scope == "multi_source"
+                    else "source_supported"
+                    if incoming_has_durable_depth
+                    else "provisional"
+                )
+        if (
+            role == "objective_change"
+            and objectivity_status == "confirmed"
+            and effective_at
+            and not self._news_event_effective_has_started(
+                effective_at,
+                normalized_detected_at,
+            )
+        ):
+            # Storage is the final integrity boundary.  A producer may preserve
+            # the claim, but a future-effective state cannot enter the fact feed.
+            objectivity_status = "unconfirmed"
+        fingerprint = self.news_event_change_fingerprint(
+            change_type=change_type,
+            previous_state=previous_state,
+            new_state=new_state,
+            effective_at=effective_at,
+            effective_precision=effective_precision,
+        )
+        existing = conn.execute(
+            """
+            SELECT * FROM news_event_changes
+            WHERE event_id = ? AND change_fingerprint = ?
+            """,
+            (normalized_event_id, fingerprint),
+        ).fetchone()
+        if existing is None:
+            # A first observation may know the state transition but not its
+            # effective time.  When later evidence supplies that time, upgrade
+            # the one unambiguous provisional row in place so its evidence and
+            # public id are not split across two changes.  If several recurring
+            # transitions match, ambiguity wins and a separate row is safer.
+            semantic_candidates = conn.execute(
+                """
+                SELECT * FROM news_event_changes
+                WHERE event_id = ? AND lifecycle = 'active'
+                ORDER BY created_at, change_id
+                """,
+                (normalized_event_id,),
+            ).fetchall()
+
+            semantic_matches = [
+                row
+                for row in semantic_candidates
+                if self._news_event_change_type_family(row["change_type"])
+                == self._news_event_change_type_family(change_type)
+                and self._news_event_states_semantically_equivalent(
+                    row["previous_state"],
+                    previous_state,
+                )
+                and self._news_event_states_semantically_equivalent(
+                    row["new_state"],
+                    new_state,
+                )
+                and (
+                    not str(row["effective_at"] or "")
+                    or not effective_at
+                    or self._news_event_effective_bucket(
+                        row["effective_at"],
+                        row["effective_precision"],
+                    )
+                    == self._news_event_effective_bucket(
+                        effective_at,
+                        effective_precision,
+                    )
+                )
+            ]
+            if len(semantic_matches) == 1:
+                existing = semantic_matches[0]
+                if (
+                    str(existing["change_fingerprint"] or "") != fingerprint
+                    or str(existing["fingerprint_version"] or "")
+                    != _NEWS_EVENT_CHANGE_FINGERPRINT_VERSION
+                ):
+                    conn.execute(
+                        """
+                        UPDATE news_event_changes
+                        SET change_fingerprint = ?, fingerprint_version = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE change_id = ?
+                        """,
+                        (
+                            fingerprint,
+                            _NEWS_EVENT_CHANGE_FINGERPRINT_VERSION,
+                            str(existing["change_id"]),
+                        ),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM news_event_changes WHERE change_id = ?",
+                        (str(existing["change_id"]),),
+                    ).fetchone()
+        origin_evidence_id = str(change.get("origin_evidence_id") or "").strip()
+        created = existing is None
+        incoming_is_default = self._news_event_change_is_default(
+            role=role,
+            objectivity_status=objectivity_status,
+            conflict_status=conflict_status,
+            previous_state=previous_state,
+            new_state=new_state,
+            evidence_status=evidence_status,
+            effective_at=effective_at,
+            detected_at=normalized_detected_at,
+            lifecycle=lifecycle,
+        )
+        incoming_authorizes_default = incoming_has_durable_depth and incoming_is_default
+        if (
+            role == "objective_change"
+            and objectivity_status == "confirmed"
+            and not (previous_state and new_state and effective_at)
+        ):
+            raise ValueError(
+                "confirmed objective changes require previous_state, new_state, and effective_at"
+            )
+        became_default = incoming_is_default
+        if existing is None:
+            requested_change_id = str(change.get("change_id") or "").strip()
+            if requested_change_id:
+                aliased = conn.execute(
+                    "SELECT 1 FROM news_event_change_aliases WHERE alias_change_id = ?",
+                    (requested_change_id,),
+                ).fetchone()
+                occupied = conn.execute(
+                    "SELECT 1 FROM news_event_changes WHERE change_id = ?",
+                    (requested_change_id,),
+                ).fetchone()
+                if aliased is not None:
+                    raise ValueError("change_id is a durable alias and cannot be reused")
+                if occupied is not None:
+                    raise ValueError("change_id already belongs to another change")
+            change_id = requested_change_id or str(uuid4())
+            conn.execute(
+                """
+                INSERT INTO news_event_changes (
+                    change_id, event_id, change_fingerprint, fingerprint_version,
+                    change_type, previous_state, new_state, fact, inference, summary,
+                    evidence_quote, confidence, role, objectivity_status,
+                    conflict_status, source_scope, evidence_status, lifecycle,
+                    supersedes_change_id, supersedes_lifecycle, is_read,
+                    origin_check_id, origin_evidence_id, effective_at,
+                    effective_precision, detected_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    change_id,
+                    normalized_event_id,
+                    fingerprint,
+                    _NEWS_EVENT_CHANGE_FINGERPRINT_VERSION,
+                    change_type,
+                    previous_state,
+                    new_state,
+                    str(change.get("fact") or "").strip()[:8_000],
+                    str(change.get("inference") or "").strip()[:8_000],
+                    str(change.get("summary") or "").strip()[:4_000],
+                    str(change.get("evidence_quote") or "").strip()[:4_000],
+                    max(0.0, min(1.0, float(change.get("confidence") or 0.0))),
+                    role,
+                    objectivity_status,
+                    conflict_status,
+                    source_scope,
+                    evidence_status,
+                    lifecycle,
+                    (supersedes_change_id or None if incoming_authorizes_default else None),
+                    supersedes_lifecycle,
+                    (
+                        0
+                        if conflict_status == "contested"
+                        else 1
+                        if not incoming_is_default or bool(change.get("is_read", False))
+                        else 0
+                    ),
+                    str(check_id or change.get("origin_check_id") or "").strip(),
+                    origin_evidence_id,
+                    effective_at,
+                    effective_precision,
+                    normalized_detected_at,
+                ),
+            )
+        else:
+            change_id = str(existing["change_id"])
+            merged_source_scope = self._news_event_source_scope(
+                existing["source_scope"], source_scope
+            )
+            merged_evidence_status = self._news_event_evidence_status(
+                existing["evidence_status"], evidence_status
+            )
+            if conflict_status == "resolved" and evidence_status != "contested":
+                merged_evidence_status = evidence_status
+            existing_role = str(existing["role"] or "analysis")
+            merged_role = (
+                "objective_change"
+                if "objective_change" in {existing_role, role}
+                else existing_role
+                if existing_role != "analysis"
+                else role
+            )
+            existing_objectivity = str(existing["objectivity_status"] or "unconfirmed")
+            if objectivity_status == "disputed" or (
+                existing_objectivity == "disputed" and conflict_status != "resolved"
+            ):
+                merged_objectivity = "disputed"
+            elif "confirmed" in {existing_objectivity, objectivity_status}:
+                merged_objectivity = "confirmed"
+            elif existing_objectivity != "unconfirmed":
+                merged_objectivity = existing_objectivity
+            else:
+                merged_objectivity = objectivity_status
+            existing_conflict = str(existing["conflict_status"] or "none")
+            if conflict_status == "resolved":
+                merged_conflict = "resolved"
+            elif "contested" in {existing_conflict, conflict_status}:
+                merged_conflict = "contested"
+            elif existing_conflict == "resolved":
+                merged_conflict = "resolved"
+            else:
+                merged_conflict = "none"
+            existing_is_default = bool(int(existing["is_objective_default"] or 0))
+            existing_effective_at = str(existing["effective_at"] or "")
+            existing_effective_precision = str(existing["effective_precision"] or "unknown")
+            existing_detected_at = str(existing["detected_at"] or "")
+            if not incoming_has_durable_depth:
+                # A title-only or incomplete duplicate may add an auditable
+                # membership, but it cannot splice together role/objectivity,
+                # effective time, conflict resolution, or supersede authority
+                # from a stronger row that happens to share its fingerprint.
+                merged_role = existing_role
+                merged_objectivity = existing_objectivity
+                merged_conflict = existing_conflict
+                merged_evidence_status = str(existing["evidence_status"] or "provisional")
+                merged_effective_at = existing_effective_at
+                merged_effective_precision = existing_effective_precision
+                merged_detected_at = existing_detected_at
+            elif not existing_is_default:
+                # A non-default row may contain claims learned from weak legacy
+                # evidence.  Promotion must be authorized by one complete
+                # incoming fact, never by mixing the most favorable fields from
+                # separate inputs.
+                merged_role = role
+                merged_objectivity = objectivity_status
+                merged_conflict = conflict_status
+                merged_evidence_status = evidence_status
+                merged_effective_at = effective_at or existing_effective_at
+                merged_effective_precision = (
+                    effective_precision if effective_at else existing_effective_precision
+                )
+                merged_detected_at = normalized_detected_at or existing_detected_at
+            else:
+                merged_effective_at = existing_effective_at or effective_at
+                merged_effective_precision = (
+                    existing_effective_precision
+                    if existing_effective_precision != "unknown"
+                    else effective_precision
+                )
+                merged_detected_at = existing_detected_at or normalized_detected_at
+            merged_is_default = self._news_event_change_is_default(
+                role=merged_role,
+                objectivity_status=merged_objectivity,
+                conflict_status=merged_conflict,
+                previous_state=previous_state,
+                new_state=new_state,
+                evidence_status=merged_evidence_status,
+                effective_at=merged_effective_at,
+                detected_at=merged_detected_at,
+                lifecycle=existing["lifecycle"],
+            )
+            became_default = merged_is_default and not existing_is_default
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET source_scope = ?, evidence_status = ?, role = ?,
+                    objectivity_status = ?, conflict_status = ?,
+                    fact = CASE WHEN fact = '' THEN ? ELSE fact END,
+                    inference = CASE WHEN inference = '' THEN ? ELSE inference END,
+                    summary = CASE WHEN summary = '' THEN ? ELSE summary END,
+                    evidence_quote = CASE
+                        WHEN evidence_quote = '' THEN ? ELSE evidence_quote END,
+                    confidence = MAX(confidence, ?),
+                    effective_at = CASE
+                        WHEN effective_at = '' THEN ? ELSE effective_at END,
+                    effective_precision = CASE
+                        WHEN effective_precision = 'unknown' THEN ?
+                        ELSE effective_precision END,
+                    detected_at = CASE WHEN ? THEN ? ELSE detected_at END,
+                    is_read = CASE WHEN ? THEN 0 ELSE is_read END,
+                    origin_check_id = CASE
+                        WHEN origin_check_id = '' THEN ? ELSE origin_check_id END,
+                    origin_evidence_id = CASE
+                        WHEN origin_evidence_id = '' THEN ? ELSE origin_evidence_id END,
+                    supersedes_change_id = CASE
+                        WHEN supersedes_change_id IS NULL THEN ?
+                        ELSE supersedes_change_id END,
+                    supersedes_lifecycle = CASE
+                        WHEN supersedes_change_id IS NULL THEN ?
+                        ELSE supersedes_lifecycle END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ?
+                """,
+                (
+                    merged_source_scope,
+                    merged_evidence_status,
+                    merged_role,
+                    merged_objectivity,
+                    merged_conflict,
+                    str(change.get("fact") or "").strip()[:8_000],
+                    str(change.get("inference") or "").strip()[:8_000],
+                    str(change.get("summary") or "").strip()[:4_000],
+                    str(change.get("evidence_quote") or "").strip()[:4_000],
+                    max(0.0, min(1.0, float(change.get("confidence") or 0.0))),
+                    effective_at,
+                    merged_effective_precision,
+                    int(incoming_has_durable_depth and not existing_detected_at),
+                    merged_detected_at,
+                    int(
+                        became_default
+                        or (merged_conflict == "contested" and existing_conflict != "contested")
+                    ),
+                    str(check_id or change.get("origin_check_id") or "").strip(),
+                    origin_evidence_id,
+                    (supersedes_change_id or None if incoming_authorizes_default else None),
+                    supersedes_lifecycle,
+                    change_id,
+                ),
+            )
+        evidence = dict(change)
+        item_key = str(evidence.get("item_key") or evidence.get("evidence_item_key") or "").strip()
+        evidence_fingerprint = str(evidence.get("evidence_fingerprint") or "").strip()
+        membership_created_count = 0
+        if item_key:
+            snapshot = evidence.get("evidence_snapshot") or evidence
+            if not evidence_fingerprint:
+                evidence_fingerprint = self._news_event_evidence_fingerprint(
+                    item_key=item_key,
+                    snapshot=snapshot,
+                )
+            _, membership_created = self._upsert_news_event_membership_on(
+                conn,
+                event_id=normalized_event_id,
+                change_id=change_id,
+                evidence_item_key=item_key,
+                evidence_fingerprint=evidence_fingerprint,
+                relation_kind=str(
+                    evidence.get("relation_kind")
+                    or ("contradicts_change" if declared_conflict else "supports_change")
+                ),
+                relation_basis=str(
+                    evidence.get("match_basis") or evidence.get("relation_basis") or ""
+                ),
+                relation_score=float(
+                    evidence.get("match_score") or evidence.get("relation_score") or 0.0
+                ),
+                content_scope=str(evidence.get("content_scope") or "unknown"),
+                media=str(
+                    evidence.get("media") or evidence.get("source") or evidence.get("up_name") or ""
+                ),
+                provider=str(evidence.get("provider") or ""),
+                title=str(evidence.get("title") or ""),
+                canonical_url=str(
+                    evidence.get("canonical_url") or evidence.get("content_url") or ""
+                ),
+                published_at=str(evidence.get("published_at") or ""),
+                retrieved_at=str(evidence.get("retrieved_at") or normalized_detected_at),
+                evidence_snapshot=snapshot,
+                evidence_completeness=evidence_completeness,
+                origin_tracking_id=str(evidence.get("origin_tracking_id") or ""),
+                origin_check_id=str(check_id or evidence.get("origin_check_id") or ""),
+                origin_candidate_record_id=str(evidence.get("origin_candidate_record_id") or ""),
+                origin_evidence_id=origin_evidence_id,
+                first_seen_at=str(evidence.get("first_seen_at") or normalized_detected_at),
+                last_seen_at=str(evidence.get("last_seen_at") or normalized_detected_at),
+            )
+            membership_created_count += int(membership_created)
+        raw_corroborating = evidence.get("corroborating_sources")
+        if isinstance(raw_corroborating, Sequence) and not isinstance(
+            raw_corroborating, (str, bytes)
+        ):
+            for raw_source in list(raw_corroborating)[:5]:
+                if not isinstance(raw_source, Mapping):
+                    continue
+                source_snapshot = {
+                    "source": str(raw_source.get("source") or raw_source.get("media") or "")[:300],
+                    "provider": str(raw_source.get("provider") or "")[:300],
+                    "url": str(
+                        raw_source.get("url")
+                        or raw_source.get("canonical_url")
+                        or raw_source.get("content_url")
+                        or ""
+                    )[:4_096],
+                    "published_at": str(raw_source.get("published_at") or "")[:120],
+                    "declared_content_scope": str(raw_source.get("content_scope") or "unknown")[
+                        :40
+                    ],
+                }
+                if not any(source_snapshot.values()):
+                    continue
+                encoded_source = json.dumps(
+                    source_snapshot,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                source_digest = hashlib.sha256(encoded_source).hexdigest()
+                _, corroborating_created = self._upsert_news_event_membership_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    change_id=change_id,
+                    evidence_item_key=f"news:corroborating:{source_digest[:32]}",
+                    evidence_fingerprint=source_digest,
+                    relation_kind="supports_change",
+                    relation_basis="corroborating_source_metadata",
+                    relation_score=0.0,
+                    # The dedupe cluster retains a pointer, not the independent
+                    # article body.  Keep it auditable without overstating depth.
+                    content_scope="unknown",
+                    media=source_snapshot["source"],
+                    provider=source_snapshot["provider"],
+                    canonical_url=source_snapshot["url"],
+                    published_at=source_snapshot["published_at"],
+                    retrieved_at=normalized_detected_at,
+                    evidence_snapshot=source_snapshot,
+                    evidence_completeness=evidence_completeness,
+                    origin_tracking_id=str(evidence.get("origin_tracking_id") or ""),
+                    origin_check_id=str(check_id or evidence.get("origin_check_id") or ""),
+                    first_seen_at=normalized_detected_at,
+                    last_seen_at=normalized_detected_at,
+                )
+                membership_created_count += int(corroborating_created)
+        self._recompute_news_event_change_evidence_on(conn, change_id)
+        row, became_default = self._refresh_news_event_change_default_on(conn, change_id)
+        self._contest_divergent_news_event_changes_on(conn, change_id)
+        row = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (change_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("news event change disappeared during conflict projection")
+        durable_supersedes_id = supersedes_change_id if incoming_authorizes_default else ""
+        lineage_accepted = False
+        if incoming_authorizes_default and durable_supersedes_id:
+            if durable_supersedes_id == change_id:
+                raise ValueError("a news event change cannot supersede itself")
+            lineage_accepted = self._reconcile_news_event_lineage_on(
+                conn,
+                event_id=normalized_event_id,
+                successor_change_id=change_id,
+                predecessor_change_id=durable_supersedes_id,
+                supersedes_lifecycle=supersedes_lifecycle,
+                source_event_id=str(change.get("source_event_id") or normalized_event_id),
+                source_change_id=str(change.get("change_id") or change_id),
+                explicit_resolution=(
+                    conflict_status == "resolved"
+                    and str(row["conflict_status"] or "none") == "resolved"
+                ),
+                force_contested=(str(row["conflict_status"] or "none") == "contested"),
+            )
+            row = conn.execute(
+                "SELECT * FROM news_event_changes WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise RuntimeError("news event change disappeared during lineage projection")
+        if (
+            lineage_accepted
+            and bool(int(row["is_objective_default"] or 0))
+            and durable_supersedes_id
+        ):
+            conn.execute(
+                """
+                UPDATE news_event_changes
+                SET lifecycle = ?, is_objective_default = 0, is_read = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE change_id = ? AND event_id = ?
+                """,
+                (
+                    str(row["supersedes_lifecycle"] or "superseded"),
+                    durable_supersedes_id,
+                    normalized_event_id,
+                ),
+            )
+        self._recompute_news_event_state_on(conn, normalized_event_id)
+        row = conn.execute(
+            "SELECT * FROM news_event_changes WHERE change_id = ?",
+            (change_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("news event change disappeared after state projection")
+        became_default = bool(int(row["is_objective_default"] or 0)) and not (
+            bool(int(existing["is_objective_default"] or 0)) if existing is not None else False
+        )
+        return row, created, membership_created_count, became_default
+
+    def _ensure_tracked_observation_event_on(
+        self,
+        conn: sqlite3.Connection,
+        tracker: Mapping[str, Any],
+        *,
+        origin_completeness: str = "partial_legacy",
+    ) -> tuple[sqlite3.Row, bool]:
+        tracker = dict(tracker)
+        tracking_id = str(tracker.get("tracking_id") or "").strip()
+        if not tracking_id:
+            raise ValueError("tracking_id is required")
+        try:
+            raw_snapshot = json.loads(str(tracker.get("original_snapshot") or "{}"))
+        except (TypeError, ValueError):
+            raw_snapshot = {}
+        snapshot = dict(raw_snapshot) if isinstance(raw_snapshot, Mapping) else {}
+        title = str(snapshot.get("title") or tracker.get("observation") or "").strip()
+        observed_at = str(
+            snapshot.get("retrieved_at")
+            or snapshot.get("published_at")
+            or tracker.get("created_at")
+            or ""
+        ).strip()
+        linked_event_id = str(tracker.get("event_id") or "").strip()
+        event: sqlite3.Row | None = None
+        created = False
+        if linked_event_id:
+            linked = self._resolve_news_event_row_on(conn, linked_event_id)
+            if linked is not None:
+                canonical_id = str(linked["event_id"])
+                if canonical_id != linked_event_id:
+                    conn.execute(
+                        "UPDATE tracked_observations SET event_id = ? WHERE tracking_id = ?",
+                        (canonical_id, tracking_id),
+                    )
+                event = linked
+        if event is None:
+            normalized_story_key = unicodedata.normalize(
+                "NFKC",
+                " ".join(str(tracker.get("story_key") or "").split()).strip(),
+            ).casefold()
+            if normalized_story_key:
+                identity_digest = hashlib.sha256(normalized_story_key.encode()).hexdigest()
+                event_key = f"tracking-story-v2:{identity_digest}"
+            else:
+                event_key = f"legacy-tracking:{tracking_id}"
+            event_id = str(uuid5(NAMESPACE_URL, f"newsclaw:event:{event_key}"))
+            event, created = self._create_news_event_on(
+                conn,
+                event_id=event_id,
+                event_key=event_key,
+                canonical_title=title or f"跟踪观察 {tracking_id}",
+                event_type="tracked_observation",
+                topic_group=str(tracker.get("topic_group") or ""),
+                story_key=str(tracker.get("story_key") or ""),
+                # The tracker seed is an observation baseline, not a confirmed fact.
+                # Origin evidence retains it; current_state starts only after a
+                # default-eligible objective change has passed the durable gate.
+                current_state="",
+                origin_tracking_id=tracking_id,
+                first_seen_at=observed_at,
+                last_seen_at=observed_at,
+            )
+        event_id = str(event["event_id"])
+        conn.execute(
+            "UPDATE tracked_observations SET event_id = ? WHERE tracking_id = ?",
+            (event_id, tracking_id),
+        )
+        item_key = str(tracker.get("item_key") or "").strip()
+        if item_key:
+            evidence_fingerprint = str(snapshot.get("evidence_fingerprint") or "").strip()
+            if not evidence_fingerprint:
+                evidence_fingerprint = self._news_event_evidence_fingerprint(
+                    item_key=item_key,
+                    snapshot=snapshot,
+                )
+            self._upsert_news_event_membership_on(
+                conn,
+                event_id=event_id,
+                evidence_item_key=item_key,
+                evidence_fingerprint=evidence_fingerprint,
+                relation_kind="origin",
+                content_scope=str(snapshot.get("content_scope") or "title_only"),
+                media=str(snapshot.get("media") or snapshot.get("source") or ""),
+                provider=str(snapshot.get("provider") or ""),
+                title=str(snapshot.get("title") or title),
+                canonical_url=str(
+                    snapshot.get("canonical_url") or snapshot.get("content_url") or ""
+                ),
+                published_at=str(snapshot.get("published_at") or ""),
+                retrieved_at=str(snapshot.get("retrieved_at") or observed_at),
+                evidence_snapshot=snapshot,
+                evidence_completeness=origin_completeness,
+                origin_tracking_id=tracking_id,
+                first_seen_at=observed_at,
+                last_seen_at=observed_at,
+            )
+        return event, created
+
+    def create_news_event(
+        self,
+        *,
+        canonical_title: str,
+        event_key: str = "",
+        event_id: str = "",
+        event_type: str = "unknown",
+        topic_group: str = "",
+        story_key: str = "",
+        entities: Sequence[object] = (),
+        current_state: str = "",
+        origin_tracking_id: str = "",
+        first_seen_at: str = "",
+        last_seen_at: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one canonical news event, deduplicated by key or tracking origin."""
+
+        normalized_id = str(event_id or uuid4()).strip()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row, created = self._create_news_event_on(
+                conn,
+                event_id=normalized_id,
+                event_key=event_key,
+                canonical_title=canonical_title,
+                event_type=event_type,
+                topic_group=topic_group,
+                story_key=story_key,
+                entities=entities,
+                current_state=current_state,
+                origin_tracking_id=origin_tracking_id,
+                first_seen_at=first_seen_at,
+                last_seen_at=last_seen_at,
+            )
+            if origin_tracking_id:
+                tracker = conn.execute(
+                    "SELECT * FROM tracked_observations WHERE tracking_id = ?",
+                    (str(origin_tracking_id).strip(),),
+                ).fetchone()
+                if tracker is None:
+                    raise KeyError(str(origin_tracking_id).strip())
+                conn.execute(
+                    "UPDATE tracked_observations SET event_id = ? WHERE tracking_id = ?",
+                    (str(row["event_id"]), str(origin_tracking_id).strip()),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        return self._news_event_dict(cast("Mapping[str, Any]", row)), created
+
+    def get_news_event(
+        self,
+        event_id: str,
+        *,
+        resolve_merged: bool = True,
+        objective_only: bool = True,
+    ) -> dict[str, Any] | None:
+        normalized_id = str(event_id or "").strip()
+        if not normalized_id:
+            return None
+        self._ensure_fresh_read()
+        objective_filter = (
+            """
+              AND c.is_objective_default = 1
+            """
+            if objective_only
+            else ""
+        )
+        seen: set[str] = set()
+        while normalized_id and normalized_id not in seen:
+            seen.add(normalized_id)
+            row = self.conn.execute(
+                (
+                    """
+                SELECT e.*,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id) AS total_change_count,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id AND c.lifecycle = 'active'
+                        """
+                    + objective_filter
+                    + """
+                       ) AS change_count,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND c.lifecycle = 'active' AND c.is_read = 0
+                        """
+                    + objective_filter
+                    + """
+                       ) AS unread_change_count,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND c.lifecycle = 'active'
+                          AND c.role = 'objective_change'
+                          AND c.objectivity_status = 'disputed'
+                          AND c.conflict_status = 'contested'
+                          AND c.evidence_status = 'contested'
+                       ) AS conflict_count,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND c.lifecycle = 'active' AND c.is_read = 0
+                          AND c.role = 'objective_change'
+                          AND c.objectivity_status = 'disputed'
+                          AND c.conflict_status = 'contested'
+                          AND c.evidence_status = 'contested'
+                       ) AS unread_conflict_count,
+                       (SELECT COUNT(*) FROM news_event_memberships m
+                        WHERE m.event_id = e.event_id) AS evidence_count
+                FROM news_events e
+                WHERE e.event_id = ?
+                """
+                ),
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if (
+                resolve_merged
+                and str(row["status"] or "") == "merged"
+                and str(row["merged_into_event_id"] or "")
+            ):
+                normalized_id = str(row["merged_into_event_id"])
+                continue
+            return self._news_event_dict(row)
+        raise RuntimeError("news event merge cycle detected")
+
+    def bind_tracked_observation_event(
+        self,
+        *,
+        tracking_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        normalized_tracking_id = str(tracking_id or "").strip()
+        normalized_event_id = str(event_id or "").strip()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tracker = conn.execute(
+                "SELECT tracking_id FROM tracked_observations WHERE tracking_id = ?",
+                (normalized_tracking_id,),
+            ).fetchone()
+            event = conn.execute(
+                "SELECT event_id FROM news_events WHERE event_id = ?",
+                (normalized_event_id,),
+            ).fetchone()
+            if tracker is None:
+                raise KeyError(normalized_tracking_id)
+            if event is None:
+                raise KeyError(normalized_event_id)
+            conn.execute(
+                "UPDATE tracked_observations SET event_id = ? WHERE tracking_id = ?",
+                (normalized_event_id, normalized_tracking_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        item = self.get_tracked_observation(normalized_tracking_id)
+        if item is None:  # pragma: no cover
+            raise RuntimeError("tracked observation disappeared after event bind")
+        return item
+
+    def record_news_event_projection(
+        self,
+        *,
+        event_id: str,
+        check_status: str,
+        detected_at: str,
+        check_id: str = "",
+        related_memberships: Sequence[Mapping[str, Any]] = (),
+        changes: Sequence[Mapping[str, Any]] = (),
+        evidence_completeness: str = "complete",
+    ) -> dict[str, Any]:
+        """Atomically append evidence memberships and verified semantic changes."""
+
+        normalized_status = str(check_status or "").strip().lower()
+        terminal_statuses = {
+            "changed",
+            "unchanged",
+            "valid_empty",
+            "retry_wait",
+            "failed",
+            "cancelled",
+        }
+        if normalized_status not in terminal_statuses:
+            raise ValueError("unsupported event projection check status")
+        if normalized_status != "changed" and changes:
+            raise ValueError("only a changed check may create news event changes")
+        if normalized_status in {"retry_wait", "failed", "cancelled", "valid_empty"} and (
+            related_memberships or changes
+        ):
+            raise ValueError("non-evidence checks cannot append event evidence")
+        normalized_event_id = str(event_id or "").strip()
+        conn = self.open_connection()
+        created_changes = 0
+        created_default_changes = 0
+        created_memberships = 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            event = conn.execute(
+                "SELECT event_id FROM news_events WHERE event_id = ?",
+                (normalized_event_id,),
+            ).fetchone()
+            if event is None:
+                raise KeyError(normalized_event_id)
+            for raw_membership in related_memberships:
+                membership = dict(raw_membership)
+                item_key = str(
+                    membership.get("item_key") or membership.get("evidence_item_key") or ""
+                ).strip()
+                snapshot = membership.get("evidence_snapshot") or membership
+                evidence_fingerprint = str(membership.get("evidence_fingerprint") or "").strip()
+                if not evidence_fingerprint:
+                    evidence_fingerprint = self._news_event_evidence_fingerprint(
+                        item_key=item_key,
+                        snapshot=snapshot,
+                    )
+                _, created = self._upsert_news_event_membership_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    evidence_item_key=item_key,
+                    evidence_fingerprint=evidence_fingerprint,
+                    relation_kind="related_no_change",
+                    relation_basis=str(
+                        membership.get("match_basis") or membership.get("relation_basis") or ""
+                    ),
+                    relation_score=float(
+                        membership.get("match_score") or membership.get("relation_score") or 0.0
+                    ),
+                    content_scope=str(membership.get("content_scope") or "unknown"),
+                    media=str(
+                        membership.get("media")
+                        or membership.get("source")
+                        or membership.get("up_name")
+                        or ""
+                    ),
+                    provider=str(membership.get("provider") or ""),
+                    title=str(membership.get("title") or ""),
+                    canonical_url=str(
+                        membership.get("canonical_url") or membership.get("content_url") or ""
+                    ),
+                    published_at=str(membership.get("published_at") or ""),
+                    retrieved_at=str(membership.get("retrieved_at") or detected_at),
+                    evidence_snapshot=snapshot,
+                    evidence_completeness=evidence_completeness,
+                    origin_check_id=check_id,
+                    origin_candidate_record_id=str(
+                        membership.get("origin_candidate_record_id") or ""
+                    ),
+                    first_seen_at=str(membership.get("first_seen_at") or detected_at),
+                    last_seen_at=str(membership.get("last_seen_at") or detected_at),
+                )
+                created_memberships += int(created)
+            for raw_change in changes:
+                (
+                    _,
+                    change_created,
+                    membership_created,
+                    became_default,
+                ) = self._upsert_news_event_change_on(
+                    conn,
+                    event_id=normalized_event_id,
+                    change=dict(raw_change),
+                    check_id=check_id,
+                    detected_at=detected_at,
+                    evidence_completeness=evidence_completeness,
+                )
+                created_changes += int(change_created)
+                created_default_changes += int(became_default)
+                created_memberships += int(membership_created)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        return {
+            "event_id": normalized_event_id,
+            "check_status": normalized_status,
+            "created_change_count": created_changes,
+            "created_default_change_count": created_default_changes,
+            "created_membership_count": created_memberships,
+        }
+
+    def list_news_event_memberships(
+        self,
+        event_id: str,
+        *,
+        change_id: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        normalized_event_id = str(event_id or "").strip()
+        normalized_change_id = str(change_id or "").strip()
+        self._ensure_fresh_read()
+        if normalized_change_id:
+            normalized_change_id = self._resolve_news_event_change_id_on(
+                self.conn,
+                normalized_change_id,
+            )
+            if not normalized_change_id:
+                return []
+        clauses = ["event_id = ?"]
+        params: list[object] = [normalized_event_id]
+        if normalized_change_id:
+            clauses.append("change_id = ?")
+            params.append(normalized_change_id)
+        params.extend((max(1, min(500, int(limit))), max(0, int(offset))))
+        rows = self.conn.execute(
+            """
+            SELECT * FROM news_event_memberships
+            WHERE """
+            + " AND ".join(clauses)
+            + " ORDER BY last_seen_at DESC, membership_id DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        return [self._news_event_membership_dict(row) for row in rows]
+
+    def list_news_event_lineage_claims(
+        self,
+        successor_change_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return every candidate edge, including rejected historical losers."""
+
+        normalized_change_id = str(successor_change_id or "").strip()
+        if not normalized_change_id:
+            return []
+        self._ensure_fresh_read()
+        normalized_change_id = self._resolve_news_event_change_id_on(
+            self.conn,
+            normalized_change_id,
+        )
+        if not normalized_change_id:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT * FROM news_event_lineage_claims
+            WHERE successor_change_id = ?
+            ORDER BY
+                CASE status
+                    WHEN 'contested' THEN 0
+                    WHEN 'resolved' THEN 1
+                    WHEN 'active' THEN 2
+                    ELSE 3 END,
+                created_at, claim_id
+            """,
+            (normalized_change_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_news_event_changes(
+        self,
+        *,
+        event_id: str = "",
+        unread_only: bool = False,
+        lifecycle: str = "active",
+        before_detected_at: str = "",
+        before_change_id: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        objective_only: bool = True,
+        conflicts_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        if objective_only and conflicts_only:
+            raise ValueError("objective_only and conflicts_only are mutually exclusive")
+        normalized_lifecycle = str(lifecycle or "active").strip().lower()
+        if normalized_lifecycle not in {*_NEWS_EVENT_CHANGE_LIFECYCLES, "all"}:
+            raise ValueError("unsupported news event change lifecycle")
+        cursor_at = str(before_detected_at or "").strip()
+        cursor_id = str(before_change_id or "").strip()
+        if bool(cursor_at) != bool(cursor_id):
+            raise ValueError("both keyset cursor fields are required")
+        clauses: list[str] = ["e.status != 'merged'"]
+        params: list[object] = []
+        if event_id:
+            clauses.append("c.event_id = ?")
+            params.append(str(event_id).strip())
+        if normalized_lifecycle != "all":
+            clauses.append("c.lifecycle = ?")
+            params.append(normalized_lifecycle)
+        if unread_only:
+            clauses.append("c.is_read = 0")
+        if objective_only:
+            clauses.append("c.is_objective_default = 1")
+        if conflicts_only:
+            clauses.extend(
+                (
+                    "c.objectivity_status = 'disputed'",
+                    "c.conflict_status = 'contested'",
+                    "c.role = 'objective_change'",
+                    "c.evidence_status = 'contested'",
+                )
+            )
+        if cursor_at:
+            clauses.append("(c.detected_at < ? OR (c.detected_at = ? AND c.change_id < ?))")
+            params.extend((cursor_at, cursor_at, cursor_id))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.extend((max(1, min(200, int(limit))), max(0, int(offset))))
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            """
+            SELECT c.*, e.canonical_title, e.topic_group, e.story_key,
+                   (SELECT COUNT(*) FROM news_event_memberships m
+                    WHERE m.change_id = c.change_id) AS evidence_count
+            FROM news_event_changes c
+            JOIN news_events e ON e.event_id = c.event_id
+            """
+            + where
+            + " ORDER BY c.detected_at DESC, c.change_id DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        items = [self._news_event_change_dict(row) for row in rows]
+        if conflicts_only and items:
+            change_ids = [str(item["change_id"]) for item in items]
+            placeholders = ", ".join("?" for _ in change_ids)
+            claim_rows = self.conn.execute(
+                f"""
+                SELECT * FROM news_event_lineage_claims
+                WHERE successor_change_id IN ({placeholders})
+                ORDER BY successor_change_id,
+                    CASE status
+                        WHEN 'contested' THEN 0
+                        WHEN 'resolved' THEN 1
+                        WHEN 'active' THEN 2
+                        ELSE 3 END,
+                    created_at, claim_id
+                """,
+                change_ids,
+            ).fetchall()
+            claims_by_successor: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for claim in claim_rows:
+                claims_by_successor[str(claim["successor_change_id"])].append(dict(claim))
+            for item in items:
+                item["lineage_claims"] = claims_by_successor.get(
+                    str(item["change_id"]),
+                    [],
+                )
+        return items
+
+    def news_event_change_summary(
+        self,
+        *,
+        event_id: str = "",
+        objective_only: bool = True,
+    ) -> dict[str, int]:
+        clauses = [
+            "lifecycle = 'active'",
+            "EXISTS (SELECT 1 FROM news_events e "
+            "WHERE e.event_id = news_event_changes.event_id AND e.status != 'merged')",
+        ]
+        params: list[object] = []
+        if event_id:
+            clauses.append("event_id = ?")
+            params.append(str(event_id).strip())
+        if objective_only:
+            clauses.append("is_objective_default = 1")
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread_count
+            FROM news_event_changes
+            WHERE """
+            + " AND ".join(clauses),
+            params,
+        ).fetchone()
+        return {
+            "total": int(row["total"] or 0) if row is not None else 0,
+            "unread_count": int(row["unread_count"] or 0) if row is not None else 0,
+        }
+
+    def get_news_event_change(
+        self,
+        change_id: str,
+        *,
+        objective_only: bool = False,
+    ) -> dict[str, Any] | None:
+        normalized_id = str(change_id or "").strip()
+        if not normalized_id:
+            return None
+        self._ensure_fresh_read()
+        normalized_id = self._resolve_news_event_change_id_on(self.conn, normalized_id)
+        if not normalized_id:
+            return None
+        clauses = ["c.change_id = ?", "e.status != 'merged'"]
+        if objective_only:
+            clauses.extend(
+                (
+                    "c.lifecycle = 'active'",
+                    "c.is_objective_default = 1",
+                )
+            )
+        row = self.conn.execute(
+            """
+            SELECT c.*, e.canonical_title, e.topic_group, e.story_key,
+                   (SELECT COUNT(*) FROM news_event_memberships m
+                    WHERE m.change_id = c.change_id) AS evidence_count
+            FROM news_event_changes c
+            JOIN news_events e ON e.event_id = c.event_id
+            WHERE """
+            + " AND ".join(clauses),
+            (normalized_id,),
+        ).fetchone()
+        return self._news_event_change_dict(row) if row is not None else None
+
+    def mark_news_event_change_read(
+        self,
+        change_id: str,
+        *,
+        objective_only: bool = True,
+        conflicts_only: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if objective_only and conflicts_only:
+            raise ValueError("objective_only and conflicts_only are mutually exclusive")
+        normalized_id = str(change_id or "").strip()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            normalized_id = self._resolve_news_event_change_id_on(conn, normalized_id)
+            if not normalized_id:
+                conn.commit()
+                return None, False
+            before = conn.execute(
+                """
+                SELECT c.* FROM news_event_changes c
+                JOIN news_events e ON e.event_id = c.event_id
+                WHERE c.change_id = ? AND e.status != 'merged'
+                  AND (
+                      ? = 0 OR (
+                          c.lifecycle = 'active'
+                          AND c.is_objective_default = 1
+                      )
+                  )
+                  AND (
+                      ? = 0 OR (
+                          c.lifecycle = 'active'
+                          AND c.role = 'objective_change'
+                          AND c.objectivity_status = 'disputed'
+                          AND c.conflict_status = 'contested'
+                          AND c.evidence_status = 'contested'
+                      )
+                  )
+                """,
+                (
+                    normalized_id,
+                    int(bool(objective_only)),
+                    int(bool(conflicts_only)),
+                ),
+            ).fetchone()
+            if before is None:
+                conn.commit()
+                return None, False
+            changed = not bool(int(before["is_read"] or 0))
+            if changed:
+                conn.execute(
+                    """
+                    UPDATE news_event_changes
+                    SET is_read = 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE change_id = ?
+                    """,
+                    (normalized_id,),
+                )
+            row = conn.execute(
+                """
+                SELECT c.*,
+                       (SELECT COUNT(*) FROM news_event_memberships m
+                        WHERE m.change_id = c.change_id) AS evidence_count
+                FROM news_event_changes c WHERE c.change_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        return (self._news_event_change_dict(row) if row is not None else None), changed
+
+    def set_news_event_status(
+        self,
+        event_id: str,
+        *,
+        status: str,
+        merged_into_event_id: str = "",
+    ) -> dict[str, Any]:
+        normalized_id = str(event_id or "").strip()
+        normalized_status = str(status or "").strip().lower()
+        normalized_target = str(merged_into_event_id or "").strip()
+        if normalized_status not in _NEWS_EVENT_STATUSES:
+            raise ValueError("unsupported news event status")
+        if normalized_status == "merged" or normalized_target:
+            raise ValueError("use merge_news_events for a durable event merge")
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            event = conn.execute(
+                "SELECT event_id, status FROM news_events WHERE event_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if event is None:
+                raise KeyError(normalized_id)
+            if str(event["status"] or "") == "merged":
+                raise ValueError("merged news events cannot be reactivated")
+            conn.execute(
+                """
+                UPDATE news_events
+                SET status = ?, merged_into_event_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+                """,
+                (normalized_status, normalized_target or None, normalized_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        item = self.get_news_event(normalized_id, resolve_merged=False)
+        if item is None:  # pragma: no cover
+            raise RuntimeError("news event disappeared after status update")
+        return item
+
+    def merge_news_events(
+        self,
+        *,
+        source_event_id: str,
+        target_event_id: str,
+    ) -> dict[str, Any]:
+        """Merge one event into another without dropping evidence or lineage."""
+
+        source_id = str(source_event_id or "").strip()
+        target_id = str(target_event_id or "").strip()
+        if not source_id or not target_id or source_id == target_id:
+            raise ValueError("distinct source_event_id and target_event_id are required")
+        moved_changes = 0
+        deduplicated_changes = 0
+        moved_memberships = 0
+        rebound_trackers = 0
+        merged = False
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute(
+                "SELECT * FROM news_events WHERE event_id = ?",
+                (source_id,),
+            ).fetchone()
+            target = conn.execute(
+                "SELECT * FROM news_events WHERE event_id = ?",
+                (target_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(source_id)
+            if target is None:
+                raise KeyError(target_id)
+            if str(target["status"] or "") == "merged":
+                raise ValueError("target event is already merged")
+            if str(source["status"] or "") == "merged":
+                if str(source["merged_into_event_id"] or "") != target_id:
+                    raise ValueError("source event was already merged into another event")
+                conn.commit()
+            else:
+                source_changes = conn.execute(
+                    """
+                    SELECT * FROM news_event_changes
+                    WHERE event_id = ? ORDER BY created_at, change_id
+                    """,
+                    (source_id,),
+                ).fetchall()
+                duplicate_map: dict[str, str] = {}
+                for source_change in source_changes:
+                    duplicate = conn.execute(
+                        """
+                        SELECT change_id FROM news_event_changes
+                        WHERE event_id = ? AND change_fingerprint = ?
+                        """,
+                        (target_id, str(source_change["change_fingerprint"])),
+                    ).fetchone()
+                    if duplicate is not None:
+                        duplicate_map[str(source_change["change_id"])] = str(duplicate["change_id"])
+                durable_source_memberships = {
+                    str(source_change["change_id"]): membership
+                    for source_change in source_changes
+                    if (
+                        membership := self._news_event_durable_support_membership_on(
+                            conn,
+                            str(source_change["change_id"]),
+                        )
+                    )
+                    is not None
+                }
+                durable_source_contradictions = {
+                    str(source_change["change_id"]): membership
+                    for source_change in source_changes
+                    if (
+                        membership := self._news_event_durable_support_membership_on(
+                            conn,
+                            str(source_change["change_id"]),
+                            relation_kind="contradicts_change",
+                        )
+                    )
+                    is not None
+                }
+                pending_supersedes: list[tuple[str, str, str]] = []
+                for source_change in source_changes:
+                    source_change_id = str(source_change["change_id"])
+                    supersedes_id = str(source_change["supersedes_change_id"] or "")
+                    if (
+                        supersedes_id
+                        and source_change_id in durable_source_memberships
+                        and str(source_change["role"] or "") == "objective_change"
+                        and str(source_change["objectivity_status"] or "") == "confirmed"
+                        and str(source_change["conflict_status"] or "none") != "contested"
+                        and str(source_change["evidence_status"] or "")
+                        in {"source_supported", "cross_source_supported"}
+                        and str(source_change["lifecycle"] or "active") != "invalidated"
+                    ):
+                        pending_supersedes.append(
+                            (
+                                source_change_id,
+                                supersedes_id,
+                                str(source_change["supersedes_lifecycle"] or "superseded"),
+                            )
+                        )
+                for old_change_id, canonical_change_id in duplicate_map.items():
+                    conn.execute(
+                        """
+                        UPDATE news_event_changes
+                        SET supersedes_change_id = ?
+                        WHERE supersedes_change_id = ?
+                        """,
+                        (canonical_change_id, old_change_id),
+                    )
+                    self._remap_news_event_lineage_change_on(
+                        conn,
+                        old_change_id=old_change_id,
+                        canonical_change_id=canonical_change_id,
+                    )
+                for source_change in source_changes:
+                    source_change_id = str(source_change["change_id"])
+                    duplicate_change_id = duplicate_map.get(source_change_id)
+                    if duplicate_change_id is None:
+                        continue
+                    merged_change = dict(source_change)
+                    merged_change["origin_evidence_id"] = ""
+                    merged_change["supersedes_change_id"] = ""
+                    merged_change["item_key"] = ""
+                    # A retained contradiction may quarantine a duplicate but
+                    # must never be mistaken for supporting evidence.  Prefer it
+                    # here so disputed source classification reaches the
+                    # canonical row; the membership itself stays contradictory.
+                    durable_membership = durable_source_contradictions.get(
+                        source_change_id
+                    ) or durable_source_memberships.get(source_change_id)
+                    if durable_membership is not None:
+                        merged_change["content_scope"] = self._news_event_verified_content_scope(
+                            durable_membership["content_scope"],
+                            durable_membership["evidence_snapshot"],
+                            durable_membership["title"],
+                        )
+                        merged_change["evidence_snapshot"] = str(
+                            durable_membership["evidence_snapshot"] or "{}"
+                        )
+                        merged_change["title"] = str(durable_membership["title"] or "")
+                    else:
+                        # Row metadata alone cannot promote a duplicate into the
+                        # objective feed.  Only retained summary/body evidence
+                        # may carry classification across an event merge.
+                        merged_change["content_scope"] = "unknown"
+                        merged_change["evidence_snapshot"] = "{}"
+                        merged_change["title"] = ""
+                    self._upsert_news_event_change_on(
+                        conn,
+                        event_id=target_id,
+                        change=merged_change,
+                        check_id=str(source_change["origin_check_id"] or ""),
+                        detected_at=str(source_change["detected_at"] or ""),
+                    )
+                    source_is_unread_default = not bool(
+                        int(source_change["is_read"] or 0)
+                    ) and self._news_event_change_is_default(
+                        role=source_change["role"],
+                        objectivity_status=source_change["objectivity_status"],
+                        conflict_status=source_change["conflict_status"],
+                        previous_state=source_change["previous_state"],
+                        new_state=source_change["new_state"],
+                        evidence_status=source_change["evidence_status"],
+                        effective_at=source_change["effective_at"],
+                        detected_at=source_change["detected_at"],
+                        lifecycle=source_change["lifecycle"],
+                    )
+                    if source_is_unread_default:
+                        conn.execute(
+                            "UPDATE news_event_changes SET is_read = 0 WHERE change_id = ?",
+                            (duplicate_change_id,),
+                        )
+                    memberships = conn.execute(
+                        """
+                        SELECT * FROM news_event_memberships
+                        WHERE change_id = ? ORDER BY membership_id
+                        """,
+                        (source_change_id,),
+                    ).fetchall()
+                    for membership in memberships:
+                        _, created = self._upsert_news_event_membership_on(
+                            conn,
+                            event_id=target_id,
+                            change_id=duplicate_change_id,
+                            evidence_item_key=str(membership["evidence_item_key"]),
+                            evidence_fingerprint=str(membership["evidence_fingerprint"]),
+                            relation_kind=str(membership["relation_kind"]),
+                            relation_basis=str(membership["relation_basis"] or ""),
+                            relation_score=float(membership["relation_score"] or 0.0),
+                            content_scope=str(membership["content_scope"] or "unknown"),
+                            media=str(membership["media"] or ""),
+                            provider=str(membership["provider"] or ""),
+                            title=str(membership["title"] or ""),
+                            canonical_url=str(membership["canonical_url"] or ""),
+                            published_at=str(membership["published_at"] or ""),
+                            retrieved_at=str(membership["retrieved_at"] or ""),
+                            evidence_snapshot=str(membership["evidence_snapshot"] or "{}"),
+                            evidence_completeness=str(
+                                membership["evidence_completeness"] or "complete"
+                            ),
+                            origin_tracking_id=str(membership["origin_tracking_id"] or ""),
+                            origin_check_id=str(membership["origin_check_id"] or ""),
+                            origin_candidate_record_id=str(
+                                membership["origin_candidate_record_id"] or ""
+                            ),
+                            origin_evidence_id=str(membership["origin_evidence_id"] or ""),
+                            first_seen_at=str(membership["first_seen_at"] or ""),
+                            last_seen_at=str(membership["last_seen_at"] or ""),
+                        )
+                        moved_memberships += int(created)
+                    conn.execute(
+                        """
+                        UPDATE news_event_change_aliases
+                        SET canonical_change_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE canonical_change_id = ?
+                        """,
+                        (duplicate_change_id, source_change_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO news_event_change_aliases (
+                            alias_change_id, canonical_change_id, source_event_id
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(alias_change_id) DO UPDATE SET
+                            canonical_change_id = excluded.canonical_change_id,
+                            source_event_id = excluded.source_event_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (source_change_id, duplicate_change_id, source_id),
+                    )
+                    conn.execute(
+                        "DELETE FROM news_event_memberships WHERE change_id = ?",
+                        (source_change_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM news_event_changes WHERE change_id = ?",
+                        (source_change_id,),
+                    )
+                    deduplicated_changes += 1
+                remaining_changes = conn.execute(
+                    "SELECT COUNT(*) FROM news_event_changes WHERE event_id = ?",
+                    (source_id,),
+                ).fetchone()
+                moved_changes = int(remaining_changes[0] or 0) if remaining_changes else 0
+                conn.execute(
+                    "UPDATE news_event_changes SET event_id = ? WHERE event_id = ?",
+                    (target_id, source_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE news_event_lineage_claims
+                    SET event_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ?
+                    """,
+                    (target_id, source_id),
+                )
+                changed_memberships = conn.execute(
+                    """
+                    UPDATE news_event_memberships
+                    SET event_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ? AND change_id IS NOT NULL
+                    """,
+                    (target_id, source_id),
+                )
+                moved_memberships += int(changed_memberships.rowcount or 0)
+                standalone_memberships = conn.execute(
+                    """
+                    SELECT * FROM news_event_memberships
+                    WHERE event_id = ? AND change_id IS NULL
+                    ORDER BY membership_id
+                    """,
+                    (source_id,),
+                ).fetchall()
+                for membership in standalone_memberships:
+                    _, created = self._upsert_news_event_membership_on(
+                        conn,
+                        event_id=target_id,
+                        evidence_item_key=str(membership["evidence_item_key"]),
+                        evidence_fingerprint=str(membership["evidence_fingerprint"]),
+                        relation_kind=str(membership["relation_kind"]),
+                        relation_basis=str(membership["relation_basis"] or ""),
+                        relation_score=float(membership["relation_score"] or 0.0),
+                        content_scope=str(membership["content_scope"] or "unknown"),
+                        media=str(membership["media"] or ""),
+                        provider=str(membership["provider"] or ""),
+                        title=str(membership["title"] or ""),
+                        canonical_url=str(membership["canonical_url"] or ""),
+                        published_at=str(membership["published_at"] or ""),
+                        retrieved_at=str(membership["retrieved_at"] or ""),
+                        evidence_snapshot=str(membership["evidence_snapshot"] or "{}"),
+                        evidence_completeness=str(
+                            membership["evidence_completeness"] or "complete"
+                        ),
+                        origin_tracking_id=str(membership["origin_tracking_id"] or ""),
+                        origin_check_id=str(membership["origin_check_id"] or ""),
+                        origin_candidate_record_id=str(
+                            membership["origin_candidate_record_id"] or ""
+                        ),
+                        origin_evidence_id=str(membership["origin_evidence_id"] or ""),
+                        first_seen_at=str(membership["first_seen_at"] or ""),
+                        last_seen_at=str(membership["last_seen_at"] or ""),
+                    )
+                    moved_memberships += int(created)
+                conn.execute(
+                    """
+                    DELETE FROM news_event_memberships
+                    WHERE event_id = ? AND change_id IS NULL
+                    """,
+                    (source_id,),
+                )
+                rebound = conn.execute(
+                    "UPDATE tracked_observations SET event_id = ? WHERE event_id = ?",
+                    (target_id, source_id),
+                )
+                rebound_trackers = int(rebound.rowcount or 0)
+                conn.execute(
+                    """
+                    UPDATE news_events
+                    SET first_seen_at = CASE
+                            WHEN first_seen_at = '' THEN ?
+                            WHEN ? != '' AND ? < first_seen_at THEN ?
+                            ELSE first_seen_at END,
+                        last_seen_at = MAX(last_seen_at, ?),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ?
+                    """,
+                    (
+                        str(source["first_seen_at"] or ""),
+                        str(source["first_seen_at"] or ""),
+                        str(source["first_seen_at"] or ""),
+                        str(source["first_seen_at"] or ""),
+                        str(source["last_seen_at"] or ""),
+                        target_id,
+                    ),
+                )
+                target_change_ids = conn.execute(
+                    "SELECT change_id FROM news_event_changes WHERE event_id = ?",
+                    (target_id,),
+                ).fetchall()
+                for target_change in target_change_ids:
+                    self._recompute_news_event_change_evidence_on(
+                        conn,
+                        str(target_change["change_id"]),
+                    )
+                    self._refresh_news_event_change_default_on(
+                        conn,
+                        str(target_change["change_id"]),
+                    )
+                for target_change in target_change_ids:
+                    self._contest_divergent_news_event_changes_on(
+                        conn,
+                        str(target_change["change_id"]),
+                    )
+                # Duplicate folding must preserve an accepted source event's
+                # supersede edge.  Rebind both ends only after every target
+                # change has been reclassified and conflict-quarantined, so a
+                # newly contested successor cannot revoke its predecessor.
+                for (
+                    source_successor_id,
+                    source_predecessor_id,
+                    requested_lifecycle,
+                ) in pending_supersedes:
+                    successor_id = self._resolve_news_event_change_id_on(
+                        conn,
+                        duplicate_map.get(source_successor_id, source_successor_id),
+                    )
+                    predecessor_id = self._resolve_news_event_change_id_on(
+                        conn,
+                        duplicate_map.get(source_predecessor_id, source_predecessor_id),
+                    )
+                    if not successor_id or not predecessor_id or successor_id == predecessor_id:
+                        continue
+                    successor = conn.execute(
+                        "SELECT * FROM news_event_changes WHERE change_id = ? AND event_id = ?",
+                        (successor_id, target_id),
+                    ).fetchone()
+                    predecessor = conn.execute(
+                        "SELECT change_id FROM news_event_changes "
+                        "WHERE change_id = ? AND event_id = ?",
+                        (predecessor_id, target_id),
+                    ).fetchone()
+                    if successor is None or predecessor is None:
+                        continue
+                    lineage_accepted = self._reconcile_news_event_lineage_on(
+                        conn,
+                        event_id=target_id,
+                        successor_change_id=successor_id,
+                        predecessor_change_id=predecessor_id,
+                        supersedes_lifecycle=requested_lifecycle,
+                        source_event_id=source_id,
+                        source_change_id=source_successor_id,
+                        explicit_resolution=False,
+                        force_contested=(
+                            str(successor["conflict_status"] or "none") == "contested"
+                        ),
+                    )
+                    successor = conn.execute(
+                        "SELECT * FROM news_event_changes WHERE change_id = ?",
+                        (successor_id,),
+                    ).fetchone()
+                    if successor is None:  # pragma: no cover
+                        raise RuntimeError("merged successor disappeared")
+                    successor_has_lineage_authority = (
+                        str(successor["role"] or "") == "objective_change"
+                        and str(successor["objectivity_status"] or "") == "confirmed"
+                        and str(successor["conflict_status"] or "none") != "contested"
+                        and str(successor["evidence_status"] or "")
+                        in {"source_supported", "cross_source_supported"}
+                        and str(successor["lifecycle"] or "active") != "invalidated"
+                    )
+                    if lineage_accepted and successor_has_lineage_authority:
+                        conn.execute(
+                            "UPDATE news_event_changes "
+                            "SET lifecycle = ?, is_objective_default = 0, is_read = 1, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE change_id = ?",
+                            (
+                                requested_lifecycle,
+                                predecessor_id,
+                            ),
+                        )
+                    else:
+                        self._restore_news_event_predecessor_if_unopposed_on(
+                            conn,
+                            event_id=target_id,
+                            predecessor_id=predecessor_id,
+                        )
+                merged_lineage_successors = conn.execute(
+                    """
+                    SELECT DISTINCT claim.successor_change_id
+                    FROM news_event_lineage_claims claim
+                    JOIN news_event_changes successor
+                      ON successor.change_id = claim.successor_change_id
+                    WHERE claim.event_id = ? AND successor.event_id = ?
+                      AND claim.status != 'rejected'
+                    ORDER BY claim.successor_change_id
+                    """,
+                    (target_id, target_id),
+                ).fetchall()
+                for merged_lineage_successor in merged_lineage_successors:
+                    self._normalize_news_event_lineage_claims_on(
+                        conn,
+                        str(merged_lineage_successor["successor_change_id"]),
+                    )
+                self._recompute_news_event_state_on(conn, target_id)
+                conn.execute(
+                    """
+                    UPDATE news_events
+                    SET status = 'merged', merged_into_event_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ?
+                    """,
+                    (target_id, source_id),
+                )
+                source_key = str(source["event_key"] or "").strip()
+                if source_key:
+                    conn.execute(
+                        """
+                        INSERT INTO news_event_aliases (
+                            alias_event_key, canonical_event_id, source_event_id
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(alias_event_key) DO UPDATE SET
+                            canonical_event_id = excluded.canonical_event_id,
+                            source_event_id = excluded.source_event_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (source_key, target_id, source_id),
+                    )
+                conn.execute(
+                    """
+                    UPDATE news_event_aliases
+                    SET canonical_event_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE canonical_event_id = ?
+                    """,
+                    (target_id, source_id),
+                )
+                merged = True
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        source_event = self.get_news_event(source_id, resolve_merged=False)
+        target_event = self.get_news_event(target_id, resolve_merged=False)
+        if source_event is None or target_event is None:  # pragma: no cover
+            raise RuntimeError("news event disappeared after merge")
+        return {
+            "source_event": source_event,
+            "target_event": target_event,
+            "moved_changes": moved_changes,
+            "deduplicated_changes": deduplicated_changes,
+            "moved_memberships": moved_memberships,
+            "rebound_trackers": rebound_trackers,
+            "merged": merged,
+        }
+
+    def get_news_event_backfill_state(
+        self,
+        contract_version: str = _NEWS_EVENT_CONTRACT_VERSION,
+    ) -> dict[str, Any]:
+        normalized_version = str(contract_version or "").strip()
+        if not normalized_version:
+            raise ValueError("contract_version is required")
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            "SELECT * FROM news_event_backfill_state WHERE contract_version = ?",
+            (normalized_version,),
+        ).fetchone()
+        if row is None:
+            return {
+                "contract_version": normalized_version,
+                "last_tracking_rowid": 0,
+                "completed": False,
+                "completed_at": "",
+                "updated_at": "",
+            }
+        item = dict(row)
+        item["last_tracking_rowid"] = int(item.get("last_tracking_rowid") or 0)
+        item["completed"] = bool(int(item.get("completed") or 0))
+        return item
+
+    def repair_news_event_origin_memberships(
+        self,
+        *,
+        batch_size: int = 100,
+        contract_version: str = _NEWS_EVENT_ORIGIN_REPAIR_VERSION,
+    ) -> dict[str, Any]:
+        """Restore one auditable origin membership for every linked tracker."""
+
+        normalized_version = str(contract_version or "").strip()
+        if not normalized_version:
+            raise ValueError("contract_version is required")
+        normalized_batch_size = max(1, min(1_000, int(batch_size)))
+        conn = self.open_connection()
+        processed_trackers = 0
+        created_memberships = 0
+        claimed_legacy_memberships = 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO news_event_backfill_state (
+                    contract_version, last_tracking_rowid
+                ) VALUES (?, 0)
+                """,
+                (normalized_version,),
+            )
+            state_before = conn.execute(
+                "SELECT * FROM news_event_backfill_state WHERE contract_version = ?",
+                (normalized_version,),
+            ).fetchone()
+            if state_before is None:  # pragma: no cover
+                raise RuntimeError("news event origin repair state disappeared")
+            if bool(int(state_before["completed"] or 0)):
+                state = dict(state_before)
+            else:
+                last_rowid = int(state_before["last_tracking_rowid"] or 0)
+                trackers = conn.execute(
+                    """
+                    SELECT rowid AS tracking_rowid, *
+                    FROM tracked_observations
+                    WHERE rowid > ?
+                    ORDER BY rowid
+                    LIMIT ?
+                    """,
+                    (last_rowid, normalized_batch_size),
+                ).fetchall()
+                for tracker_row in trackers:
+                    tracker = dict(tracker_row)
+                    tracking_id = str(tracker.get("tracking_id") or "").strip()
+                    linked_event_id = str(tracker.get("event_id") or "").strip()
+                    linked = (
+                        self._resolve_news_event_row_on(conn, linked_event_id)
+                        if linked_event_id
+                        else None
+                    )
+                    if linked is not None:
+                        canonical_event_id = str(linked["event_id"])
+                        if canonical_event_id != linked_event_id:
+                            conn.execute(
+                                "UPDATE tracked_observations SET event_id = ? "
+                                "WHERE tracking_id = ?",
+                                (canonical_event_id, tracking_id),
+                            )
+                            tracker["event_id"] = canonical_event_id
+                        try:
+                            raw_snapshot = json.loads(str(tracker.get("original_snapshot") or "{}"))
+                        except (TypeError, ValueError):
+                            raw_snapshot = {}
+                        snapshot = dict(raw_snapshot) if isinstance(raw_snapshot, Mapping) else {}
+                        item_key = str(tracker.get("item_key") or "").strip()
+                        if item_key:
+                            evidence_fingerprint = str(
+                                snapshot.get("evidence_fingerprint") or ""
+                            ).strip()
+                            if not evidence_fingerprint:
+                                evidence_fingerprint = self._news_event_evidence_fingerprint(
+                                    item_key=item_key,
+                                    snapshot=snapshot,
+                                )
+                            has_specific = conn.execute(
+                                """
+                                SELECT 1 FROM news_event_memberships
+                                WHERE event_id = ? AND change_id IS NULL
+                                  AND relation_kind = 'origin'
+                                  AND origin_tracking_id = ?
+                                  AND evidence_item_key = ?
+                                  AND evidence_fingerprint = ?
+                                LIMIT 1
+                                """,
+                                (
+                                    canonical_event_id,
+                                    tracking_id,
+                                    item_key,
+                                    evidence_fingerprint,
+                                ),
+                            ).fetchone()
+                            if has_specific is None:
+                                legacy = conn.execute(
+                                    """
+                                    SELECT membership_id FROM news_event_memberships
+                                    WHERE event_id = ? AND change_id IS NULL
+                                      AND relation_kind = 'origin'
+                                      AND origin_tracking_id = ''
+                                      AND evidence_item_key = ?
+                                      AND evidence_fingerprint = ?
+                                    ORDER BY created_at, membership_id
+                                    LIMIT 1
+                                    """,
+                                    (
+                                        canonical_event_id,
+                                        item_key,
+                                        evidence_fingerprint,
+                                    ),
+                                ).fetchone()
+                                if legacy is not None:
+                                    conn.execute(
+                                        "UPDATE news_event_memberships "
+                                        "SET origin_tracking_id = ?, "
+                                        "updated_at = CURRENT_TIMESTAMP "
+                                        "WHERE membership_id = ?",
+                                        (tracking_id, str(legacy["membership_id"])),
+                                    )
+                                    claimed_legacy_memberships += 1
+                    origin_count_before = int(
+                        conn.execute(
+                            "SELECT COUNT(*) AS total FROM news_event_memberships "
+                            "WHERE relation_kind = 'origin' AND change_id IS NULL "
+                            "AND origin_tracking_id = ?",
+                            (tracking_id,),
+                        ).fetchone()["total"]
+                    )
+                    self._ensure_tracked_observation_event_on(
+                        conn,
+                        tracker,
+                        origin_completeness="partial_legacy",
+                    )
+                    origin_count_after = int(
+                        conn.execute(
+                            "SELECT COUNT(*) AS total FROM news_event_memberships "
+                            "WHERE relation_kind = 'origin' AND change_id IS NULL "
+                            "AND origin_tracking_id = ?",
+                            (tracking_id,),
+                        ).fetchone()["total"]
+                    )
+                    created_memberships += max(0, origin_count_after - origin_count_before)
+                    last_rowid = int(tracker["tracking_rowid"])
+                    processed_trackers += 1
+                has_more = conn.execute(
+                    "SELECT 1 FROM tracked_observations WHERE rowid > ? LIMIT 1",
+                    (last_rowid,),
+                ).fetchone()
+                completed = has_more is None
+                if completed:
+                    conn.execute(
+                        """
+                        DELETE FROM news_event_memberships AS legacy
+                        WHERE legacy.relation_kind = 'origin'
+                          AND legacy.change_id IS NULL
+                          AND legacy.origin_tracking_id = ''
+                          AND EXISTS (
+                              SELECT 1
+                              FROM news_event_memberships AS repaired
+                              WHERE repaired.event_id = legacy.event_id
+                                AND repaired.change_id IS NULL
+                                AND repaired.relation_kind = 'origin'
+                                AND repaired.origin_tracking_id != ''
+                                AND repaired.evidence_item_key = legacy.evidence_item_key
+                                AND repaired.evidence_fingerprint =
+                                    legacy.evidence_fingerprint
+                          )
+                        """
+                    )
+                conn.execute(
+                    """
+                    UPDATE news_event_backfill_state
+                    SET last_tracking_rowid = ?, completed = ?,
+                        completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE '' END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE contract_version = ?
+                    """,
+                    (last_rowid, int(completed), int(completed), normalized_version),
+                )
+                state_row = conn.execute(
+                    "SELECT * FROM news_event_backfill_state WHERE contract_version = ?",
+                    (normalized_version,),
+                ).fetchone()
+                if state_row is None:  # pragma: no cover
+                    raise RuntimeError("news event origin repair state disappeared after update")
+                state = dict(state_row)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        state["last_tracking_rowid"] = int(state.get("last_tracking_rowid") or 0)
+        state["completed"] = bool(int(state.get("completed") or 0))
+        return {
+            "contract_version": normalized_version,
+            "processed_trackers": processed_trackers,
+            "created_memberships": created_memberships,
+            "claimed_legacy_memberships": claimed_legacy_memberships,
+            "state": state,
+        }
+
+    def backfill_news_event_projection(
+        self,
+        *,
+        batch_size: int = 100,
+        contract_version: str = _NEWS_EVENT_CONTRACT_VERSION,
+    ) -> dict[str, Any]:
+        """Project legacy tracking history in a resumable, conservative batch."""
+
+        normalized_version = str(contract_version or "").strip()
+        if not normalized_version:
+            raise ValueError("contract_version is required")
+        normalized_batch_size = max(1, min(1_000, int(batch_size)))
+        conn = self.open_connection()
+        processed_trackers = 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO news_event_backfill_state (
+                    contract_version, last_tracking_rowid
+                ) VALUES (?, 0)
+                """,
+                (normalized_version,),
+            )
+            state_before = conn.execute(
+                "SELECT * FROM news_event_backfill_state WHERE contract_version = ?",
+                (normalized_version,),
+            ).fetchone()
+            if state_before is None:  # pragma: no cover
+                raise RuntimeError("news event backfill state disappeared")
+            counts_before = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM news_events) AS event_count,
+                    (SELECT COUNT(*) FROM news_event_changes) AS change_count,
+                    (SELECT COUNT(*) FROM news_event_memberships) AS membership_count
+                """
+            ).fetchone()
+            if bool(int(state_before["completed"] or 0)):
+                conn.commit()
+                state = dict(state_before)
+            else:
+                last_rowid = int(state_before["last_tracking_rowid"] or 0)
+                trackers = conn.execute(
+                    """
+                    SELECT rowid AS tracking_rowid, *
+                    FROM tracked_observations
+                    WHERE rowid > ?
+                    ORDER BY rowid
+                    LIMIT ?
+                    """,
+                    (last_rowid, normalized_batch_size),
+                ).fetchall()
+                for tracker in trackers:
+                    event, _ = self._ensure_tracked_observation_event_on(conn, tracker)
+                    event_id = str(event["event_id"])
+                    tracking_id = str(tracker["tracking_id"])
+                    candidates = conn.execute(
+                        """
+                        SELECT * FROM tracked_observation_candidates
+                        WHERE tracking_id = ? AND decision = 'related_no_change'
+                        ORDER BY examined_at, candidate_record_id
+                        """,
+                        (tracking_id,),
+                    ).fetchall()
+                    for candidate in candidates:
+                        snapshot_json = str(candidate["evidence_snapshot"] or "{}")
+                        try:
+                            decoded_snapshot = json.loads(snapshot_json)
+                        except (TypeError, ValueError):
+                            decoded_snapshot = {}
+                        snapshot = (
+                            dict(decoded_snapshot) if isinstance(decoded_snapshot, Mapping) else {}
+                        )
+                        self._upsert_news_event_membership_on(
+                            conn,
+                            event_id=event_id,
+                            evidence_item_key=str(candidate["evidence_item_key"]),
+                            evidence_fingerprint=str(candidate["evidence_fingerprint"]),
+                            relation_kind="related_no_change",
+                            relation_basis=str(candidate["match_basis"] or ""),
+                            relation_score=float(candidate["match_score"] or 0.0),
+                            content_scope=str(snapshot.get("content_scope") or "unknown"),
+                            media=str(snapshot.get("source") or snapshot.get("media") or ""),
+                            provider=str(snapshot.get("provider") or ""),
+                            title=str(snapshot.get("title") or ""),
+                            canonical_url=str(
+                                snapshot.get("canonical_url") or snapshot.get("content_url") or ""
+                            ),
+                            published_at=str(snapshot.get("published_at") or ""),
+                            retrieved_at=str(candidate["examined_at"] or ""),
+                            evidence_snapshot=snapshot,
+                            evidence_completeness="partial_legacy",
+                            origin_tracking_id=tracking_id,
+                            origin_check_id=str(candidate["check_id"] or ""),
+                            origin_candidate_record_id=str(candidate["candidate_record_id"] or ""),
+                            first_seen_at=str(candidate["examined_at"] or ""),
+                            last_seen_at=str(candidate["examined_at"] or ""),
+                        )
+                    evidence_rows = conn.execute(
+                        """
+                        SELECT e.*, c.is_read AS legacy_is_read,
+                               c.status AS legacy_check_status
+                        FROM tracked_observation_evidence e
+                        JOIN tracked_observation_checks c ON c.check_id = e.check_id
+                        WHERE e.tracking_id = ? AND c.status = 'changed'
+                        ORDER BY e.detected_at, e.evidence_id
+                        """,
+                        (tracking_id,),
+                    ).fetchall()
+                    for evidence in evidence_rows:
+                        snapshot_json = str(evidence["evidence_snapshot"] or "{}")
+                        try:
+                            decoded_snapshot = json.loads(snapshot_json)
+                        except (TypeError, ValueError):
+                            decoded_snapshot = {}
+                        snapshot = (
+                            dict(decoded_snapshot) if isinstance(decoded_snapshot, Mapping) else {}
+                        )
+                        # Legacy checks did not record whether a statement had
+                        # already happened or was merely analysis.  Preserve it
+                        # for audit, but never promote it into the objective
+                        # default feed without a later explicit confirmation.
+                        self._upsert_news_event_change_on(
+                            conn,
+                            event_id=event_id,
+                            check_id=str(evidence["check_id"] or ""),
+                            detected_at=str(evidence["detected_at"] or ""),
+                            evidence_completeness="partial_legacy",
+                            change={
+                                "change_type": str(evidence["change_type"] or "legacy_change"),
+                                "previous_state": str(evidence["previous_state"] or ""),
+                                "new_state": str(evidence["new_state"] or ""),
+                                "fact": str(evidence["fact"] or ""),
+                                "inference": str(evidence["inference"] or ""),
+                                "summary": str(evidence["summary"] or ""),
+                                "evidence_quote": str(evidence["evidence_quote"] or ""),
+                                "confidence": float(evidence["confidence"] or 0.0),
+                                "role": "analysis",
+                                "objectivity_status": "unconfirmed",
+                                "conflict_status": "none",
+                                "source_scope": "unknown",
+                                "evidence_status": "provisional",
+                                "is_read": bool(int(evidence["legacy_is_read"] or 0)),
+                                "origin_evidence_id": str(evidence["evidence_id"] or ""),
+                                "origin_tracking_id": tracking_id,
+                                "item_key": str(evidence["evidence_item_key"] or ""),
+                                "evidence_fingerprint": str(evidence["evidence_fingerprint"] or ""),
+                                "match_basis": str(evidence["match_basis"] or ""),
+                                "match_score": float(evidence["match_score"] or 0.0),
+                                "content_scope": str(snapshot.get("content_scope") or "unknown"),
+                                "media": str(snapshot.get("source") or snapshot.get("media") or ""),
+                                "provider": str(snapshot.get("provider") or ""),
+                                "title": str(snapshot.get("title") or ""),
+                                "canonical_url": str(
+                                    snapshot.get("canonical_url")
+                                    or snapshot.get("content_url")
+                                    or ""
+                                ),
+                                "published_at": str(snapshot.get("published_at") or ""),
+                                "retrieved_at": str(evidence["detected_at"] or ""),
+                                "evidence_snapshot": snapshot,
+                            },
+                        )
+                    last_rowid = int(tracker["tracking_rowid"])
+                    processed_trackers += 1
+                has_more = conn.execute(
+                    "SELECT 1 FROM tracked_observations WHERE rowid > ? LIMIT 1",
+                    (last_rowid,),
+                ).fetchone()
+                completed = has_more is None
+                conn.execute(
+                    """
+                    UPDATE news_event_backfill_state
+                    SET last_tracking_rowid = ?, completed = ?,
+                        completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE '' END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE contract_version = ?
+                    """,
+                    (last_rowid, int(completed), int(completed), normalized_version),
+                )
+                state_row = conn.execute(
+                    "SELECT * FROM news_event_backfill_state WHERE contract_version = ?",
+                    (normalized_version,),
+                ).fetchone()
+                if state_row is None:  # pragma: no cover
+                    raise RuntimeError("news event backfill state disappeared after update")
+                state = dict(state_row)
+                conn.commit()
+            counts_after = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM news_events) AS event_count,
+                    (SELECT COUNT(*) FROM news_event_changes) AS change_count,
+                    (SELECT COUNT(*) FROM news_event_memberships) AS membership_count
+                """
+            ).fetchone()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self._ensure_fresh_read()
+        if counts_before is None or counts_after is None:  # pragma: no cover
+            raise RuntimeError("news event backfill counts unavailable")
+        state["last_tracking_rowid"] = int(state.get("last_tracking_rowid") or 0)
+        state["completed"] = bool(int(state.get("completed") or 0))
+        return {
+            "contract_version": normalized_version,
+            "processed_trackers": processed_trackers,
+            "created_events": int(counts_after["event_count"]) - int(counts_before["event_count"]),
+            "created_changes": int(counts_after["change_count"])
+            - int(counts_before["change_count"]),
+            "created_memberships": int(counts_after["membership_count"])
+            - int(counts_before["membership_count"]),
+            "state": state,
+        }
 
     def _ensure_saved_sync_tables(self) -> None:
         """Create normalized saved-content tables and import legacy saved rows once."""

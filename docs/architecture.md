@@ -46,9 +46,18 @@ NewsClaw judgment workbench
         ├─ save / click / feedback / removal → immutable judgment snapshot → local history
         └─ observation → tracked_observations active / archived ledger
              └─ normal Tushare/RSS refresh → deterministic shortlist → structured comparison
-                  ├─ material change → check + evidence ledger → timeline + unread
+                  ├─ material change → check + evidence ledger ─┐
                   ├─ unchanged / valid empty → check history only
                   └─ source/model failure → bounded retry, never false unchanged
+             Phase 3 same-transaction event projection ←───────┘
+                  ├─ news_events (distinct from behavior events) + immutable evidence memberships
+                  ├─ new confirmed A→B transition → one event change + unread
+                  ├─ corroboration → stronger evidence, no duplicate unread
+                  ├─ mutually exclusive outcome → contested ledger + frozen current state
+                  └─ expectation / sentiment / analysis → secondary, excluded from objective feed
+             restart-safe legacy backfill → conservative partial-legacy projection
+                  └─ analysis + unconfirmed + provisional; excluded from objective feed
+             restart-safe origin/fact/identity repair → aliases + revalidated evidence depth
              (no automatic Tavily call; no profile-learning event)
 
 migration control plane (real loopback; browser calls also require same origin)

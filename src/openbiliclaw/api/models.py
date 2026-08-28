@@ -445,6 +445,7 @@ class TrackedObservationOut(BaseModel):
     """One durable observation that can be stopped without erasing history."""
 
     tracking_id: str
+    event_id: str = ""
     request_id: str
     item_key: str
     recommendation_id: int | None = None

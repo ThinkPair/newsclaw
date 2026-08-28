@@ -26,6 +26,10 @@ NewsClaw 的持续跟踪不新增第二条采集循环。`api.news_routes.NewsRu
 
 本节是 Phase 2 的实现与验收合同。代码、接口、数据库迁移和桌面契约回归已经完成；2026-08-28 已在本机正式桌面服务验证新增接口、内容库路由和空状态。完整入口本阶段仅在桌面 Web，手机/PWA、浏览器扩展和 DSH 不创建独立调度或第二套跟踪状态。真实外部新闻触发的首次自然变化仍需在日常运行中继续观察，但不改变失败不能伪装成“无变化”的既有边界。
 
+### NewsClaw Phase 3 事件回填运行合同（已实现）
+
+`NewsRuntime.start()` 以 app-owned 后台任务顺序执行 `_backfill_event_projection()` 与 `_repair_event_origin_index()`，不阻塞 API 启动、新闻刷新或事件读取。第一段按旧 tracker/check/evidence 账本补齐保守事件投影并运行事实门/变化身份修复；第二段使用独立的 `news-event-origin-v2` 持久游标，逐 tracker 恢复来源归属，即使旧回填标记已经完成也不会漏掉另一观察点。每批通过工作线程处理 50 个 tracker，分别把 `event_backfill_status`、`event_origin_repair_status`、累计处理数和脱敏错误写入 runtime state；数据库游标与批次事务保证中断或关机后可在下次启动继续，重复运行不产生重复事件、证据、变化、别名或未读。shutdown 会取消后台任务。失败只暂停对应修复并留下安全状态，不会另起采集循环、调用 Tavily、发布推荐或修改画像。
+
 ## 已实现功能
 
 | 功能 | 状态 | 说明 |

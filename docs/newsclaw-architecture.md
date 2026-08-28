@@ -244,6 +244,87 @@ phase. Mobile/PWA, the browser extension and DSH have no tracking-center,
 timeline or check-now contract yet; they must later consume the same database
 truth rather than introduce a parallel ledger.
 
+### Phase 3 durable event projection (implemented backend contract)
+
+Phase 3 adds a source-independent truth layer without changing the current
+desktop surface. An article becomes an immutable evidence membership, a tracker
+remains the user's monitoring instruction, and a completed check remains an
+execution receipt. The durable product unit is one real-world event and its
+verified state transitions.
+
+```text
+Phase 2 changed check + evidence
+        |
+        └→ same SQLite transaction
+              ├→ create or reuse exact story-key news event
+              ├→ attach immutable evidence revision
+              ├→ new confirmed, effective A→B transition → one change + unread
+              ├→ same transition from another source → evidence upgrade only
+              ├→ mutually exclusive durable outcome → contested + freeze state
+              └→ expectation / sentiment / AI analysis → secondary record only
+
+legacy tracker/check/evidence ledger
+        └→ restart-safe bounded backfill → conservative partial-legacy projection
+              └→ analysis + unconfirmed + provisional; not the objective feed
+        └→ restart-safe origin/fact/identity repairs
+              └→ revalidate content depth + rebuild aliases and lineage
+```
+
+`objective_change` is allowed into the default change feed only when it is
+confirmed, not contested, has an effective time with explicit date/minute
+precision, preserves a previous and new state, and has enough actually retained
+summary or body evidence. The shared evidence verifier removes markup and
+boilerplate and rejects content that merely repeats the title; a metadata label
+cannot promote itself to a confirmed fact. A publisher repeated through another
+technical provider is not counted as an independent source. Expectations,
+sentiment and inference remain auditable but are excluded from the objective
+feed and cannot own its unread state.
+
+The check completion and event projection share one transaction: if event,
+membership or change persistence fails, the Phase 2 completion rolls back too.
+Identity is deliberately split in two: exact normalized `story_key` selects the
+event, then change identity v3 uses the event-scoped stable change family,
+normalized A/B states, effective value and its precision. Publisher, provider,
+URL, tracker wording and item key are excluded, so equivalent transitions do
+not duplicate unread while distinct evidence revisions remain inspectable. A
+publication timestamp used only as fallback is folded to its source-local date;
+it does not invent an intraday event time. Controlled paraphrase matching is
+deliberately conservative: action family and positive/pending/negative/stopped
+polarity must match, and the residual subject must be exact after adjacent state
+phrases are removed. Mixed polarity, different numbers and any other residual
+difference fail closed instead of using fuzzy similarity. Two independently
+durable objective outcomes for the same event/effective/previous-state slot are not
+silently merged: both become contested, the event current state is frozen, and
+resolution requires a stronger explicit superseding change. Event merge
+preserves event and change aliases, rebinds trackers and evidence, deduplicates
+equivalent changes, and applies the same conflict rule. When equivalent
+successors arrive with different predecessor edges, `news_event_lineage_claims`
+retains both candidates, their requested lifecycle and immutable source IDs.
+One explicit resolution selects a winner, keeps every loser as `rejected`,
+restores any predecessor no longer suppressed, and resumes state projection in
+the same transaction. Alias folding and later event merges remap only canonical
+edge endpoints, so the claim origin remains auditable. Existing behavior
+`events` are untouched.
+
+The NewsClaw-only read contract exposes the objective change feed, event detail,
+one event's objective timeline, a separate contested-change ledger, evidence
+memberships, and idempotent read state for both objective and contested rows.
+Event details expose objective and conflict counts without leaking model-private
+fields into the feed. Cursors are opaque, keyset-based and bound to their
+filter/event scope. Backfill and the separate origin repair run in bounded
+background batches at startup and resume after interruption. Fact-gate repair
+rechecks the saved text itself; pre-release change identities migrate to v3 and
+old IDs resolve through aliases. Historical `changed` rows whose old schema
+cannot prove the new fact gate remain `analysis / unconfirmed / provisional /
+partial_legacy`; they are auditable but never promoted into the objective feed.
+If revalidation later downgrades an accepted successor, the stale supersede
+pointer loses authority, its predecessor is restored, and the rejected lineage
+claim remains visible. A shallow or subjective contradiction remains an
+auditable membership but cannot create the durable conflict state by itself.
+These reads do not refresh sources, call Tavily, publish a
+recommendation, enqueue work or mutate the profile. Phase 4 will decide the UI;
+Phase 3 deliberately adds none.
+
 ## Client contract
 
 - Desktop Web retains the licensed interaction geometry for its top bar, left

@@ -72,6 +72,85 @@ def _runtime(tmp_path: Path) -> NewsRuntime:
 
 
 @pytest.mark.asyncio
+async def test_event_backfill_runs_in_resumable_batches_without_collecting_news(
+    tmp_path: Path,
+) -> None:
+    class BackfillDatabase(_FakeDatabase):
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def backfill_news_event_projection(self, *, batch_size: int) -> dict[str, object]:
+            self.calls.append(batch_size)
+            completed = len(self.calls) == 2
+            return {
+                "processed_trackers": 1,
+                "state": {"completed": completed},
+            }
+
+    database = BackfillDatabase()
+    runtime = NewsRuntime(
+        data_path=tmp_path,
+        database=database,
+        soul_engine=_FakeSoul(),
+        event_ingress=_FakeIngress(),
+        request_replenishment=_noop_replenishment,
+    )
+
+    result = await runtime._backfill_event_projection()
+
+    assert result == {"ran": True, "completed": True, "processed": 2}
+    assert database.calls == [50, 50]
+    assert runtime.runtime_state()["event_backfill_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_legacy_backfill_still_runs_origin_lineage_repair(
+    tmp_path: Path,
+) -> None:
+    class RepairDatabase(_FakeDatabase):
+        def __init__(self) -> None:
+            self.backfill_calls = 0
+            self.repair_calls = 0
+
+        def backfill_news_event_projection(self, *, batch_size: int) -> dict[str, object]:
+            assert batch_size == 50
+            self.backfill_calls += 1
+            return {"processed_trackers": 0, "state": {"completed": True}}
+
+        def repair_news_event_origin_memberships(
+            self,
+            *,
+            batch_size: int,
+        ) -> dict[str, object]:
+            assert batch_size == 50
+            self.repair_calls += 1
+            return {
+                "processed_trackers": 1,
+                "state": {"completed": self.repair_calls == 2},
+            }
+
+    database = RepairDatabase()
+    runtime = NewsRuntime(
+        data_path=tmp_path,
+        database=database,
+        soul_engine=_FakeSoul(),
+        event_ingress=_FakeIngress(),
+        request_replenishment=_noop_replenishment,
+    )
+
+    result = await runtime._backfill_event_projection()
+
+    assert database.backfill_calls == 1
+    assert database.repair_calls == 2
+    assert result == {
+        "ran": True,
+        "completed": True,
+        "processed": 0,
+        "repaired_trackers": 2,
+    }
+
+
+@pytest.mark.asyncio
 async def test_news_runtime_applies_and_reports_effective_settings(tmp_path: Path) -> None:
     applied: list[dict[str, object]] = []
 

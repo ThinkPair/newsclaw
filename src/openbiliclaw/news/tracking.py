@@ -24,6 +24,7 @@ from typing import Any, cast
 from openbiliclaw.llm.json_utils import parse_llm_json_tolerant
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.news.errors import safe_error_message
+from openbiliclaw.news.evidence import verified_content_scope
 
 TrackingAnalysisCallback = Callable[
     [Mapping[str, Any], list[Mapping[str, Any]]],
@@ -35,6 +36,9 @@ _HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 _CONTENT_SCOPES = ("full_text", "summary", "title_only")
 _CHANGE_TYPES = {"new_fact", "confirmation", "contradiction", "progress", "invalidated"}
 _DECISIONS = {"changed", "related_no_change", "irrelevant", "uncertain"}
+_EVENT_ROLES = {"objective_change", "expectation", "sentiment", "analysis"}
+_OBJECTIVITY_STATUSES = {"confirmed", "unconfirmed", "disputed", "not_applicable"}
+_CONFLICT_STATUSES = {"none", "contested", "resolved"}
 _IN_FLIGHT_WAIT_SECONDS = 130.0
 
 _TRACKING_SYSTEM_PROMPT = """你是 NewsClaw 的变化核验器。
@@ -48,6 +52,12 @@ _TRACKING_SYSTEM_PROMPT = """你是 NewsClaw 的变化核验器。
 3. 标题级证据必须保守；不能声称读过正文。
 4. 事实与推断分开。不得给投资买卖建议。
 5. 只能引用输入里的 evidence_item_key；不能补造来源、数字、日期或引语。
+6. objective_change 只表示已经发生或正式生效、且能明确写成“此前状态→现在状态”的客观变化。
+7. 计划、预测、指引和概率判断标 expectation；市场情绪标 sentiment；原因、影响和场景解释标 analysis。
+8. confirmed 的 objective_change 必须给出证据支持的 effective_at。
+   若正文只说明事情已经发生但没有更精确时间，只能用该证据 published_at 的 YYYY-MM-DD
+   日期部分，不能把媒体发稿分钟伪装成事件发生分钟，也不能自行推算时间。
+9. 来源冲突未解决时 objectivity_status=disputed、conflict_status=contested，不能伪装成确定事实。
 
 严格输出 JSON 对象：
 {
@@ -62,6 +72,10 @@ _TRACKING_SYSTEM_PROMPT = """你是 NewsClaw 的变化核验器。
       "inference": "系统推断；没有则空字符串",
       "summary": "一句话变化摘要",
       "evidence_quote": "最短必要证据片段；标题级可直接复述标题",
+      "role": "objective_change|expectation|sentiment|analysis",
+      "objectivity_status": "confirmed|unconfirmed|disputed|not_applicable",
+      "conflict_status": "none|contested|resolved",
+      "effective_at": "证据支持的 ISO 8601 时间或 YYYY-MM-DD；不适用则空字符串",
       "confidence": 0.0
     }
   ]
@@ -80,6 +94,96 @@ def _iso(value: datetime) -> str:
 
 def _clean_text(value: object, *, maximum: int = 4_000) -> str:
     return " ".join(str(value or "").split()).strip()[:maximum]
+
+
+def _normalize_effective_at(value: object) -> str:
+    """Accept only an explicit calendar date or timezone-aware ISO timestamp."""
+
+    normalized = _clean_text(value, maximum=100)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        try:
+            datetime.fromisoformat(normalized)
+        except ValueError:
+            return ""
+        return normalized
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        return ""
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _source_local_date(value: object) -> str:
+    """Return the explicit calendar date written by a source timestamp."""
+
+    normalized = _clean_text(value, maximum=100)
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:$|T|\s)", normalized)
+    if match is None:
+        return ""
+    try:
+        datetime.fromisoformat(match.group(1))
+    except ValueError:
+        return ""
+    return match.group(1)
+
+
+def _event_evidence_strength(candidate: Mapping[str, Any]) -> tuple[str, str]:
+    """Derive support strength from stored evidence, never from model claims."""
+
+    corroborating_sources = _corroborating_sources(candidate)
+    primary_scope = _content_scope(candidate)
+    primary_source = _clean_text(
+        candidate.get("media") or candidate.get("source") or candidate.get("up_name"),
+        maximum=200,
+    ).casefold()
+    has_independent_source = any(
+        source_name
+        for source in corroborating_sources
+        if (source_name := _clean_text(source.get("source"), maximum=200).casefold())
+        and source_name != primary_source
+    )
+    source_scope = "multi_source" if has_independent_source else "single_source"
+    # Corroborating rows in the normalized candidate are metadata pointers,
+    # not independently retained body evidence.  They can describe breadth,
+    # but only durable memberships may later upgrade evidence to cross-source.
+    evidence_status = (
+        "source_supported" if primary_scope in {"summary", "full_text"} else "provisional"
+    )
+    return source_scope, evidence_status
+
+
+def _effective_at_has_started(
+    effective_at: str,
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Reject future-effective claims from the already-happened fact lane."""
+
+    if not effective_at:
+        return False
+    now = _utc_now()
+    reference = now
+    retrieved_at = _clean_text(candidate.get("retrieved_at"), maximum=100)
+    if retrieved_at:
+        try:
+            parsed_reference = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+        except ValueError:
+            parsed_reference = None
+        if parsed_reference is not None and parsed_reference.tzinfo is not None:
+            # Imported or malformed evidence can claim a retrieval time in the
+            # future.  It must never move the already-happened boundary beyond
+            # the actual clock.
+            reference = min(parsed_reference.astimezone(UTC), now)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", effective_at):
+        return datetime.fromisoformat(effective_at).date() <= reference.date()
+    try:
+        parsed_effective = datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return bool(
+        parsed_effective.tzinfo is not None and parsed_effective.astimezone(UTC) <= reference
+    )
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -115,6 +219,7 @@ def _overlap(left: object, right: object) -> float:
 
 
 def _content_scope(candidate: Mapping[str, Any]) -> str:
+    explicit_scope = _clean_text(candidate.get("content_scope"), maximum=30).casefold()
     raw_tags = candidate.get("tags", [])
     if isinstance(raw_tags, str):
         try:
@@ -122,7 +227,17 @@ def _content_scope(candidate: Mapping[str, Any]) -> str:
         except (TypeError, ValueError, json.JSONDecodeError):
             raw_tags = []
     tags = {str(value).strip().casefold() for value in raw_tags if value}
-    return next((scope for scope in _CONTENT_SCOPES if scope in tags), "title_only")
+    declared = (
+        explicit_scope
+        if explicit_scope in _CONTENT_SCOPES
+        else next((scope for scope in _CONTENT_SCOPES if scope in tags), "")
+    )
+    return verified_content_scope(
+        declared or "unknown",
+        candidate,
+        title=candidate.get("title"),
+        derive_when_unknown=not declared,
+    )
 
 
 def _candidate_fingerprint(candidate: Mapping[str, Any]) -> str:
@@ -429,12 +544,77 @@ class NewsTrackingService:
             if not summary or not previous_state or not new_state or not fact:
                 continue
             candidate = by_key[item_key]
+            role = _clean_text(raw.get("role") or "analysis", maximum=40).casefold()
+            objectivity_status = _clean_text(
+                raw.get("objectivity_status") or "unconfirmed",
+                maximum=40,
+            ).casefold()
+            conflict_status = _clean_text(
+                raw.get("conflict_status") or "none",
+                maximum=40,
+            ).casefold()
+            if (
+                role not in _EVENT_ROLES
+                or objectivity_status not in _OBJECTIVITY_STATUSES
+                or conflict_status not in _CONFLICT_STATUSES
+            ):
+                continue
+            effective_at = _normalize_effective_at(raw.get("effective_at"))
+            published_at = _normalize_effective_at(candidate.get("published_at"))
+            effective_basis = "evidence_explicit"
+            if effective_at and published_at and effective_at == published_at:
+                # A fallback publication timestamp identifies the day on which
+                # the fact was observable, not the minute it happened.  Folding
+                # it to the source-local date lets two publishers support one
+                # transition instead of inventing two intraday changes.
+                effective_at = _source_local_date(candidate.get("published_at"))
+                effective_basis = "published_at_fallback"
+            effective_precision = (
+                "date"
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", effective_at)
+                else "minute"
+                if effective_at
+                else "unknown"
+            )
+            source_scope, evidence_status = _event_evidence_strength(candidate)
+            declared_conflict = conflict_status == "contested" or objectivity_status == "disputed"
+            durable_declared_conflict = bool(
+                declared_conflict
+                and role == "objective_change"
+                and evidence_status in {"source_supported", "cross_source_supported"}
+                and effective_at
+                and previous_state.casefold() != new_state.casefold()
+                and _effective_at_has_started(effective_at, candidate)
+            )
+            if durable_declared_conflict:
+                evidence_status = "contested"
+                objectivity_status = "disputed"
+                conflict_status = "contested"
+            elif declared_conflict:
+                objectivity_status = (
+                    "unconfirmed" if role == "objective_change" else "not_applicable"
+                )
+                conflict_status = "none"
+            if role == "objective_change" and objectivity_status == "confirmed":
+                if not effective_at or previous_state.casefold() == new_state.casefold():
+                    continue
+                if not _effective_at_has_started(effective_at, candidate):
+                    # A dated future state is useful secondary context, but it
+                    # is not an already-effective objective change.
+                    role = "expectation"
+                    objectivity_status = "not_applicable"
+                elif evidence_status == "provisional":
+                    # A title can be a clue, but it cannot independently promote
+                    # an event into the confirmed objective-change feed.
+                    objectivity_status = "unconfirmed"
             change_material = "\n".join(
                 (
                     str(candidate.get("evidence_fingerprint", "")),
                     change_type,
                     previous_state.casefold(),
                     new_state.casefold(),
+                    effective_at,
+                    effective_precision,
                 )
             )
             candidate.update(
@@ -448,6 +628,14 @@ class NewsTrackingService:
                     "summary": summary,
                     "evidence_quote": _clean_text(raw.get("evidence_quote"), maximum=800),
                     "confidence": round(confidence, 4),
+                    "role": role,
+                    "objectivity_status": objectivity_status,
+                    "conflict_status": conflict_status,
+                    "source_scope": source_scope,
+                    "evidence_status": evidence_status,
+                    "effective_at": effective_at,
+                    "effective_precision": effective_precision,
+                    "effective_basis": effective_basis,
                     "change_fingerprint": hashlib.sha256(
                         change_material.encode("utf-8")
                     ).hexdigest(),

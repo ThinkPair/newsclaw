@@ -31,6 +31,7 @@ candidate pool.
 | Semantic dedupe | Implemented | Exact URL/hash/title plus offline headline similarity; local embedding similarity can be injected |
 | From-zero onboarding | Implemented | Explicit manual interests/avoid terms, initial source fetch, cross-source dedupe, candidate callback, four-stage result |
 | Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; the live desktop list/route/empty state and API schema were verified locally, while populated-card and change paths are covered by automated contracts |
+| Durable event projection (Phase 3) | Implemented | Projects completed tracking evidence into stable events, immutable evidence memberships and deduplicated state changes in the same transaction; only confirmed, effective objective changes enter the default feed, while expectations/sentiment/analysis remain secondary |
 
 ## Canonical article contract
 
@@ -115,6 +116,39 @@ is a profile-learning event.
 The complete control surface is desktop-only for Phase 2. Mobile/PWA, the
 browser extension and DSH deliberately omit the tracking center, timeline and
 manual check-now action until they can consume this same backend ledger.
+
+### Phase 3 durable event contract
+
+`NewsTrackingService` emits explicit `role`, `objectivity_status`,
+`conflict_status`, `effective_at` and `effective_precision` fields for every
+proposed change. It must classify forecasts, expectations, sentiment and AI
+interpretation separately from `objective_change`; it cannot invent a precise
+effective time from vague language. Date-only facts remain date precision;
+timezone-aware timestamps normalize to an absolute minute. A shared evidence
+verifier strips HTML/boilerplate and rejects near-title content, so metadata
+claiming `full_text` cannot substitute for retained evidence. The same publisher
+repeated through another technical provider remains one source.
+
+Database completion projects a changed check into `news_events`, evidence
+memberships and event changes in the same transaction. Exact normalized
+`story_key` chooses the event; missing keys remain tracker-local. Change identity
+v3 then deduplicates event-scoped normalized A→B transitions across tracker and
+source wording. Equivalent transitions add corroborating evidence rather than
+another unread item. Mutually exclusive durable outcomes in the same event/time
+slot are quarantined as contested and freeze current-state projection until a
+strong explicit superseding change resolves them. If event merging gives one
+successor two predecessor candidates, the database keeps both edges and their
+immutable source event/change IDs in a lineage-claim ledger. An explicit durable
+resolution atomically marks the winner resolved, retains the loser as rejected,
+applies only the chosen lifecycle edge, and closes the event conflict. Change
+alias folding and later event merges remap canonical endpoints without rewriting
+the origin fields. Projection failures roll back
+check completion. Legacy history, evidence depth, source origins and pre-release
+identities are repaired in bounded, restart-safe and idempotent batches, with
+aliases preserving old reads. Rows that cannot satisfy the new evidence gate
+remain `analysis / unconfirmed / provisional / partial_legacy` and stay out of
+the objective feed. This module adds no new collector, Tavily call, profile
+mutation or UI behavior.
 
 ### From-zero onboarding
 

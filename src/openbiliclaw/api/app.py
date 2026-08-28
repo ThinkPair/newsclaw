@@ -8517,6 +8517,7 @@ def create_app(
     def _tracked_observation_out(row: Mapping[str, Any]) -> TrackedObservationOut:
         return TrackedObservationOut(
             tracking_id=str(row.get("tracking_id", "")),
+            event_id=str(row.get("event_id", "")),
             request_id=str(row.get("request_id", "")),
             item_key=str(row.get("item_key", "")),
             recommendation_id=(

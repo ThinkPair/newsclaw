@@ -44,6 +44,25 @@ not require another product at runtime.
   for that tracker instead of issuing a second model call. Stopping a tracker preserves its history, and a
   restart creates a new cycle without rewriting the archived one. This lane
   never calls Tavily automatically and never updates the user profile.
+- **Phase 3 durable event projection is implemented.** An article is evidence,
+  not the event itself. Exact normalized `story_key` identity first determines
+  the real-world event; an event-scoped before/after state plus explicit time
+  precision then identifies the transition. Corroboration from another tracker
+  or source strengthens that transition without creating another unread item.
+  The default feed admits only confirmed, already-effective objective changes
+  with enough locally retained summary or body evidence. Mutually exclusive,
+  durable outcomes for the same event state slot are quarantined as contested:
+  current state is frozen, both evidence trails remain auditable, and only a
+  stronger explicit resolution may restore projection. When an event merge
+  produces two predecessor candidates for one successor, both edges and their
+  immutable origins are retained in a lineage-claim ledger. One explicit
+  resolution selects the winner, rejects but preserves the loser, and closes
+  the conflict atomically. Expectations, market
+  sentiment, and AI analysis remain secondary records and cannot masquerade as
+  facts. Restart-safe repair revalidates legacy evidence depth, origin lineage,
+  and pre-release change identities. This phase adds backend truth and read
+  contracts only: it does not change the desktop UI, call Tavily automatically,
+  or update the profile.
 
 ## Sources
 
@@ -67,7 +86,12 @@ Tushare / RSS → news evidence → normalized, deduplicated local batch → eva
                                       │
                                       └→ [Phase 2] due observation → local-rule shortlist
                                                                          → structured model check
-                                                                         ├→ material change → timeline + unread
+                                                                         ├→ material change → check + evidence ledger
+                                                                         │                    └→ [Phase 3] transactional event projection
+                                                                         │                         ├→ new objective transition → local event-change ledger + unread
+                                                                         │                         ├→ corroboration → stronger evidence, no duplicate unread
+                                                                         │                         ├→ conflicting outcome → contested, freeze state, await resolution
+                                                                         │                         └→ expectation/sentiment/analysis → secondary only
                                                                          └→ no change → check history only
 
 Workbench → explicit feedback → profile
@@ -93,6 +117,13 @@ extension, and DSH keep their existing news capabilities in this phase, but do
 not expose a tracking center, change timeline, or manual check-now action. A
 future client must consume the same backend truth rather than create a second
 tracking state.
+
+Phase 3 does not change any client surface yet. Event detail, the objective
+change feed, contested changes, evidence membership, and their independent read
+state first stabilize as local backend contracts; Phase 4 will decide their
+presentation. A client must not promote a forecast, sentiment signal, or AI
+inference into an objective change, or silently choose a winner when evidence
+conflicts.
 
 ## Local preview
 

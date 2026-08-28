@@ -8,18 +8,22 @@ state and is registered when ``NEWSCLAW_MODE=1``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import importlib
 import json
 import logging
 import os
+import re
 import shutil
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from openbiliclaw.discovery.candidate_pool import (
@@ -55,6 +59,9 @@ if TYPE_CHECKING:
 NewsSourceKind = Literal["tushare", "rss"]
 MaybeAwaitable = Callable[..., Awaitable[object] | object]
 RuntimeSettingsApplier = Callable[[Mapping[str, object]], Awaitable[object] | object]
+
+_NEWS_CHANGE_CURSOR_VERSION = 1
+_NEWS_CHANGE_CURSOR_MAX_LENGTH = 1_024
 
 logger = logging.getLogger(__name__)
 
@@ -373,6 +380,255 @@ class NewsBootstrapIn(BaseModel):
     request_id: str = ""
 
 
+class NewsEventOut(BaseModel):
+    """One durable real-world event, separate from articles and tracking runs."""
+
+    event_id: str
+    canonical_title: str
+    event_type: str = "unknown"
+    topic_group: str = ""
+    story_key: str = ""
+    entities: list[Any] = Field(default_factory=list)
+    current_state: str = ""
+    state_version: int = 0
+    status: Literal["active", "resolved", "merged", "archived"] = "active"
+    merged_into_event_id: str | None = None
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    last_change_at: str = ""
+    change_count: int = 0
+    unread_change_count: int = 0
+    conflict_count: int = 0
+    unread_conflict_count: int = 0
+    evidence_count: int = 0
+
+
+class NewsObjectiveChangeOut(BaseModel):
+    """A confirmed objective change; interpretation fields stay out of this DTO."""
+
+    change_id: str
+    event_id: str
+    canonical_title: str = ""
+    topic_group: str = ""
+    story_key: str = ""
+    change_type: str
+    previous_state: str
+    new_state: str
+    fact: str = ""
+    summary: str = ""
+    evidence_quote: str = ""
+    role: Literal["objective_change"]
+    objectivity_status: Literal["confirmed"]
+    conflict_status: Literal["none", "resolved"] = "none"
+    source_scope: Literal["unknown", "single_source", "multi_source"] = "unknown"
+    evidence_status: Literal["source_supported", "cross_source_supported"]
+    supersedes_change_id: str | None = None
+    is_read: bool = False
+    effective_at: str
+    effective_precision: Literal["unknown", "date", "minute"] = "unknown"
+    detected_at: str = ""
+    evidence_count: int = 0
+
+
+class NewsEventEvidenceOut(BaseModel):
+    """One immutable evidence revision attached to an event or change."""
+
+    membership_id: str
+    event_id: str
+    change_id: str | None = None
+    evidence_item_key: str
+    relation_kind: Literal[
+        "origin",
+        "supports_change",
+        "related_no_change",
+        "contradicts_change",
+    ]
+    relation_basis: str = ""
+    relation_score: float = 0.0
+    content_scope: Literal["unknown", "title_only", "summary", "full_text"] = "unknown"
+    media: str = ""
+    provider: str = ""
+    title: str = ""
+    canonical_url: str = ""
+    published_at: str = ""
+    retrieved_at: str = ""
+    evidence_snapshot: dict[str, Any] = Field(default_factory=dict)
+    evidence_completeness: Literal["complete", "partial_legacy"] = "complete"
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+
+
+class NewsEventLineageClaimOut(BaseModel):
+    """One retained candidate edge behind a successor's lineage decision."""
+
+    claim_id: str
+    event_id: str
+    successor_change_id: str
+    predecessor_change_id: str
+    supersedes_lifecycle: Literal["superseded", "invalidated"]
+    source_event_id: str
+    source_change_id: str
+    status: Literal["active", "contested", "resolved", "rejected"]
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class NewsEventConflictOut(BaseModel):
+    """One unresolved clash between otherwise durable state transitions."""
+
+    change_id: str
+    event_id: str
+    canonical_title: str = ""
+    topic_group: str = ""
+    story_key: str = ""
+    change_type: str
+    previous_state: str
+    new_state: str
+    fact: str = ""
+    summary: str = ""
+    evidence_quote: str = ""
+    role: Literal["objective_change", "expectation", "sentiment", "analysis"]
+    objectivity_status: Literal["disputed"]
+    conflict_status: Literal["contested"]
+    evidence_status: Literal["contested"]
+    source_scope: Literal["unknown", "single_source", "multi_source"] = "unknown"
+    is_read: bool = False
+    effective_at: str
+    effective_precision: Literal["unknown", "date", "minute"] = "unknown"
+    detected_at: str = ""
+    evidence_count: int = 0
+    freeze_reason: Literal["durable_evidence_conflict"] = "durable_evidence_conflict"
+    lineage_claims: list[NewsEventLineageClaimOut] = Field(default_factory=list)
+
+
+class NewsChangeFeedResponse(BaseModel):
+    items: list[NewsObjectiveChangeOut] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class NewsEventDetailResponse(BaseModel):
+    item: NewsEventOut
+    resolved_from_event_id: str = ""
+
+
+class NewsEventChangeTimelineResponse(BaseModel):
+    event: NewsEventOut
+    items: list[NewsObjectiveChangeOut] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class NewsEventEvidencePage(BaseModel):
+    event_id: str
+    change_id: str | None = None
+    resolved_from_change_id: str = ""
+    items: list[NewsEventEvidenceOut] = Field(default_factory=list)
+    next_offset: int | None = None
+    has_more: bool = False
+
+
+class NewsEventChangeReadResponse(BaseModel):
+    item: NewsObjectiveChangeOut
+    updated: bool = False
+
+
+class NewsEventConflictPage(BaseModel):
+    event: NewsEventOut
+    items: list[NewsEventConflictOut] = Field(default_factory=list)
+    next_offset: int | None = None
+    has_more: bool = False
+
+
+class NewsEventConflictReadResponse(BaseModel):
+    item: NewsEventConflictOut
+    updated: bool = False
+
+
+def _encode_news_change_cursor(
+    *,
+    event_id: str,
+    unread_only: bool,
+    position: tuple[str, str],
+) -> str:
+    """Bind one opaque keyset cursor to its event and objective-feed filters."""
+
+    payload = {
+        "v": _NEWS_CHANGE_CURSOR_VERSION,
+        "scope": "event" if event_id else "global",
+        "event_id": event_id,
+        "unread_only": unread_only,
+        "lifecycle": "active",
+        "objective_only": True,
+        "after": list(position),
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    if len(token) > _NEWS_CHANGE_CURSOR_MAX_LENGTH:  # pragma: no cover - trusted bound
+        raise RuntimeError("news change cursor exceeds its encoded length bound")
+    return token
+
+
+def _decode_news_change_cursor(
+    token: str,
+    *,
+    event_id: str,
+    unread_only: bool,
+) -> tuple[str, str]:
+    """Strictly decode a restart-safe objective-change cursor."""
+
+    if (
+        not token
+        or len(token) > _NEWS_CHANGE_CURSOR_MAX_LENGTH
+        or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None
+    ):
+        raise ValueError("invalid news change cursor")
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.b64decode(
+            (token + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid news change cursor") from error
+    expected_keys = {
+        "v",
+        "scope",
+        "event_id",
+        "unread_only",
+        "lifecycle",
+        "objective_only",
+        "after",
+    }
+    expected_scope = "event" if event_id else "global"
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload["v"] != _NEWS_CHANGE_CURSOR_VERSION
+        or payload["scope"] != expected_scope
+        or payload["event_id"] != event_id
+        or payload["unread_only"] is not unread_only
+        or payload["lifecycle"] != "active"
+        or payload["objective_only"] is not True
+    ):
+        raise ValueError("invalid news change cursor")
+    after = payload["after"]
+    if (
+        not isinstance(after, list)
+        or len(after) != 2
+        or any(not isinstance(value, str) or not value for value in after)
+    ):
+        raise ValueError("invalid news change cursor")
+    return after[0], after[1]
+
+
 async def _maybe_await(callback: MaybeAwaitable, *args: object, **kwargs: object) -> object:
     result = callback(*args, **kwargs)
     if isinstance(result, Awaitable):
@@ -422,6 +678,7 @@ class NewsRuntime:
         self._refresh_lock = asyncio.Lock()
         self._bootstrap_task: asyncio.Task[None] | None = None
         self._scheduler_task: asyncio.Task[None] | None = None
+        self._event_backfill_task: asyncio.Task[object] | None = None
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._stop_event = asyncio.Event()
         self._effective_settings: dict[str, object] = {}
@@ -1423,9 +1680,96 @@ class NewsRuntime:
                     }
                 )
 
+    async def _backfill_event_projection(self) -> dict[str, object]:
+        """Migrate legacy tracking history in short, restart-safe local batches."""
+
+        backfill = getattr(self.database, "backfill_news_event_projection", None)
+        if not callable(backfill):
+            return {"ran": False, "reason": "event_projection_unavailable"}
+        repair_origins = getattr(
+            self.database,
+            "repair_news_event_origin_memberships",
+            None,
+        )
+        processed = 0
+        repaired_trackers = 0
+        self._merge_runtime_state({"event_backfill_status": "running"})
+        try:
+            while not self._stop_event.is_set():
+                batch_result = await asyncio.to_thread(backfill, batch_size=50)
+                if not isinstance(batch_result, Mapping):
+                    raise RuntimeError("event projection backfill returned an invalid result")
+                processed += _as_int(batch_result.get("processed_trackers"), 0)
+                state = batch_result.get("state")
+                completed = bool(isinstance(state, Mapping) and state.get("completed", False))
+                self._merge_runtime_state(
+                    {
+                        "event_backfill_status": "completed" if completed else "running",
+                        "event_backfill_processed_trackers": processed,
+                        "event_backfill_last_error": "",
+                    }
+                )
+                if completed:
+                    break
+                await asyncio.sleep(0)
+            if self._stop_event.is_set():
+                return {"ran": True, "completed": False, "processed": processed}
+            if callable(repair_origins):
+                self._merge_runtime_state({"event_origin_repair_status": "running"})
+                while not self._stop_event.is_set():
+                    repair_result = await asyncio.to_thread(repair_origins, batch_size=50)
+                    if not isinstance(repair_result, Mapping):
+                        raise RuntimeError("event origin repair returned an invalid result")
+                    repaired_trackers += _as_int(repair_result.get("processed_trackers"), 0)
+                    repair_state = repair_result.get("state")
+                    repair_completed = bool(
+                        isinstance(repair_state, Mapping) and repair_state.get("completed", False)
+                    )
+                    self._merge_runtime_state(
+                        {
+                            "event_origin_repair_status": (
+                                "completed" if repair_completed else "running"
+                            ),
+                            "event_origin_repair_processed_trackers": repaired_trackers,
+                            "event_origin_repair_last_error": "",
+                        }
+                    )
+                    if repair_completed:
+                        break
+                    await asyncio.sleep(0)
+            final_result: dict[str, object] = {
+                "ran": True,
+                "completed": True,
+                "processed": processed,
+            }
+            if callable(repair_origins):
+                final_result["repaired_trackers"] = repaired_trackers
+            return final_result
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            message = safe_error_message(error) or type(error).__name__
+            self._merge_runtime_state(
+                {
+                    "event_backfill_status": "failed",
+                    "event_backfill_processed_trackers": processed,
+                    "event_backfill_last_error": message,
+                    "event_origin_repair_status": "failed",
+                    "event_origin_repair_processed_trackers": repaired_trackers,
+                    "event_origin_repair_last_error": message,
+                }
+            )
+            logger.warning("NewsClaw event backfill paused: %s", message)
+            return {"ran": True, "completed": False, "processed": processed, "error": message}
+        return {"ran": True, "completed": False, "processed": processed}
+
     async def start(self) -> None:
         self._stop_event.clear()
         await self.apply_settings()
+        if self._event_backfill_task is None or self._event_backfill_task.done():
+            self._event_backfill_task = asyncio.create_task(self._backfill_event_projection())
+            self._background_tasks.add(self._event_backfill_task)
+            self._event_backfill_task.add_done_callback(self._background_tasks.discard)
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
@@ -1498,6 +1842,258 @@ def register_newsclaw_routes(
     )
     app.state.newsclaw_runtime = runtime
     register_research_routes(app, runtime=runtime)
+
+    def _resolved_news_event(event_id: str) -> tuple[dict[str, Any], str]:
+        try:
+            row = database.get_news_event(event_id, resolve_merged=True)
+        except RuntimeError as error:
+            raise HTTPException(
+                status_code=409, detail="news event merge chain is invalid"
+            ) from error
+        if not isinstance(row, Mapping):
+            raise HTTPException(status_code=404, detail="news event not found")
+        item = dict(row)
+        resolved_id = str(item.get("event_id") or "")
+        return item, event_id if resolved_id != event_id else ""
+
+    def _uuid_text(value: str, *, field: str) -> str:
+        try:
+            return str(uuid.UUID(value))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=f"invalid {field}") from error
+
+    def _objective_change_out(row: Mapping[str, Any]) -> NewsObjectiveChangeOut:
+        item = dict(row)
+        if not item.get("canonical_title"):
+            event, _resolved_from = _resolved_news_event(str(item.get("event_id") or ""))
+            for field in ("canonical_title", "topic_group", "story_key"):
+                item[field] = event.get(field, "")
+        return NewsObjectiveChangeOut.model_validate(item)
+
+    def _objective_change_page(
+        *,
+        event_id: str,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> tuple[list[NewsObjectiveChangeOut], str | None, bool]:
+        before_detected_at = ""
+        before_change_id = ""
+        if cursor is not None:
+            try:
+                before_detected_at, before_change_id = _decode_news_change_cursor(
+                    cursor,
+                    event_id=event_id,
+                    unread_only=unread_only,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+        rows = database.list_news_event_changes(
+            event_id=event_id,
+            unread_only=unread_only,
+            lifecycle="active",
+            before_detected_at=before_detected_at,
+            before_change_id=before_change_id,
+            limit=limit + 1,
+            objective_only=True,
+        )
+        page = [dict(row) for row in rows[:limit] if isinstance(row, Mapping)]
+        has_more = len(rows) > limit
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_news_change_cursor(
+                event_id=event_id,
+                unread_only=unread_only,
+                position=(
+                    str(last.get("detected_at") or ""),
+                    str(last.get("change_id") or ""),
+                ),
+            )
+        return [_objective_change_out(row) for row in page], next_cursor, has_more
+
+    @app.get("/api/news/changes", response_model=NewsChangeFeedResponse)
+    async def news_objective_changes(
+        limit: int = Query(default=30, ge=1, le=100),
+        cursor: str | None = Query(
+            default=None,
+            min_length=1,
+            max_length=_NEWS_CHANGE_CURSOR_MAX_LENGTH,
+        ),
+        unread_only: bool = Query(default=False),
+    ) -> NewsChangeFeedResponse:
+        items, next_cursor, has_more = _objective_change_page(
+            event_id="",
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
+        return NewsChangeFeedResponse(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    @app.get("/api/news/events/{event_id}", response_model=NewsEventDetailResponse)
+    async def news_event_detail(event_id: str) -> NewsEventDetailResponse:
+        requested_id = _uuid_text(event_id, field="event_id")
+        item, resolved_from = _resolved_news_event(requested_id)
+        return NewsEventDetailResponse(
+            item=NewsEventOut.model_validate(item),
+            resolved_from_event_id=resolved_from,
+        )
+
+    @app.get(
+        "/api/news/events/{event_id}/changes",
+        response_model=NewsEventChangeTimelineResponse,
+    )
+    async def news_event_changes(
+        event_id: str,
+        limit: int = Query(default=30, ge=1, le=100),
+        cursor: str | None = Query(
+            default=None,
+            min_length=1,
+            max_length=_NEWS_CHANGE_CURSOR_MAX_LENGTH,
+        ),
+        unread_only: bool = Query(default=False),
+    ) -> NewsEventChangeTimelineResponse:
+        event, _resolved_from = _resolved_news_event(_uuid_text(event_id, field="event_id"))
+        canonical_event_id = str(event["event_id"])
+        items, next_cursor, has_more = _objective_change_page(
+            event_id=canonical_event_id,
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
+        return NewsEventChangeTimelineResponse(
+            event=NewsEventOut.model_validate(event),
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    @app.get(
+        "/api/news/events/{event_id}/conflicts",
+        response_model=NewsEventConflictPage,
+    )
+    async def news_event_conflicts(
+        event_id: str,
+        limit: int = Query(default=30, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        unread_only: bool = Query(default=False),
+    ) -> NewsEventConflictPage:
+        event, _resolved_from = _resolved_news_event(_uuid_text(event_id, field="event_id"))
+        canonical_event_id = str(event["event_id"])
+        rows = database.list_news_event_changes(
+            event_id=canonical_event_id,
+            unread_only=unread_only,
+            lifecycle="active",
+            limit=limit + 1,
+            offset=offset,
+            objective_only=False,
+            conflicts_only=True,
+        )
+        visible = rows[:limit]
+        has_more = len(rows) > limit
+        return NewsEventConflictPage(
+            event=NewsEventOut.model_validate(event),
+            items=[NewsEventConflictOut.model_validate(row) for row in visible],
+            next_offset=offset + limit if has_more else None,
+            has_more=has_more,
+        )
+
+    @app.get(
+        "/api/news/events/{event_id}/evidence",
+        response_model=NewsEventEvidencePage,
+    )
+    async def news_event_evidence(
+        event_id: str,
+        change_id: str | None = None,
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+    ) -> NewsEventEvidencePage:
+        event, _resolved_from = _resolved_news_event(_uuid_text(event_id, field="event_id"))
+        canonical_event_id = str(event["event_id"])
+        normalized_change_id = (
+            _uuid_text(change_id, field="change_id") if change_id is not None else ""
+        )
+        resolved_from_change_id = ""
+        if normalized_change_id:
+            requested_change_id = normalized_change_id
+            try:
+                change = database.get_news_event_change(requested_change_id)
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="news event change alias is inconsistent",
+                ) from exc
+            if (
+                not isinstance(change, Mapping)
+                or str(change.get("event_id") or "") != canonical_event_id
+            ):
+                raise HTTPException(status_code=404, detail="news event change not found")
+            normalized_change_id = str(change.get("change_id") or "")
+            if normalized_change_id != requested_change_id:
+                resolved_from_change_id = requested_change_id
+        rows = database.list_news_event_memberships(
+            canonical_event_id,
+            change_id=normalized_change_id,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page = [dict(row) for row in rows[:limit] if isinstance(row, Mapping)]
+        has_more = len(rows) > limit
+        return NewsEventEvidencePage(
+            event_id=canonical_event_id,
+            change_id=normalized_change_id or None,
+            resolved_from_change_id=resolved_from_change_id,
+            items=[NewsEventEvidenceOut.model_validate(row) for row in page],
+            next_offset=offset + limit if has_more else None,
+            has_more=has_more,
+        )
+
+    @app.post(
+        "/api/news/changes/{change_id}/read",
+        response_model=NewsEventChangeReadResponse,
+    )
+    async def read_news_event_change(change_id: str) -> NewsEventChangeReadResponse:
+        normalized_change_id = _uuid_text(change_id, field="change_id")
+        row, updated = database.mark_news_event_change_read(
+            normalized_change_id,
+            objective_only=True,
+        )
+        if not isinstance(row, Mapping):
+            raise HTTPException(status_code=404, detail="news event change not found")
+        refreshed = database.get_news_event_change(
+            normalized_change_id,
+            objective_only=True,
+        )
+        if not isinstance(refreshed, Mapping):  # pragma: no cover - same transaction invariant
+            raise HTTPException(status_code=409, detail="news event change is inconsistent")
+        return NewsEventChangeReadResponse(
+            item=_objective_change_out(refreshed),
+            updated=updated,
+        )
+
+    @app.post(
+        "/api/news/conflicts/{change_id}/read",
+        response_model=NewsEventConflictReadResponse,
+    )
+    async def read_news_event_conflict(
+        change_id: str,
+    ) -> NewsEventConflictReadResponse:
+        normalized_change_id = _uuid_text(change_id, field="change_id")
+        row, updated = database.mark_news_event_change_read(
+            normalized_change_id,
+            objective_only=False,
+            conflicts_only=True,
+        )
+        if not isinstance(row, Mapping):
+            raise HTTPException(status_code=404, detail="news event conflict not found")
+        return NewsEventConflictReadResponse(
+            item=NewsEventConflictOut.model_validate(row),
+            updated=updated,
+        )
 
     @app.on_event("startup")
     async def _start_newsclaw_runtime() -> None:

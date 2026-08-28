@@ -84,6 +84,10 @@ def _changed_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "inference": "政策进入可执行阶段。",
         "summary": "实施细则从等待发布变为已经正式发布。",
         "evidence_quote": "实施细则已经正式发布",
+        "role": "objective_change",
+        "objectivity_status": "confirmed",
+        "conflict_status": "none",
+        "effective_at": "2026-08-28T08:00:00+00:00",
         "confidence": 0.94,
     }
 
@@ -123,6 +127,190 @@ def _unread_count(database: Database, tracking_id: str) -> int:
         """,
         (tracking_id,),
     )
+
+
+def test_objective_change_metadata_is_derived_conservatively_from_evidence() -> None:
+    candidate = _candidate()
+    changes, decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert decisions == [{"evidence_item_key": candidate["item_key"], "decision": "changed"}]
+    assert changes[0]["role"] == "objective_change"
+    assert changes[0]["objectivity_status"] == "confirmed"
+    assert changes[0]["source_scope"] == "single_source"
+    assert changes[0]["evidence_status"] == "source_supported"
+    assert changes[0]["effective_at"] == "2026-08-28"
+    assert changes[0]["effective_precision"] == "date"
+    assert changes[0]["effective_basis"] == "published_at_fallback"
+
+
+def test_title_only_change_cannot_promote_itself_to_confirmed_objective_fact() -> None:
+    candidate = {**_candidate(), "content_scope": "title_only", "body_text": ""}
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert changes[0]["objectivity_status"] == "unconfirmed"
+    assert changes[0]["evidence_status"] == "provisional"
+
+
+@pytest.mark.parametrize("secondary_kind", ["title_only", "expectation", "analysis"])
+def test_non_durable_declared_conflict_stays_secondary(secondary_kind: str) -> None:
+    candidate = _candidate()
+    decision = _changed_decision(candidate)
+    decision["objectivity_status"] = "disputed"
+    decision["conflict_status"] = "contested"
+    if secondary_kind == "title_only":
+        candidate["content_scope"] = "title_only"
+        candidate["body_text"] = ""
+        candidate["description"] = ""
+    else:
+        decision["role"] = secondary_kind
+        decision["objectivity_status"] = "not_applicable"
+
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [decision],
+    )
+
+    assert len(changes) == 1
+    assert changes[0]["conflict_status"] == "none"
+    assert changes[0]["objectivity_status"] != "disputed"
+    assert changes[0]["evidence_status"] != "contested"
+
+
+def test_full_text_label_without_body_is_capped_at_title_only() -> None:
+    candidate = {
+        **_candidate(),
+        "content_scope": "full_text",
+        "body_text": "",
+        "description": "",
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert changes[0]["evidence_status"] == "provisional"
+    assert changes[0]["objectivity_status"] == "unconfirmed"
+
+
+@pytest.mark.parametrize(
+    "body_text",
+    [
+        "政策实施细则正式发布。",
+        "点击查看全文",
+        "来源：测试媒体",
+    ],
+)
+def test_near_title_and_boilerplate_body_cannot_confirm_fact(body_text: str) -> None:
+    candidate = {
+        **_candidate(),
+        "content_scope": "full_text",
+        "body_text": body_text,
+        "description": body_text,
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert changes[0]["evidence_status"] == "provisional"
+    assert changes[0]["objectivity_status"] == "unconfirmed"
+
+
+def test_multiple_title_only_sources_still_cannot_confirm_an_objective_fact() -> None:
+    candidate = {
+        **_candidate(),
+        "content_scope": "title_only",
+        "body_text": "",
+        "corroborating_sources": [
+            {
+                "source": "另一家媒体",
+                "provider": "聚合索引",
+                "url": "https://mirror.example.com/title-only",
+                "content_scope": "title_only",
+            }
+        ],
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert changes[0]["source_scope"] == "multi_source"
+    assert changes[0]["evidence_status"] == "provisional"
+    assert changes[0]["objectivity_status"] == "unconfirmed"
+
+
+def test_future_effective_objective_claim_is_reclassified_as_expectation() -> None:
+    candidate = {
+        **_candidate(),
+        # A hostile import cannot advance the real clock by claiming it was
+        # retrieved in the future.
+        "retrieved_at": "2099-01-01T09:00:00+00:00",
+    }
+    future = {
+        **_changed_decision(candidate),
+        "effective_at": "2099-01-01T08:00:00+00:00",
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [future],
+    )
+
+    assert changes[0]["role"] == "expectation"
+    assert changes[0]["objectivity_status"] == "not_applicable"
+
+
+def test_same_publisher_duplicate_is_not_counted_as_independent_corroboration() -> None:
+    candidate = {
+        **_candidate(),
+        "corroborating_sources": [
+            {
+                "source": "测试媒体",
+                "provider": "另一条技术通道",
+                "url": "https://mirror.example.com/same-publisher",
+                "content_scope": "full_text",
+            }
+        ],
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [_changed_decision(candidate)],
+    )
+
+    assert changes[0]["source_scope"] == "single_source"
+    assert changes[0]["evidence_status"] == "source_supported"
+
+
+def test_invalid_effective_time_retries_instead_of_inventing_a_confirmed_fact() -> None:
+    candidate = _candidate()
+    invalid = {**_changed_decision(candidate), "effective_at": "今天早些时候"}
+
+    with pytest.raises(ValueError, match="缺少可落库"):
+        NewsTrackingService._validated_model_result([candidate], [invalid])
+
+
+def test_expectation_stays_secondary_even_when_it_is_a_material_update() -> None:
+    candidate = _candidate()
+    expectation = {
+        **_changed_decision(candidate),
+        "role": "expectation",
+        "objectivity_status": "not_applicable",
+        "effective_at": "",
+    }
+    changes, _decisions = NewsTrackingService._validated_model_result(
+        [candidate],
+        [expectation],
+    )
+
+    assert changes[0]["role"] == "expectation"
+    assert changes[0]["objectivity_status"] == "not_applicable"
+    assert changes[0]["effective_at"] == ""
 
 
 @pytest.mark.asyncio
