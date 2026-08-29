@@ -1,14 +1,15 @@
 # NewsClaw
 
-**Understand you first, then proactively find real news.**
+**NewsClaw does not merely collect news; it tracks what objectively changed.**
 
 📌 Latest: **v0.1.0**
 
 > Release boundary: NewsClaw does not use the upstream `openbiliclaw-v*` aggregate Release as its own update or download channel; this GitHub repository is private source hosting only.
 
 NewsClaw is an independent local-only personalized news agent for one person.
-It owns its news sources, product semantics, data, and configuration, and does
-not require another product at runtime.
+Articles remain evidence; the product unit is the objective A→B change of a
+real-world event over time. It owns its news sources, product semantics, data,
+and configuration, and does not require another product at runtime.
 
 > The local production cutover completed on 2026-08-17. The formal service
 > runs at `http://127.0.0.1:8430` with an independent database, a dedicated
@@ -60,9 +61,21 @@ not require another product at runtime.
   the conflict atomically. Expectations, market
   sentiment, and AI analysis remain secondary records and cannot masquerade as
   facts. Restart-safe repair revalidates legacy evidence depth, origin lineage,
-  and pre-release change identities. This phase adds backend truth and read
-  contracts only: it does not change the desktop UI, call Tavily automatically,
-  or update the profile.
+  and pre-release change identities. This truth layer never calls Tavily
+  automatically and never updates the profile.
+- **Phase 4 event workspace is implemented.** Desktop Web now presents an event
+  inbox → current change pulse → evidence/tracking master-detail workspace.
+  Unread, conflict, and topic filters consume one backend truth. The default
+  timeline exposes the safe `is_state_applied` objective A→B set; the scalar
+  `current_state` alone is calculated along one reachable state chain. Unresolved
+  conflicts freeze current state, while obsolete and side-branch changes remain
+  available through an explicit audit view. Evidence opens on demand instead of
+  flooding the main surface. Narrow layouts switch between inbox and detail.
+  The global unread badge uses a separate summary endpoint, and event-inbox
+  cursor v3 carries a global revision fence and binds long topic filters by a
+  fixed-length digest: a mutation during continuation
+  returns HTTP 409 and requires a first-page refresh rather than risking skips
+  or duplicates.
 
 ## Sources
 
@@ -91,7 +104,11 @@ Tushare / RSS → news evidence → normalized, deduplicated local batch → eva
                                                                          │                         ├→ new objective transition → local event-change ledger + unread
                                                                          │                         ├→ corroboration → stronger evidence, no duplicate unread
                                                                          │                         ├→ conflicting outcome → contested, freeze state, await resolution
-                                                                         │                         └→ expectation/sentiment/analysis → secondary only
+                                                                         │                         ├→ expectation/sentiment/analysis → secondary only
+                                                                         │                         └→ [Phase 4] event inbox → safe current changes → evidence drawer
+                                                                         │                                        ├→ backend unread/conflict/topic truth
+                                                                         │                                        ├→ frozen conflict + explicit audit branches
+                                                                         │                                        └→ narrow-screen master/detail; no parallel ledger
                                                                          └→ no change → check history only
 
 Workbench → explicit feedback → profile
@@ -104,8 +121,9 @@ DSH Agent / REST research request → fresh local cache or Tavily Search/Extract
 
 ## Four clients
 
-Desktop Web, mobile Web/PWA, a display-only browser side panel, and a DeepSeek
-Harness trailing grid column all share one backend, primary SQLite database,
+Desktop Web (including the event workspace), mobile Web/PWA, a display-only
+browser side panel, and a DeepSeek Harness trailing grid column all share one
+backend, primary SQLite database,
 profile, recommendation pool, saved items, and chat history. On-demand research
 evidence stays in a separate SQLite ledger under the same private data
 directory, so it is not mixed with profile or pool state. The extension never
@@ -118,12 +136,11 @@ not expose a tracking center, change timeline, or manual check-now action. A
 future client must consume the same backend truth rather than create a second
 tracking state.
 
-Phase 3 does not change any client surface yet. Event detail, the objective
-change feed, contested changes, evidence membership, and their independent read
-state first stabilize as local backend contracts; Phase 4 will decide their
-presentation. A client must not promote a forecast, sentiment signal, or AI
-inference into an objective change, or silently choose a winner when evidence
-conflicts.
+Phase 4 consumes the Phase 3 event truth in Desktop Web. Mobile/PWA, the browser
+extension, and DSH still expose no independent event workspace and must not
+create another event ledger. No client may promote a forecast, sentiment signal,
+or AI inference into an objective change, or silently choose a winner when
+evidence conflicts.
 
 ## Local preview
 

@@ -16,6 +16,15 @@ Those portions remain available under the MIT License included in LICENSE:
 The browser and DSH clients may also contain code adapted from
 dsh-openbiliclaw, whose BSD-3-Clause notice is retained with that client.
 
+The desktop Web client bundles Phosphor Icons font and CSS assets under the
+MIT License:
+
+  Copyright (c) 2020-2021 Phosphor Icons
+
+The complete license text is retained at:
+
+  src/openbiliclaw/web/desktop/assets/icons/phosphor/LICENSE
+
 News articles, publisher names, publisher marks, and third-party API data are
 not covered by the software licenses. NewsClaw stores provenance and links to
 the original publisher. The default build is for the owner's personal,

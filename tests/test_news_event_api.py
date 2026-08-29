@@ -52,13 +52,18 @@ def event_api(tmp_path: Path) -> tuple[TestClient, Database]:
     client.close()
 
 
-def _event(database: Database, *, suffix: str = "1") -> dict[str, Any]:
+def _event(
+    database: Database,
+    *,
+    suffix: str = "1",
+    topic_group: str = "产业政策",
+) -> dict[str, Any]:
     event, created = database.create_news_event(
         event_id=str(uuid4()),
         event_key=f"policy-implementation-{suffix}",
         canonical_title=f"产业政策实施进展 {suffix}",
         event_type="policy",
-        topic_group="产业政策",
+        topic_group=topic_group,
         story_key=f"政策实施跟踪-{suffix}",
         current_state="实施细则尚未发布",
         first_seen_at="2026-08-27T08:00:00+00:00",
@@ -78,6 +83,7 @@ def _record_change(
     objectivity_status: str = "confirmed",
     conflict_status: str = "none",
     effective_at: str = "2026-08-28T08:00:00+00:00",
+    supersedes_change_id: str = "",
 ) -> dict[str, Any]:
     change = {
         "item_key": f"news:evidence-{suffix}",
@@ -105,6 +111,8 @@ def _record_change(
         "retrieved_at": detected_at,
         "evidence_snapshot": {"body_text": f"阶段 {suffix} 已经发生"},
     }
+    if supersedes_change_id:
+        change["supersedes_change_id"] = supersedes_change_id
     database.record_news_event_projection(
         event_id=event_id,
         check_status="changed",
@@ -210,6 +218,405 @@ def test_change_cursor_is_filter_bound_and_stable_under_new_head_insert(
     assert second.json()["items"][0]["summary"] == "阶段 middle 已经发生"
     assert wrong_filter.status_code == 422
     assert wrong_filter.json()["detail"] == "invalid news change cursor"
+
+
+def test_event_inbox_has_server_filters_attention_summary_and_stable_cursor(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    policy = _event(database, suffix="policy", topic_group="产业政策")
+    finance = _event(database, suffix="finance", topic_group="货币政策")
+    conflict_event = _event(database, suffix="conflict-inbox", topic_group="国际政策")
+    _record_change(
+        database,
+        policy["event_id"],
+        suffix="policy",
+        detected_at="2026-08-28T09:00:00+00:00",
+    )
+    _record_change(
+        database,
+        finance["event_id"],
+        suffix="finance",
+        detected_at="2026-08-28T10:00:00+00:00",
+    )
+    _record_change(
+        database,
+        conflict_event["event_id"],
+        suffix="conflict-inbox",
+        detected_at="2026-08-28T11:00:00+00:00",
+        conflict_status="contested",
+    )
+
+    first = client.get("/api/news/events", params={"limit": 1})
+    conflict_only = client.get("/api/news/events", params={"attention": "conflict"})
+    policy_only = client.get(
+        "/api/news/events",
+        params={"topic_group": "产业政策"},
+    )
+    wrong_cursor_filter = client.get(
+        "/api/news/events",
+        params={
+            "limit": 1,
+            "cursor": first.json()["next_cursor"],
+            "attention": "unread",
+        },
+    )
+
+    assert first.status_code == 200
+    assert first.json()["has_more"] is True
+    assert first.json()["summary"] == {
+        "event_count": 3,
+        "unread_event_count": 3,
+        "conflict_event_count": 1,
+        "unread_change_count": 2,
+        "unread_conflict_count": 1,
+    }
+    assert first.json()["items"][0]["event_id"] == conflict_event["event_id"]
+    assert first.json()["items"][0]["latest_change"] is None
+    assert {item["topic_group"] for item in first.json()["topics"]} == {
+        "产业政策",
+        "货币政策",
+        "国际政策",
+    }
+    assert [item["event_id"] for item in conflict_only.json()["items"]] == [
+        conflict_event["event_id"]
+    ]
+    assert [item["event_id"] for item in policy_only.json()["items"]] == [policy["event_id"]]
+    assert wrong_cursor_filter.status_code == 422
+    assert wrong_cursor_filter.json()["detail"] == "invalid news event cursor"
+
+
+def test_event_inbox_cursor_requires_refresh_after_mutable_reorder(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    oldest = _event(database, suffix="cursor-oldest")
+    middle = _event(database, suffix="cursor-middle")
+    newest = _event(database, suffix="cursor-newest")
+    for event, suffix, detected_at in (
+        (oldest, "cursor-oldest", "2026-08-28T08:00:00+00:00"),
+        (middle, "cursor-middle", "2026-08-28T09:00:00+00:00"),
+        (newest, "cursor-newest", "2026-08-28T10:00:00+00:00"),
+    ):
+        _record_change(
+            database,
+            event["event_id"],
+            suffix=suffix,
+            detected_at=detected_at,
+            effective_at=detected_at,
+        )
+
+    first = client.get("/api/news/events", params={"limit": 1})
+    assert first.status_code == 200
+    assert first.json()["items"][0]["event_id"] == newest["event_id"]
+    cursor = first.json()["next_cursor"]
+    unchanged_second = client.get(
+        "/api/news/events",
+        params={"limit": 1, "cursor": cursor},
+    )
+    assert unchanged_second.status_code == 200
+    assert unchanged_second.json()["items"][0]["event_id"] == middle["event_id"]
+
+    _record_change(
+        database,
+        oldest["event_id"],
+        suffix="cursor-new-head",
+        detected_at="2026-08-28T11:00:00+00:00",
+        effective_at="2026-08-28T11:00:00+00:00",
+    )
+
+    stale = client.get(
+        "/api/news/events",
+        params={"limit": 1, "cursor": cursor},
+    )
+    refreshed = client.get("/api/news/events", params={"limit": 1})
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == "news event inbox changed; refresh"
+    assert refreshed.status_code == 200
+    assert refreshed.json()["items"][0]["event_id"] == oldest["event_id"]
+
+
+def test_event_inbox_cursor_falls_back_when_legacy_detected_at_is_empty(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    first_event = _event(database, suffix="empty-detected-a")
+    second_event = _event(database, suffix="empty-detected-b")
+    for event, suffix in (
+        (first_event, "empty-detected-a"),
+        (second_event, "empty-detected-b"),
+    ):
+        _record_change(
+            database,
+            event["event_id"],
+            suffix=suffix,
+            detected_at="",
+        )
+
+    first_page = client.get("/api/news/events", params={"limit": 1})
+
+    assert first_page.status_code == 200
+    assert first_page.json()["has_more"] is True
+    assert first_page.json()["next_cursor"]
+
+    second_page = client.get(
+        "/api/news/events",
+        params={"limit": 1, "cursor": first_page.json()["next_cursor"]},
+    )
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+
+
+def test_event_change_cursor_falls_back_when_legacy_detected_at_is_empty(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    event = _event(database, suffix="empty-change-cursor")
+    first = _record_change(
+        database,
+        event["event_id"],
+        suffix="empty-change-a",
+        detected_at="",
+        effective_at="2026-08-28T09:00:00+00:00",
+    )
+    second = _record_change(
+        database,
+        event["event_id"],
+        suffix="empty-change-b",
+        detected_at="",
+        effective_at="2026-08-28T10:00:00+00:00",
+    )
+
+    first_page = client.get(
+        f"/api/news/events/{event['event_id']}/changes",
+        params={"limit": 1},
+    )
+    assert first_page.status_code == 200
+    assert first_page.json()["has_more"] is True
+    cursor = first_page.json()["next_cursor"]
+    assert cursor
+
+    second_page = client.get(
+        f"/api/news/events/{event['event_id']}/changes",
+        params={"limit": 1, "cursor": cursor},
+    )
+    assert second_page.status_code == 200
+    assert {
+        first_page.json()["items"][0]["change_id"],
+        second_page.json()["items"][0]["change_id"],
+    } == {first["change_id"], second["change_id"]}
+
+
+def test_event_inbox_uses_same_fallback_sort_for_mixed_legacy_change_times(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    event = _event(database, suffix="mixed-change-times")
+    older = _record_change(
+        database,
+        event["event_id"],
+        suffix="mixed-older",
+        detected_at="2026-08-28T09:00:00+00:00",
+        effective_at="2026-08-28T00:00:00+00:00",
+    )
+    newer = _record_change(
+        database,
+        event["event_id"],
+        suffix="mixed-newer",
+        detected_at="",
+        effective_at="2026-08-29",
+    )
+
+    inbox = client.get("/api/news/events")
+
+    assert inbox.status_code == 200
+    item = next(row for row in inbox.json()["items"] if row["event_id"] == event["event_id"])
+    assert item["latest_change"]["change_id"] == newer["change_id"]
+    assert item["latest_change"]["change_id"] != older["change_id"]
+
+
+def test_event_topic_chip_round_trips_normalized_whitespace_and_case(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    first = _event(database, suffix="topic-normalized-a", topic_group="  MACRO　 Policy ")
+    second = _event(database, suffix="topic-normalized-b", topic_group="macro policy")
+
+    inbox = client.get("/api/news/events")
+    topic = next(
+        item for item in inbox.json()["topics"] if item["topic_group"].casefold() == "macro policy"
+    )
+    filtered = client.get(
+        "/api/news/events",
+        params={"topic_group": topic["topic_group"]},
+    )
+
+    assert topic["event_count"] == 2
+    assert {item["event_id"] for item in filtered.json()["items"]} == {
+        first["event_id"],
+        second["event_id"],
+    }
+
+
+def test_event_cursor_binds_maximum_length_topic_by_digest(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    topic_group = "宏" * 300
+    first = _event(database, suffix="long-topic-a", topic_group=topic_group)
+    second = _event(database, suffix="long-topic-b", topic_group=topic_group)
+
+    page_one = client.get(
+        "/api/news/events",
+        params={"topic_group": topic_group, "limit": 1},
+    )
+    assert page_one.status_code == 200
+    cursor = page_one.json()["next_cursor"]
+    page_two = client.get(
+        "/api/news/events",
+        params={"topic_group": topic_group, "limit": 1, "cursor": cursor},
+    )
+
+    assert cursor and len(cursor) <= 1_024
+    assert page_two.status_code == 200
+    assert {
+        page_one.json()["items"][0]["event_id"],
+        page_two.json()["items"][0]["event_id"],
+    } == {first["event_id"], second["event_id"]}
+
+
+def test_event_audit_view_retains_superseded_objective_history(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    event = _event(database, suffix="audit")
+    predecessor = _record_change(
+        database,
+        event["event_id"],
+        suffix="audit-a",
+        detected_at="2026-08-28T09:00:00+00:00",
+    )
+    successor = _record_change(
+        database,
+        event["event_id"],
+        suffix="audit-b",
+        detected_at="2026-08-28T10:00:00+00:00",
+        supersedes_change_id=predecessor["change_id"],
+    )
+
+    current = client.get(f"/api/news/events/{event['event_id']}/changes")
+    audit = client.get(
+        f"/api/news/events/{event['event_id']}/changes",
+        params={"view": "audit"},
+    )
+
+    assert [item["change_id"] for item in current.json()["items"]] == [successor["change_id"]]
+    assert audit.status_code == 200
+    assert audit.json()["view"] == "audit"
+    assert [item["lifecycle"] for item in audit.json()["items"]] == [
+        "active",
+        "superseded",
+    ]
+    assert [item["is_state_applied"] for item in audit.json()["items"]] == [True, False]
+    assert [item["can_mark_read"] for item in audit.json()["items"]] == [True, False]
+    assert "inference" not in audit.json()["items"][1]
+    assert "confidence" not in audit.json()["items"][1]
+
+
+def test_resolved_conflict_loser_remains_in_public_audit_history(
+    event_api: tuple[TestClient, Database],
+) -> None:
+    client, database = event_api
+    event = _event(database, suffix="audit-conflict-loser")
+    first = _record_change(
+        database,
+        event["event_id"],
+        suffix="audit-conflict-b",
+        detected_at="2025-08-20T09:00:00+00:00",
+        effective_at="2025-08-20T08:00:00+00:00",
+    )
+    competing = {
+        "item_key": "news:audit-conflict-c",
+        "evidence_fingerprint": "audit-conflict-c-r1",
+        "change_type": "invalidated",
+        "previous_state": first["previous_state"],
+        "new_state": "互斥的阶段C已经发生",
+        "fact": "另一份可靠来源确认阶段C已经发生。",
+        "summary": "阶段C与阶段B形成互斥版本",
+        "evidence_quote": "阶段C已经发生",
+        "confidence": 0.94,
+        "role": "objective_change",
+        "objectivity_status": "confirmed",
+        "conflict_status": "none",
+        "source_scope": "single_source",
+        "evidence_status": "source_supported",
+        "effective_at": "2025-08-20T08:00:00+00:00",
+        "content_scope": "full_text",
+        "media": "另一测试媒体",
+        "provider": "官方页面",
+        "title": "阶段C更新",
+        "content_url": "https://example.com/evidence/audit-conflict-c",
+        "published_at": "2025-08-20T10:00:00+00:00",
+        "retrieved_at": "2025-08-20T10:00:00+00:00",
+        "evidence_snapshot": {"body_text": "正式文件明确确认阶段C已经发生。"},
+    }
+    database.record_news_event_projection(
+        event_id=event["event_id"],
+        check_status="changed",
+        detected_at="2025-08-20T10:00:00+00:00",
+        changes=[competing],
+    )
+    conflict_rows = database.list_news_event_changes(
+        event_id=event["event_id"],
+        objective_only=False,
+        conflicts_only=True,
+    )
+    loser_id = next(
+        row["change_id"] for row in conflict_rows if row["new_state"] == first["new_state"]
+    )
+    resolution = dict(
+        competing,
+        item_key="news:audit-conflict-c-resolution",
+        evidence_fingerprint="audit-conflict-c-resolution-r1",
+        objectivity_status="confirmed",
+        conflict_status="resolved",
+        evidence_status="source_supported",
+        supersedes_change_id=loser_id,
+        supersedes_lifecycle="invalidated",
+        published_at="2025-08-21T09:00:00+00:00",
+        retrieved_at="2025-08-21T09:00:00+00:00",
+    )
+    database.record_news_event_projection(
+        event_id=event["event_id"],
+        check_status="changed",
+        detected_at="2025-08-21T09:00:00+00:00",
+        changes=[resolution],
+    )
+
+    current = client.get(f"/api/news/events/{event['event_id']}/changes")
+    audit = client.get(
+        f"/api/news/events/{event['event_id']}/changes",
+        params={"view": "audit"},
+    )
+    conflicts = client.get(f"/api/news/events/{event['event_id']}/conflicts")
+    detail = client.get(f"/api/news/events/{event['event_id']}")
+
+    assert current.status_code == 200
+    assert [item["new_state"] for item in current.json()["items"]] == ["互斥的阶段C已经发生"]
+    assert conflicts.status_code == 200 and conflicts.json()["items"] == []
+    assert audit.status_code == 200
+    loser = next(item for item in audit.json()["items"] if item["change_id"] == loser_id)
+    assert loser["lifecycle"] == "invalidated"
+    assert loser["objectivity_status"] == "disputed"
+    assert loser["conflict_status"] == "contested"
+    assert loser["is_state_applied"] is False
+    assert loser["can_mark_read"] is False
+    assert detail.json()["item"]["audit_change_count"] == 2
+    loser_evidence = client.get(
+        f"/api/news/events/{event['event_id']}/evidence",
+        params={"change_id": loser_id},
+    )
+    assert loser_evidence.status_code == 200 and loser_evidence.json()["items"]
 
 
 def test_event_detail_evidence_and_read_are_closed_and_idempotent(

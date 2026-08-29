@@ -32,6 +32,7 @@ candidate pool.
 | From-zero onboarding | Implemented | Explicit manual interests/avoid terms, initial source fetch, cross-source dedupe, candidate callback, four-stage result |
 | Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; the live desktop list/route/empty state and API schema were verified locally, while populated-card and change paths are covered by automated contracts |
 | Durable event projection (Phase 3) | Implemented | Projects completed tracking evidence into stable events, immutable evidence memberships and deduplicated state changes in the same transaction; only confirmed, effective objective changes enter the default feed, while expectations/sentiment/analysis remain secondary |
+| Event workspace projection (Phase 4) | Implemented | Desktop event inbox, safe applied A→B change set, scalar reachable `current_state`, conflict freeze, explicit audit history, evidence drawer, unread state and mobile master/detail all consume the shared backend event truth |
 
 ## Canonical article contract
 
@@ -147,8 +148,32 @@ check completion. Legacy history, evidence depth, source origins and pre-release
 identities are repaired in bounded, restart-safe and idempotent batches, with
 aliases preserving old reads. Rows that cannot satisfy the new evidence gate
 remain `analysis / unconfirmed / provisional / partial_legacy` and stay out of
-the objective feed. This module adds no new collector, Tavily call, profile
-mutation or UI behavior.
+the objective feed. This module adds no new collector, Tavily call or profile
+mutation.
+
+### Phase 4 event workspace projection
+
+The event workspace is a read projection over the Phase 3 ledger, not another
+news ingestion pipeline. `GET /api/news/events` joins each event to its latest
+`is_state_applied` objective change, unread/conflict counts, topic group and
+active tracking status. Confirmed rows that are no longer reachable from the
+accepted state chain remain in `view=audit` but cannot become the current state,
+latest inbox change or current unread. An unresolved durable conflict freezes
+the event's current projection instead of letting JavaScript choose a branch.
+
+The event-inbox cursor is version 3. It binds status/attention filters, a fixed-
+length digest of the topic filter,
+the keyset position and a monotonic inbox revision. Event, change, evidence or
+tracked-observation mutations advance that revision. A stale continuation is a
+409 refresh signal; clients must reload the first page rather than append an
+inconsistent page. `/api/news/events/summary` is deliberately separate so the
+global badge is not narrowed by a local inbox filter.
+
+Desktop Web is the implemented Phase 4 surface. Wide layouts show inbox and
+selected event together; narrow layouts switch between master and detail. The
+evidence drawer, audit toggle, pagination and idempotent read controls use the
+same API contracts. Mobile/PWA, the browser extension and DSH do not introduce
+a separate event workspace in this phase.
 
 ### From-zero onboarding
 
@@ -194,6 +219,9 @@ NewsSourceAdapter -> SourceRunner -> Article[] -> SemanticDeduplicator
                          v                            v
                  source task + health          candidate callback
                     (SQLite)
+
+completed tracking change -> Phase 3 event projection -> applied objective chain
+                                                       -> Phase 4 desktop workspace
 ```
 
 From-zero initialization adds one explicit step before this flow:

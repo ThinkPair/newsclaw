@@ -14,6 +14,7 @@
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit / Linux.do 来源任务首个终态结果的 crash-safe staging。
 - 事件入口幂等回执，以及小红书 / 抖音 / YouTube / 知乎 / Reddit 来源任务首个终态结果的 crash-safe staging。
 - 跨机器迁移包的一致快照、严格校验、私有暂存和重启期 journaled replace / rollback。
+- NewsClaw 现实事件、当前安全的客观 A→B 变化集合、标量可达状态链、争议/审计证据、事件收件箱 revision fence 与独立未读状态。
 
 ## 可移植数据迁移
 
@@ -96,7 +97,8 @@
 | NewsClaw 判断快照 | ✅ | recommendation、favorite/watch-later membership、saved removal 与点击历史都可保存 `newsclaw-judgment-v1` JSON 快照；内容身份由服务端重新绑定，客户端不能把别条推荐的快照贴到当前条目。快照写入后按当时值回放，不用最新算法重算；旧行缺字段仍按 legacy 投影读取。 |
 | NewsClaw 观察点跟踪 | ✅ | `tracked_observations` 保存 UUID tracking ID、稳定 request ID、canonical `news:` item key、可选 recommendation ID、主题/故事、归一化 observation key、状态、最近证据、原始判断快照和时间戳。request ID 与 active semantic key 双重幂等；停止跟踪只把状态改为 archived，保留本地追溯。初始化会幂等创建表与索引，旧数据库无需手工迁移。 |
 | NewsClaw 持续跟踪账本（Phase 2） | ✅ | `tracked_observations` 保存检查间隔、下次/最近检查、最近变化、失败次数与错误状态；独立 check/candidate/evidence 账本保存每轮来源状态、候选/匹配计数、已核验内容指纹、事实与推断、证据快照、变化指纹和未读。`tracked_observation_checks` 以 partial unique index 保证每个 tracker 最多一条 `running`，有效租约可被手动请求等待复用，过期 owner 在新检查前被 fencing。相同内容修订只核验一次；只有新变化指纹生成未读；无变化/有效空结果保留检查历史但不通知；失败不推进为 `unchanged`。这个 check/tracker 级未读继续服务现有桌面持续跟踪页；归档保留全部历史并阻止新检查，重新开始会建立新周期而不改写旧周期。 |
-| NewsClaw 持久事件层（Phase 3） | ✅ | additive V7 schema 新增 `news_events`、`news_event_memberships`、`news_event_changes`、`news_event_lineage_claims`、事件/变化别名与 `news_event_backfill_state`，并为 tracker 补可选 `event_id`；旧行为 `events` 不改。Phase 2 changed 完成与事件投影共用一个事务：事件、不可变证据修订、event-scoped A→B 变化和 unread 要么一起写入，要么一起回滚。事件身份只认精确规范化 `story_key`（缺失时 tracker-local）；变化身份 v3 使用稳定类型族、规范化前后状态、生效值及 date/minute 精度，不含来源字段。发布时间只是兜底时按来源原日期归并；受控改写只在动作族、正向/待定/否定/停止极性、完整数值 token 和去状态词后的主体均一致时折叠，混合极性、不同数值或其他主体差异一律保留。同一变化的跨 tracker/跨来源证据只升级佐证，不重复 change/unread。默认事实门由持久 `is_objective_default` 统一裁决，要求已发生、confirmed objective change、无未解决冲突、明确生效精度、前后状态和经正文深度复核的本地证据；只重复标题、样板文本或虚假的 `full_text` 标签均不够。只有各自通过事实门的互斥客观变化才能进入 contested ledger、拥有独立 conflict unread/count 并冻结事件；标题级、未来、预期、情绪或分析矛盾只保留次级证据。强证据显式 supersede 后才恢复；若旧 successor 被事实门降级，其过期 pointer 失权、predecessor 恢复，rejected claim 仍留档。合并产生不同 predecessor 时，lineage claim 账本保留每条候选边及原始 event/change 来源；裁决在同一事务选中胜者、将输家标为 rejected 但不删除，并解冻事件。别名折叠和二次事件合并会重绑 canonical 端点，不改写原始来源。当前状态按上海业务日期与 UTC 分钟统一排序，并沿保守同义状态可达链推进，失效前置不会让后继回跳。`news_event_changes.is_read` 独立拥有 Phase 3 未读，不与 Phase 2 检查未读相加，当前 UI 也尚未切换。存储合同覆盖客观流、争议流、证据、幂等已读、合并和别名解析。合并保留谱系、重绑 tracker/证据/变化并同样检测冲突；历史回填、`news-event-fact-gate-v4` 与 `news-event-origin-v2` 修复均按独立持久游标分批、可恢复且幂等，旧资料不足时只保留 `analysis / unconfirmed / provisional / partial_legacy`，不虚构或进入客观流。 |
+| NewsClaw 持久事件层（Phase 3） | ✅ | additive V7 schema 新增 `news_events`、`news_event_memberships`、`news_event_changes`、`news_event_lineage_claims`、事件/变化别名与 `news_event_backfill_state`，并为 tracker 补可选 `event_id`；旧行为 `events` 不改。Phase 2 changed 完成与事件投影共用一个事务，事件、不可变证据修订、event-scoped A→B 变化和 unread 要么一起写入，要么一起回滚。精确 `story_key` 选择事件，变化身份 v3 按稳定类型族、规范化前后状态、生效值与 date/minute 精度去重。`is_objective_default` 记录单条变化是否通过客观事实门；`is_state_applied` 另行记录它是否属于当前安全变化集合。投影重算先清除旧 applied 标记，再排除依赖失效事实且没有更早安全前置的后继；同一事件可以保留多个独立客观维度，只有标量 `current_state` 沿一条匹配链推进。失效或落败旁支仍可审计，但不能继续占据当前状态、最新变化或当前未读。只有通过事实门的互斥结果能形成 contested ledger 并冻结事件；标题级、未来、预期、情绪或分析矛盾只保留次级证据。lineage claim 账本保留候选边及不可变来源，裁决选择胜者并保留 rejected 输家。`news_event_changes.is_read` 与 Phase 2 检查未读独立。历史回填、事实门、来源和身份修复按持久游标分批、可恢复且幂等，资料不足的旧记录只保留为 `analysis / unconfirmed / provisional / partial_legacy`。 |
+| NewsClaw 事件收件箱一致性（Phase 4） | ✅ | 单行 `news_event_inbox_revision` 由事件、变化、证据 membership 和 tracked observation 的 INSERT/UPDATE/DELETE 触发器单调提升。`load_news_event_inbox_snapshot()` 在同一 WAL 只读事务中读取 revision、事件页、摘要与主题；v3 游标携带上一页 revision，并用固定长度摘要绑定主题筛选，过期时抛出 `NewsEventInboxChangedError`，API 转为 409/刷新。`list_news_events()` 和 `news_event_inbox_summary()` 只把 applied 客观变化算作当前变化/未读，同时保留独立 audit/conflict 计数供工作台追溯。 |
 | 扩展原生保存 job ledger 与旧状态迁移 | ✅ | `extension_native_save_jobs` 保存脱敏后的六平台扩展任务；task URL 只允许平台 HTTPS host 与默认端口，输出移除 fragment/非导航 query（YouTube 仅保留身份参数 `v`；小红书仅保留打开公开笔记所需的单值非空 `xsec_token/xsec_source`，其它 key 仍剥离）。partial unique index 保证 `(platform, item_key, requested_action)` 只有一个 pending/in-progress row。命名迁移只把六个 canonical 平台的旧 `unsupported`/空 error code 改为 `unsupported_adapter_missing`，绝不改 Bilibili、未知平台或 `unsupported_content_type`。 |
 | 推荐链路 canonical identity | ✅ | `content_cache.item_key` 对**非空值**使用 partial unique index（`WHERE item_key != ''`），另有普通 lookup index，`recommendations.item_key` 使用普通索引；空值只作为 v0.3.166 及更早写入器不知道 additive 列时的兼容窗口，避免旧桌面版与新版源码共用数据库后第二条补池候选开始持续触发 `UNIQUE constraint failed`。当前版本初始化会临时移除旧全量 guard，按平台 + raw `content_id` 回填空 identity，并在恢复 partial unique 前确定性合并 canonical 重复行（优先 canonical storage key、填补非空元数据、重定向 recommendation 引用）。若 loser 仍被旧 `watch_later` / `favorites` 引用，consolidation 会先为真实 legacy schema 补 additive `item_key` 并写入 canonical key；后续 normalized saved migration 在 exact `bvid` 不存在时用该稳定键 join keeper，既保留 membership，也不绕过 Task 2 的单次 marker / no-resurrection 语义。B 站 `bvid` 主键保持 raw BV 兼容，非 B 站 `bvid` 存储键使用 namespaced identity，API 继续从独立字段输出 raw ID 与 authoritative URL。 |
 | 推荐历史避雷与标签投影字段 | ✅ | `get_recommendations()` 在既有 DTO 字段外返回 `description/tags/topic_key/topic_group/style_key/franchise_key/pool_topic_label` 及现有时效字段，供 API 与 OpenClaw 在历史行离开 storage 后按最新 effective dislikes 做最终过滤，并让 NewsClaw API 从小型结构化列投影展示标签；查询不会为卡片读取可能包含正文的 `discovery_candidates.raw_payload`。`exclude_processed=true` 继续同步排除已反馈单卡。 |
@@ -136,6 +138,18 @@ fresh servable pool predicate，并可按 embedding fingerprint、正维度和 s
 增量补列，旧的无 provenance 行不会被当作当前 embedding namespace 的完成结果。
 
 ## 公开 API
+
+### NewsClaw event inbox and applied-state projection
+
+- `list_news_events(...)`：读取事件收件箱行；最新变化与当前未读只来自 `is_state_applied=1`。
+- `load_news_event_inbox_snapshot(..., expected_revision=...)`：在一致只读快照内返回 revision、页面、摘要和主题；revision 不匹配抛出 `NewsEventInboxChangedError`。
+- `news_event_inbox_summary(status=...)`：返回不受 attention/topic 页面筛选影响的全局事件、未读和争议计数。
+- `list_news_event_changes(..., objective_only=True)`：读取当前 applied 客观变化；`objective_history=True` 读取保留的客观审计历史，包括裁决后不再冻结当前状态的争议输家，但这些历史行不重新进入未读。
+- `list_news_event_memberships(...)` / `mark_news_event_change_read(...)`：分别提供不可变证据分页和幂等的客观/争议已读写入。
+
+`is_objective_default` 回答“这条记录本身是否满足客观事实门”，`is_state_applied`
+回答“它是否属于事件当前安全的客观变化集合”。两者不能合并：一条被替代或落在失败旁支上的变化
+仍可能是客观事实，但不得继续拥有当前状态、收件箱最新变化或当前未读。
 
 ### Durable event ingress 回执
 

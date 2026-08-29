@@ -152,21 +152,23 @@ Phase 2 的后台检查随正常 `NewsRuntime.refresh()` 复用同一批本地�
 
 这条链路不自动调用 Tavily，不写画像事件。完整 Phase 2 控制面只属于桌面 Web；手机/PWA、浏览器扩展和 DSH 本阶段没有跟踪中心、时间线或手动检查接口入口。
 
-### NewsClaw 事件层（Phase 3 后端合同）
+### NewsClaw 事件层与工作台（Phase 3 真值 + Phase 4 读取合同）
 
 | 方法与路径 | 契约 |
 | --- | --- |
-| `GET /api/news/changes?limit=30&cursor=<opaque>&unread_only=false` | 返回已确认、已生效且有证据的客观状态变化。固定使用客观变化门，调用方不能请求把预期、情绪或 AI 分析混入默认流。按 `detected_at + change_id` 使用绑定筛选条件的 keyset 游标。 |
+| `GET /api/news/changes?limit=30&cursor=<opaque>&unread_only=false` | 返回所有事件当前 `is_state_applied=1`、已确认、已生效且有证据的客观状态变化。调用方不能请求把已失效旁支、预期、情绪或 AI 分析混入默认流。按 `detected_at + change_id` 使用绑定筛选条件的 keyset 游标。 |
+| `GET /api/news/events?status=active&attention=all&topic_group=&limit=30&cursor=<opaque>` | Phase 4 事件收件箱。返回事件、当前最新 `is_state_applied` 客观变化、未读/争议/证据计数、主题计数与 active tracking 状态。`attention` 只接受 `all | unread | conflict`。v3 游标用 SHA-256 摘要绑定主题筛选，并绑定其余筛选、排序位置和全局 revision；续页期间底层事件、变化、证据或跟踪状态改变时返回 409，客户端应丢弃续页并刷新首屏。 |
+| `GET /api/news/events/summary?status=active` | 返回全局 `event_count / unread_event_count / conflict_event_count / unread_change_count / unread_conflict_count`；不接受 attention/topic 筛选，供全局徽标使用，避免局部筛选污染导航未读数。 |
 | `GET /api/news/events/{event_id}` | 返回事件当前状态、单调版本、首次/最近发现时间、客观变化/未读、争议变化/未读和证据计数；请求已合并事件时解析到最终事件并返回原始事件 ID。争议未解决时当前状态冻结。 |
-| `GET /api/news/events/{event_id}/changes` | 返回单一事件的客观变化时间线；游标绑定事件 ID，不能跨事件复用。 |
+| `GET /api/news/events/{event_id}/changes?view=current|audit&unread_only=false` | `current` 只返回当前安全、`is_state_applied=1` 的客观 A→B 变化；`audit` 返回保留的客观历史、被替代/失效、旁支变化及裁决后的争议输家，并如实保留其 disputed/contested 语义。游标同时绑定事件 ID、view 与 unread 条件，不能跨作用域复用。响应变化携带 `can_mark_read`；所有非当前审计记录均为 false，不能重新拥有当前未读。 |
 | `GET /api/news/events/{event_id}/evidence?change_id=<optional>&limit=50&offset=0` | 返回事件或指定变化的不可变证据修订；旧变化 ID 会解析到 canonical change，并返回 `resolved_from_change_id`；合法空结果为 200，不把证据正文铺进变化流。 |
 | `POST /api/news/changes/{change_id}/read` | 幂等标记一个客观变化已读；首次 `updated=true`，重复操作 `updated=false`。 |
 | `GET /api/news/events/{event_id}/conflicts?limit=50&offset=0&unread_only=false` | 返回该事件被隔离的互斥变化及双方状态、时间、证据强度和未读；它们永远不混入默认客观变化流。若冲突来自事件合并后的前置关系，`lineage_claims` 会列出每个候选 predecessor、原始 event/change 来源及 `active/contested/resolved/rejected` 状态；被拒绝的历史候选也不删除。 |
 | `POST /api/news/conflicts/{change_id}/read` | 幂等标记一个争议变化已读；只改变读取状态，不解决争议或推进事件当前状态。 |
 
-这些路由只在 NewsClaw 模式注册。默认变化流和事件时间线故意不暴露模型推断、置信度、原始快照和内部指纹；证据详情与争议端点保留核验所需的持久事实。读取和两类已读都不会触发来源刷新、Tavily、画像、推荐发布、新任务或争议裁决。事件创建、修改、合并、删除和历史修复均不开放网页写接口。启动时先做可中断续跑的旧账本投影/事实门/身份迁移，再用独立游标修复每个 tracker 的来源归属；旧 change/event ID 通过别名继续可读。旧 schema 或实际保存正文无法证明新事实门的 changed 记录只按 `analysis / unconfirmed / provisional / partial_legacy` 保存，不进入客观变化流。本阶段没有改动桌面、手机、扩展或 DSH 的可见页面。
+这些路由只在 NewsClaw 模式注册。默认变化流和事件当前时间线故意不暴露模型推断、置信度、原始快照和内部指纹；证据、审计与争议端点保留核验所需的持久事实。读取和两类已读都不会触发来源刷新、Tavily、画像、推荐发布、新任务或争议裁决。事件创建、修改、合并、删除和历史修复均不开放网页写接口。启动时先做可中断续跑的旧账本投影/事实门/身份迁移，再用独立游标修复每个 tracker 的来源归属；旧 change/event ID 通过别名继续可读。旧 schema 或实际保存正文无法证明新事实门的 changed 记录只按 `analysis / unconfirmed / provisional / partial_legacy` 保存，不进入客观变化流。Phase 4 桌面事件工作台直接消费这些合同；手机/PWA、浏览器扩展和 DSH 本阶段仍没有独立事件界面。
 
-两个客观变化列表都返回 `items / next_cursor / has_more`；争议列表使用有界 `limit/offset`。损坏、缺字段或跨筛选/跨事件复用的游标返回 422；事件或变化不存在返回 404；事件合并谱系循环或损坏返回 409；合法事件暂无变化、争议或证据时返回 200 和空数组。
+客观变化和事件收件箱都返回 `items / next_cursor / has_more`；争议与证据列表使用有界 `limit/offset`。损坏、缺字段或跨筛选/跨事件/跨 view 复用的游标返回 422；事件收件箱续页 revision 过期返回 409 并要求刷新；事件或变化不存在返回 404；事件合并谱系循环或损坏返回 409；合法事件暂无变化、争议或证据时返回 200 和空数组。
 
 ### 30 天内容历史（issue #112）
 

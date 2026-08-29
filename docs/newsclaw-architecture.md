@@ -2,7 +2,10 @@
 
 ## Scope
 
-NewsClaw is a single-user, local-only news recommendation system. Its four
+NewsClaw is a single-user, local-only change-tracking information system. It
+uses news articles as evidence, but its durable product unit is a verified
+real-world event and the objective A→B changes that remain reachable over time.
+Its four
 clients share one FastAPI process, one primary application SQLite database, one
 five-layer profile, one recommendation pool, and one feedback ledger. The
 optional Research lane keeps a separate `newsclaw_research.db` evidence ledger.
@@ -40,6 +43,8 @@ Tushare news / major_news / cctv_news     Official or custom RSS/Atom
  open / like / dislike / ignore / read-later / save / track / search / chat
                                 |
  idempotent events -> profile ledger; judgment snapshots -> local memory
+                                |
+     due tracking -> verified A→B event projection -> desktop event workspace
 ```
 
 The on-demand research lane is deliberately separate:
@@ -244,13 +249,13 @@ phase. Mobile/PWA, the browser extension and DSH have no tracking-center,
 timeline or check-now contract yet; they must later consume the same database
 truth rather than introduce a parallel ledger.
 
-### Phase 3 durable event projection (implemented backend contract)
+### Phase 3 durable event projection (implemented truth contract)
 
-Phase 3 adds a source-independent truth layer without changing the current
-desktop surface. An article becomes an immutable evidence membership, a tracker
-remains the user's monitoring instruction, and a completed check remains an
-execution receipt. The durable product unit is one real-world event and its
-verified state transitions.
+Phase 3 adds a source-independent truth layer. An article becomes an immutable
+evidence membership, a tracker remains the user's monitoring instruction, and
+a completed check remains an execution receipt. The durable product unit is one
+real-world event and its verified state transitions; Phase 4 consumes this
+contract without changing its ownership.
 
 ```text
 Phase 2 changed check + evidence
@@ -307,11 +312,17 @@ edge endpoints, so the claim origin remains auditable. Existing behavior
 `events` are untouched.
 
 The NewsClaw-only read contract exposes the objective change feed, event detail,
-one event's objective timeline, a separate contested-change ledger, evidence
-memberships, and idempotent read state for both objective and contested rows.
-Event details expose objective and conflict counts without leaking model-private
-fields into the feed. Cursors are opaque, keyset-based and bound to their
-filter/event scope. Backfill and the separate origin repair run in bounded
+one event's current objective timeline, a separate contested-change ledger,
+evidence memberships, and idempotent read state for both objective and
+contested rows. The projection stores `is_state_applied` separately from the
+broader fact gate: only the safe, non-conflicting applied change set owns the
+current unread count and latest change, while scalar `current_state` is computed
+along one reachable matching chain. Confirmed changes on an
+obsolete or losing branch remain auditable but cannot re-enter the current
+stream merely because they are individually objective. Event details expose
+current, audit and conflict counts without leaking model-private fields into
+the feed. Cursors are opaque, keyset-based and bound to their filter/event
+scope. Backfill and the separate origin repair run in bounded
 background batches at startup and resume after interruption. Fact-gate repair
 rechecks the saved text itself; pre-release change identities migrate to v3 and
 old IDs resolve through aliases. Historical `changed` rows whose old schema
@@ -321,9 +332,55 @@ If revalidation later downgrades an accepted successor, the stale supersede
 pointer loses authority, its predecessor is restored, and the rejected lineage
 claim remains visible. A shallow or subjective contradiction remains an
 auditable membership but cannot create the durable conflict state by itself.
-These reads do not refresh sources, call Tavily, publish a
-recommendation, enqueue work or mutate the profile. Phase 4 will decide the UI;
-Phase 3 deliberately adds none.
+These reads do not refresh sources, call Tavily, publish a recommendation,
+enqueue work or mutate the profile.
+
+### Phase 4 event workspace (implemented desktop contract)
+
+Phase 4 makes the Phase 3 truth usable without creating a second client-side
+ledger. The desktop home adds an event workspace with three progressive layers:
+
+```text
+event inbox
+    ├→ unread / conflict / topic filters
+    └→ selected event
+           ├→ current state + objective change pulse
+           ├→ explicit audit view for superseded/invalidated/side-branch changes
+           ├→ on-demand evidence drawer
+           └→ tracking status / next check
+```
+
+`GET /api/news/events` returns an event-inbox page with the latest applied
+objective change, event counts, topic counts and tracking metadata. Its v3
+opaque keyset cursor binds `status`, `attention`, `topic_group`, the last sort
+position and a monotonic global `revision`. Inserts, updates or deletes in
+events, event changes, evidence memberships or tracked observations advance
+`news_event_inbox_revision`. `load_news_event_inbox_snapshot()` reads the
+revision, page, summary and topic counts from one WAL snapshot. A continuation
+whose revision is stale returns HTTP 409; the Web client discards that
+continuation and reloads the first page instead of risking OFFSET-style gaps or
+duplicates.
+
+`GET /api/news/events/summary` supplies the global active-event badge without
+being narrowed by the currently selected attention/topic filters. It returns
+event, unread-event, conflict-event, unread-change and unread-conflict counts.
+Event details then use `GET /api/news/events/{event_id}/changes?view=current` for
+the safe applied change set or `view=audit` for retained objective history. Current rows
+expose `can_mark_read`; obsolete audit rows cannot own current unread. Conflicts
+and evidence keep their existing bounded pagination and independent idempotent
+read actions.
+
+The desktop visual hierarchy is intentionally not another article wall. The
+inbox is scan-first, the selected event owns the A→B story, and full evidence is
+opened only when the user asks to verify it. At narrow widths the layout becomes
+a true master/detail switch: the inbox and detail are not stacked into two
+simultaneously scrolling panes. The event workspace uses locally bundled
+Phosphor Icons; it does not add a remote runtime dependency.
+
+The current view must never include expectations, market sentiment, AI analysis,
+unresolved conflicting outcomes or objective rows that are no longer reachable
+from the event's accepted state chain. Those records remain available only in
+their explicit audit/conflict surfaces.
 
 ## Client contract
 
@@ -337,6 +394,8 @@ Phase 3 deliberately adds none.
   redaction-safe `key_usage`, `key_limit`, `account_plan`, `plan_usage` and
   `plan_limit` fields.
   Phase 1 does not add a desktop research-question, result-list or history UI.
+  Phase 4 adds the event workspace described above and reads only the shared
+  Phase 3 event truth; it does not infer event state in JavaScript.
 - Mobile Web/PWA uses the same API and adds pull-to-refresh and explicit
   online/degraded/offline state. Phase 1 adds no Research controls and never
   sends a Tavily credential to this client.

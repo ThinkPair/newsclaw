@@ -93,6 +93,13 @@ output/
 # data. Keep them on the verification machine, never in a source snapshot.
 /design-reference/*.png
 
+# Product-design iteration captures stay local; only the selected reference,
+# final comparison, and final desktop/mobile screenshots are committed.
+/docs/design/assets/phase4-comparison-pass*.png
+/docs/design/assets/phase4-implementation-pass*.png
+/docs/design/assets/phase4-negative-*.png
+/docs/design/assets/phase4-responsive-*.png
+
 # Local AI / chat tooling state — runtime attachments (cc-connect),
 # session memory + project plans (Claude Code). Per-developer, never
 # part of the project source.

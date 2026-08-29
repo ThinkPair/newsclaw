@@ -55,6 +55,12 @@ NewsClaw judgment workbench
                   ├─ corroboration → stronger evidence, no duplicate unread
                   ├─ mutually exclusive outcome → contested ledger + frozen current state
                   └─ expectation / sentiment / analysis → secondary, excluded from objective feed
+             Phase 4 desktop event workspace
+                  ├─ /api/news/events + /summary → inbox, unread/conflict/topic truth
+                  ├─ is_state_applied safe change set → change pulse; scalar current_state → reachable chain
+                  ├─ evidence/conflict pagination + idempotent read actions
+                  ├─ cursor v3 revision fence + topic digest → mutation during continuation returns 409/refresh
+                  └─ desktop master/detail; narrow layout switches inbox ↔ detail
              restart-safe legacy backfill → conservative partial-legacy projection
                   └─ analysis + unconfirmed + provisional; excluded from objective feed
              restart-safe origin/fact/identity repair → aliases + revalidated evidence depth
@@ -238,6 +244,14 @@ cookie 补 `Secure`，并把已验证的 Web Origin 做最小 `https→http` 适
 - Research 是外部世界证据，不是用户记忆：不会自动写 Soul、`discovery_candidates`、`content_cache` 或推荐池
 - Phase 1 研究交互仅由 DSH Agent 工具和后端 REST/Agent Bridge 提供；桌面 Web
   只管理 Key/脱敏状态/真实连接 probe，手机 PWA 与浏览器扩展没有研究按钮且不持有 Key
+
+### NewsClaw event workspace (`api/news_routes.py`, `web/desktop/`, `storage/database.py`)
+
+- `GET /api/news/events` 把当前事件、最新可用客观变化、未读/争议计数、主题分组与跟踪状态投影为事件收件箱；`GET /api/news/events/summary` 提供不受页面筛选污染的全局徽标计数
+- 当前变化视图只读取 `is_state_applied=1` 的安全客观变化；未解决冲突冻结事件状态，失效、被替代、旁支变化和裁决后的争议输家仍可通过 `view=audit` 追溯，但不能重新拥有当前未读
+- 事件、变化、证据成员或跟踪状态的写入都会提升 `news_event_inbox_revision`。事件收件箱 v3 keyset 游标同时绑定筛选条件摘要、排序位置与 revision；长主题只进入 SHA-256 摘要而不膨胀游标。续页发现 revision 变化时 fail closed 返回 409，让客户端回到首屏重取
+- 桌面端采用事件收件箱、变化脉搏和证据抽屉的主从布局；证据与争议有界分页，标记已读复用后端幂等写入口；窄屏一次只显示收件箱或详情，不建立客户端副本
+- 预测、市场情绪、AI 推断和无法通过本地证据门的记录仍只属于审计/次级账本，事件工作台不得把它们投影为客观主流
 
 ### Saved Sync (`saved_sync/`)
 - `NativeSaveRouter` 根据 adapter capability 确定 favorite / watch-later 路由；watch-later 仅在平台不支持原生动作且支持 favorite 时回退
@@ -532,6 +546,8 @@ embedding 和空向量失败留待下轮重试，成功槽位会复用。已有�
 - 冷备份、完整性检查与显式修复
 - 候选质量信号持久化与数据迁移；`events` 行写入 `inferred_satisfaction` / `satisfaction_reason`，支持 `query_events(satisfaction_modes=...)`
 - `seen_items` 是 discovery / recommendation 共用的无界已看身份账本；`insert_event` 与 `insert_events_batch` 同事务维护，`seen_items_backfill_state` 让升级回填幂等且增量
+- NewsClaw 事件读取以 `news_event_changes.is_state_applied` 标出当前安全的客观 A→B 变化集合；同一事件可保留多个独立维度，标量 `current_state` 才沿一条匹配链推进。重算先清除旧标记，再排除依赖失效事实且没有更早安全前置的后继，避免已失效旁支继续占据当前状态、当前未读或首页最新变化
+- `news_event_inbox_revision` 是单行单调版本，相关事件、变化、证据成员和跟踪表通过触发器提升版本；`load_news_event_inbox_snapshot()` 在同一 WAL 只读事务内读取 revision、页面、摘要和主题，拒绝过期续页
 - `get_pool_candidates` 与 canonical availability loader 共用每个 `topic_group` ≤3 条的窗口：先执行 durable seen / linkability gate，再按 topic 内 relevance / score time / view / bvid 排名选前三，最后恢复全局 candidate-tier / relevance 顺序。这样长尾 group 能进入窗口，已看或不可打开的高分行也不会先占掉公开槽位
 - `discovery_candidates` 持久化所有来源 raw candidates 的 lifecycle：`pending_eval`、`evaluating`、`evaluated`、`cached`、`rejected_low_score`、`rejected_duplicate`、`rejected_cache_admission`、`rejected_temporal_stale`、`rejected_recently_viewed`、`rejected_franchise_quota`、`failed_eval`、`trimmed_capacity`；容量 victim 与时效拒绝都保留 terminal 行和 `eval_error` 原因，不做物理删除。
 - evaluator embedding prefilter 默认保持 shadow。`discovery.prefilter_audit` 先把不含候选文本/URL/画像正文的 decision（identity hash、平台/上下文 class、相似度阈值、explore/保护位、embedding/profile digest）写入 `evaluator_prefilter_shadow_audit`，provider 返回后按随机 decision id 回填 diversity cap 之前的原始 LLM score 与统一 admission 判定。表按 30 天和 20,000 行双重有界；required-interest 和 embedding 输入共享权重排序后的 top-256。embedding 或 telemetry 任一异常都把候选留在 LLM 路径：显式 `enforce` 也只有在本批每条决策证据完整落库后才允许剔除，否则整批 fail-open；§6.4 gate 会因 coverage/fail-open 证据不足保持关闭。只读 gate 只报告，不写 `eval_prefilter_mode`。

@@ -324,6 +324,11 @@ NewsClaw judgment workbench
                   ├─ corroboration → evidence upgrade, no duplicate unread
                   ├─ mutually exclusive outcome → contested ledger + frozen current state
                   └─ expectation / sentiment / analysis → secondary, not objective feed
+             Phase 4 desktop event workspace
+                  ├─ event inbox + global summary → unread/conflict/topic truth
+                  ├─ applied objective chain → current pulse; audit view → retained branches
+                  ├─ evidence drawer + conflict pagination + idempotent read actions
+                  └─ cursor v3 revision fence + topic digest → changed continuation returns 409/refresh
              restart-safe legacy backfill → conservative partial-legacy projection
                   └─ analysis + unconfirmed + provisional; excluded from objective feed
              restart-safe origin/fact/identity repair → aliases + revalidated evidence depth

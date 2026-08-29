@@ -2664,7 +2664,7 @@ def test_change_feed_uses_stable_keyset_and_supersedes_lifecycle(
     cursor = first_page[-1]
     second_page = database.list_news_event_changes(
         event_id=event["event_id"],
-        before_detected_at=cursor["detected_at"],
+        before_detected_at=cursor["timeline_sort_at"],
         before_change_id=cursor["change_id"],
         limit=2,
     )
@@ -3290,6 +3290,9 @@ def test_conflict_freezes_descendants_and_resolution_uses_reachable_chain(
     assert detail is not None
     assert detail["conflict_count"] == 2
     assert detail["current_state"] == ""
+    assert detail["change_count"] == 0
+    assert detail["unread_change_count"] == 0
+    assert database.list_news_event_changes(event_id=event["event_id"]) == []
     all_rows = database.list_news_event_changes(event_id=event["event_id"], objective_only=False)
     base_id = next(row["change_id"] for row in all_rows if row["new_state"] == "阶段B")
     resolution = dict(
@@ -3313,7 +3316,158 @@ def test_conflict_freezes_descendants_and_resolution_uses_reachable_chain(
     assert resolved is not None
     assert resolved["conflict_count"] == 0
     assert resolved["current_state"] == "阶段C"
+    assert resolved["change_count"] == 1
+    current_rows = database.list_news_event_changes(event_id=event["event_id"])
+    assert [row["new_state"] for row in current_rows] == ["阶段C"]
+    audit_rows = database.list_news_event_changes(event_id=event["event_id"], objective_only=False)
+    descendant_row = next(row for row in audit_rows if row["new_state"] == "阶段D")
+    assert descendant_row["is_state_applied"] is False
     assert database.get_news_event_change(base_id)["lifecycle"] == "invalidated"  # type: ignore[index]
+
+
+def test_invalidated_pointer_cannot_bridge_an_unrelated_blocked_state(
+    database: Database,
+) -> None:
+    event, _ = database.create_news_event(
+        canonical_title="错误替代指针不能跨过失效事实",
+        event_key="policy:wrong-invalidated-pointer",
+    )
+    unrelated = _objective_change(
+        item_key="web:unrelated-x-y",
+        evidence_fingerprint="unrelated-x-y-r1",
+        previous_state="阶段X",
+        new_state="阶段Y",
+        detected_at="2025-08-19T09:00:00+00:00",
+    )
+    blocked_predecessor = _objective_change(
+        item_key="web:blocked-a-b",
+        evidence_fingerprint="blocked-a-b-r1",
+        previous_state="阶段A",
+        new_state="阶段B",
+        detected_at="2025-08-20T09:00:00+00:00",
+    )
+    for change in (unrelated, blocked_predecessor):
+        database.record_news_event_projection(
+            event_id=event["event_id"],
+            check_status="changed",
+            detected_at=change["detected_at"],
+            changes=[change],
+        )
+    rows = database.list_news_event_changes(event_id=event["event_id"])
+    ids = {row["new_state"]: row["change_id"] for row in rows}
+
+    wrong_descendant = _objective_change(
+        item_key="web:wrong-bridge-b-d",
+        evidence_fingerprint="wrong-bridge-b-d-r1",
+        previous_state="阶段B",
+        new_state="阶段D",
+        detected_at="2025-08-21T09:00:00+00:00",
+    )
+    wrong_descendant.update(
+        supersedes_change_id=ids["阶段Y"],
+        supersedes_lifecycle="invalidated",
+    )
+    database.record_news_event_projection(
+        event_id=event["event_id"],
+        check_status="changed",
+        detected_at=wrong_descendant["detected_at"],
+        changes=[wrong_descendant],
+    )
+    resolution = _objective_change(
+        item_key="web:resolve-a-c",
+        evidence_fingerprint="resolve-a-c-r1",
+        previous_state="阶段A",
+        new_state="阶段C",
+        detected_at="2025-08-22T09:00:00+00:00",
+    )
+    resolution.update(
+        supersedes_change_id=ids["阶段B"],
+        supersedes_lifecycle="invalidated",
+    )
+    database.record_news_event_projection(
+        event_id=event["event_id"],
+        check_status="changed",
+        detected_at=resolution["detected_at"],
+        changes=[resolution],
+    )
+
+    audit_rows = database.list_news_event_changes(event_id=event["event_id"], objective_only=False)
+    wrong_row = next(row for row in audit_rows if row["new_state"] == "阶段D")
+    current_states = {
+        row["new_state"] for row in database.list_news_event_changes(event_id=event["event_id"])
+    }
+    assert wrong_row["is_state_applied"] is False
+    assert "阶段D" not in current_states
+    assert "阶段C" in current_states
+
+
+def test_future_safe_producer_cannot_rescue_earlier_invalidated_descendant(
+    database: Database,
+) -> None:
+    event, _ = database.create_news_event(
+        canonical_title="未来事实不能反向证明过去变化",
+        event_key="policy:future-producer-causality",
+    )
+    predecessor = _objective_change(
+        item_key="web:causal-a-b",
+        evidence_fingerprint="causal-a-b-r1",
+        previous_state="阶段A",
+        new_state="阶段B",
+        detected_at="2025-08-20T09:00:00+00:00",
+    )
+    descendant = _objective_change(
+        item_key="web:causal-b-d",
+        evidence_fingerprint="causal-b-d-r1",
+        previous_state="阶段B",
+        new_state="阶段D",
+        detected_at="2025-08-21T09:00:00+00:00",
+    )
+    future_producer = _objective_change(
+        item_key="web:causal-x-b",
+        evidence_fingerprint="causal-x-b-r1",
+        previous_state="阶段X",
+        new_state="阶段B",
+        detected_at="2025-08-22T09:00:00+00:00",
+    )
+    for change in (predecessor, descendant, future_producer):
+        database.record_news_event_projection(
+            event_id=event["event_id"],
+            check_status="changed",
+            detected_at=change["detected_at"],
+            changes=[change],
+        )
+    predecessor_id = next(
+        row["change_id"]
+        for row in database.list_news_event_changes(event_id=event["event_id"])
+        if row["previous_state"] == "阶段A" and row["new_state"] == "阶段B"
+    )
+    resolution = _objective_change(
+        item_key="web:causal-a-c",
+        evidence_fingerprint="causal-a-c-r1",
+        previous_state="阶段A",
+        new_state="阶段C",
+        detected_at="2025-08-23T09:00:00+00:00",
+    )
+    resolution.update(
+        supersedes_change_id=predecessor_id,
+        supersedes_lifecycle="invalidated",
+    )
+    database.record_news_event_projection(
+        event_id=event["event_id"],
+        check_status="changed",
+        detected_at=resolution["detected_at"],
+        changes=[resolution],
+    )
+
+    audit_rows = database.list_news_event_changes(event_id=event["event_id"], objective_only=False)
+    descendant_row = next(row for row in audit_rows if row["new_state"] == "阶段D")
+    current_states = {
+        row["new_state"] for row in database.list_news_event_changes(event_id=event["event_id"])
+    }
+    assert descendant_row["is_state_applied"] is False
+    assert "阶段D" not in current_states
+    assert "阶段B" in current_states
+    assert "阶段C" in current_states
 
 
 def test_incoming_supersede_that_becomes_contested_cannot_revoke_target(

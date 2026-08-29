@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>NewsClaw 推荐首页</title>
+  <title>NewsClaw 事件脉冲台</title>
   <link rel="icon" type="image/png" sizes="32x32" href="/m/icon-32.png?v=4">
   <script>
     (() => {
@@ -32,6 +32,7 @@
   </script>
   <link rel="stylesheet" href="/web/assets/css/app.css">
   <link rel="stylesheet" href="/web/assets/css/classic.css">
+  <link rel="stylesheet" href="/web/assets/icons/phosphor/style.css">
 </head>
 <body>
   <div class="app-shell">
@@ -93,7 +94,8 @@
         <div class="side-drawer-scrim" id="sideDrawerScrim"></div>
         <div class="side-drawer-panel" aria-label="侧边菜单">
           <nav class="side-drawer-nav" aria-label="全局功能">
-          <button class="nav-action" id="homeBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></span><span>首页</span></button>
+          <button class="nav-action" id="homeBtn" type="button"><span class="nav-glyph"><i class="ph ph-pulse" aria-hidden="true"></i></span><span>事件脉冲台</span><span class="nav-count-badge" id="eventUnreadBadge" aria-label="未读客观变化" hidden></span></button>
+          <button class="nav-action" id="newMaterialsBtn" type="button"><span class="nav-glyph"><i class="ph ph-newspaper" aria-hidden="true"></i></span><span>新材料</span></button>
           <button class="nav-action" id="contentLibraryBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H10l2 2h5.5A2.5 2.5 0 0 1 20 7.5v9A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5z"/><path d="M8 10h8M8 14h6"/></svg></span><span>内容库</span></button>
           <button class="nav-action" id="profileBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h3a1 1 0 0 0 1 -1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h3a1 1 0 0 1 1 1v3a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4h-1a1 1 0 0 0 -1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-1a2 2 0 0 0 -4 0v1a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h1a2 2 0 0 0 0 -4h-1a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1"/></svg></span><span>我的画像</span></button>
           <button class="nav-action" id="chatBtn" type="button"><span class="nav-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span>聊聊口味</span><span class="nav-count-badge" id="chatPendingCountBadge" hidden></span></button>
@@ -131,8 +133,81 @@
     </aside>
 
     <main class="layout" id="home">
-      <section class="main-col" id="homePage" aria-label="推荐首页" data-od-id="recommendation-home">
-        <section class="judgment-workbench" data-od-id="recommendations" aria-labelledby="workbenchTitle">
+      <section class="main-col" id="homePage" aria-label="事件脉冲台" data-od-id="event-pulse-home">
+        <section class="event-workspace" id="eventWorkspace" aria-labelledby="eventWorkspaceTitle">
+          <header class="event-workspace-head">
+            <div class="event-workspace-title">
+              <p class="eyebrow">Verified changes, kept locally</p>
+              <h1 id="eventWorkspaceTitle">事件脉冲台</h1>
+              <p>这里只放已经发生、能够沿证据反查的变化。新闻会归入同一事件，后续继续累积。</p>
+            </div>
+            <div class="event-workspace-controls" aria-label="事件收件箱筛选">
+              <label class="event-filter-field" for="eventTopicFilter">
+                <span>主题</span>
+                <select id="eventTopicFilter"><option value="">全部主题</option></select>
+              </label>
+              <div class="event-attention-filter" role="radiogroup" aria-label="注意状态">
+                <button type="button" role="radio" aria-checked="true" data-event-attention="all">全部</button>
+                <button type="button" role="radio" aria-checked="false" data-event-attention="unread">未读</button>
+                <button type="button" role="radio" aria-checked="false" data-event-attention="conflict">冲突</button>
+              </div>
+              <button class="event-icon-button" id="eventRefreshBtn" type="button" aria-label="刷新事件收件箱" title="刷新事件收件箱"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i></button>
+            </div>
+          </header>
+
+          <div class="event-workspace-grid" id="eventWorkspaceGrid">
+            <section class="event-inbox-pane" aria-labelledby="eventInboxTitle">
+              <header class="event-pane-head">
+                <div><h2 id="eventInboxTitle">事件收件箱</h2></div>
+                <p class="event-pane-summary" id="eventInboxSummary" role="status" aria-live="polite">正在读取事件…</p>
+              </header>
+              <p class="event-pane-status" id="eventInboxStatus" aria-live="polite"></p>
+              <div class="event-inbox-list" id="eventInboxList" role="listbox" aria-label="事件收件箱" aria-busy="true"></div>
+              <div class="event-pane-footer"><button class="event-secondary-button" id="eventInboxMoreBtn" type="button" hidden>加载更多事件</button></div>
+            </section>
+
+            <section class="event-pulse-pane" aria-labelledby="eventPulseTitle">
+              <header class="event-pane-head event-pulse-head">
+                <div class="event-pulse-title-row">
+                  <button class="event-icon-button event-mobile-back" id="eventMobileBackBtn" type="button" aria-label="返回事件收件箱"><i class="ph ph-arrow-left" aria-hidden="true"></i></button>
+                  <h2 id="eventPulseTitle">变化脉冲</h2>
+                </div>
+                <span class="event-current-state" id="eventCurrentState" hidden></span>
+              </header>
+              <div class="event-pulse-context" id="eventPulseContext" hidden></div>
+              <p class="event-pane-status" id="eventPulseStatus" aria-live="polite"></p>
+              <div class="event-pulse-timeline" id="eventPulseTimeline" aria-busy="false"></div>
+              <div class="event-pane-footer event-pulse-footer">
+                <button class="event-secondary-button" id="eventPulseMoreBtn" type="button" hidden>查看更早变化</button>
+                <button class="event-text-button" id="eventAuditToggleBtn" type="button" aria-pressed="false" hidden>显示完整审计历史</button>
+              </div>
+            </section>
+
+            <button class="event-evidence-scrim" id="eventEvidenceScrim" type="button" aria-label="关闭证据链" hidden></button>
+            <aside class="event-evidence-pane" id="eventEvidencePane" aria-labelledby="eventEvidenceTitle">
+              <header class="event-pane-head">
+                <div><h2 id="eventEvidenceTitle">证据链</h2></div>
+                <button class="event-icon-button event-evidence-close" id="eventEvidenceCloseBtn" type="button" aria-label="关闭证据链"><i class="ph ph-x" aria-hidden="true"></i></button>
+              </header>
+              <p class="event-evidence-lead" id="eventEvidenceLead">选择一条变化后，这里只显示能反查到本机记录的来源。</p>
+              <section class="event-conflict-panel" id="eventConflictPanel" hidden aria-labelledby="eventConflictTitle">
+                <div><i class="ph ph-warning-circle" aria-hidden="true"></i><strong id="eventConflictTitle">可靠证据互相冲突，当前状态已冻结</strong></div>
+                <p>冲突不会混入客观变化线，也不能靠主观点击裁决。</p>
+                <div id="eventConflictList"></div>
+                <button class="event-text-button event-conflict-more" id="eventConflictMoreBtn" type="button" hidden>加载更多冲突版本</button>
+              </section>
+              <p class="event-pane-status" id="eventEvidenceStatus" aria-live="polite"></p>
+              <div class="event-evidence-list" id="eventEvidenceList"></div>
+              <div class="event-pane-footer"><button class="event-secondary-button" id="eventEvidenceMoreBtn" type="button" hidden>加载更多证据</button></div>
+              <footer class="event-evidence-actions">
+                <button class="event-primary-button" id="eventMarkReadBtn" type="button" disabled>标为已读</button>
+                <button class="event-secondary-button" id="eventTrackingActionBtn" type="button" disabled>查看持续跟踪</button>
+              </footer>
+            </aside>
+          </div>
+        </section>
+
+        <section class="judgment-workbench" id="recommendationWorkspace" data-od-id="recommendations" aria-labelledby="workbenchTitle" hidden>
           <header class="workbench-head">
             <div>
               <p class="eyebrow">Daily intelligence desk</p>
@@ -781,6 +856,8 @@
         <button class="pill-btn dark" type="submit">筛选</button>
       </form>
       <div class="mobile-menu-list" aria-label="手机功能入口">
+        <button class="mobile-menu-item" data-mobile-home-mode="events" type="button"><span>事件脉冲台</span><small>查看已经核验的客观变化</small></button>
+        <button class="mobile-menu-item" data-mobile-home-mode="materials" type="button"><span>新材料</span><small>从推荐中建立新的观察点</small></button>
         <button class="mobile-menu-item" data-mobile-page="profilePage" type="button"><span>我的画像</span><small id="mobileProfileHint">查看完整画像和近期记忆</small></button>
         <button class="mobile-menu-item" data-mobile-page="chatPage" type="button"><span>聊聊口味</span><small>告诉新闻爪你的偏好和边界</small></button>
         <button class="mobile-menu-item" data-mobile-panel="messagesDrawer" type="button"><span>消息</span><small><span id="mobileMessageCount">0</span> 条通知</small></button>
@@ -904,6 +981,7 @@
   <script src="/web/assets/js/mobile-qr.js" defer></script>
   <script src="/web/assets/js/pending-actions.js" defer></script>
   <script src="/web/assets/js/saved-sync-core.js" defer></script>
+  <script src="/web/assets/js/event-workspace.js" defer></script>
   <!-- Frontend helpers shared with the extension side panel (and, for source
        status, the setup wizard); served from /shared because /web is rooted at
        web/desktop. -->

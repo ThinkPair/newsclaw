@@ -383,6 +383,20 @@ class PoolMaintenanceDeferredError(PoolMaintenanceSnapshotUnavailableError):
     """
 
 
+class NewsEventInboxChangedError(RuntimeError):
+    """Raised when a paged event inbox no longer matches its first-page snapshot."""
+
+
+@dataclass(frozen=True, slots=True)
+class NewsEventInboxSnapshot:
+    """One revision-fenced read of event rows and their filter metadata."""
+
+    revision: int
+    rows: tuple[dict[str, Any], ...]
+    summary: dict[str, int]
+    topics: tuple[dict[str, Any], ...]
+
+
 @dataclass(frozen=True)
 class PoolServeSnapshot:
     """One consistent, connection-isolated read for the recommendation hot path."""
@@ -16995,7 +17009,8 @@ class Database:
                     str(row["sql"] or ""),
                 )
                 for row in self.conn.execute(
-                    "SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')"
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE type IN ('table', 'index', 'trigger')"
                 ).fetchall()
             }
             required_tables = {
@@ -17006,6 +17021,7 @@ class Database:
                 "news_event_lineage_claims",
                 "news_event_memberships",
                 "news_event_backfill_state",
+                "news_event_inbox_revision",
             }
             required_indexes = {
                 "idx_news_events_active_key",
@@ -17017,6 +17033,7 @@ class Database:
                 "idx_news_event_changes_default_feed",
                 "idx_news_event_changes_event_timeline",
                 "idx_news_event_changes_objective_feed",
+                "idx_news_event_changes_state_feed",
                 "idx_news_event_change_aliases_canonical",
                 "idx_news_event_lineage_successor",
                 "idx_news_event_lineage_predecessor",
@@ -17028,9 +17045,25 @@ class Database:
                 "idx_news_event_memberships_event_origin",
                 "idx_tracked_observations_event",
             }
-            has_schema_contract = all(
-                schema_objects.get(name, ("", ""))[0] == "table" for name in required_tables
-            ) and all(schema_objects.get(name, ("", ""))[0] == "index" for name in required_indexes)
+            required_triggers = {
+                f"trg_news_event_inbox_{table}_{operation}"
+                for table in (
+                    "news_events",
+                    "news_event_changes",
+                    "news_event_memberships",
+                    "tracked_observations",
+                )
+                for operation in ("insert", "update", "delete")
+            }
+            has_schema_contract = (
+                all(schema_objects.get(name, ("", ""))[0] == "table" for name in required_tables)
+                and all(
+                    schema_objects.get(name, ("", ""))[0] == "index" for name in required_indexes
+                )
+                and all(
+                    schema_objects.get(name, ("", ""))[0] == "trigger" for name in required_triggers
+                )
+            )
             if has_schema_contract:
                 change_columns = {
                     str(row["name"])
@@ -17053,6 +17086,7 @@ class Database:
                     "objectivity_status",
                     "conflict_status",
                     "is_objective_default",
+                    "is_state_applied",
                     "supersedes_lifecycle",
                     "effective_precision",
                     "fingerprint_version",
@@ -17256,6 +17290,8 @@ class Database:
                     CHECK (lifecycle IN ('active', 'superseded', 'invalidated')),
                 is_objective_default INTEGER NOT NULL DEFAULT 0
                     CHECK (is_objective_default IN (0, 1)),
+                is_state_applied     INTEGER NOT NULL DEFAULT 0
+                    CHECK (is_state_applied IN (0, 1)),
                 supersedes_change_id TEXT,
                 supersedes_lifecycle TEXT NOT NULL DEFAULT 'superseded'
                     CHECK (supersedes_lifecycle IN ('superseded', 'invalidated')),
@@ -17420,6 +17456,7 @@ class Database:
             "objectivity_status": "TEXT NOT NULL DEFAULT 'unconfirmed'",
             "conflict_status": "TEXT NOT NULL DEFAULT 'none'",
             "is_objective_default": "INTEGER NOT NULL DEFAULT 0",
+            "is_state_applied": "INTEGER NOT NULL DEFAULT 0",
             "supersedes_lifecycle": "TEXT NOT NULL DEFAULT 'superseded'",
             "effective_precision": "TEXT NOT NULL DEFAULT 'unknown'",
         }
@@ -17498,6 +17535,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_news_event_changes_objective_feed
             ON news_event_changes(
                 is_objective_default, lifecycle, is_read,
+                detected_at DESC, change_id DESC
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_news_event_changes_state_feed
+            ON news_event_changes(
+                is_state_applied, lifecycle, is_read,
                 detected_at DESC, change_id DESC
             )
             """
@@ -17691,6 +17737,64 @@ class Database:
                 """,
                 (_NEWS_EVENT_ORIGIN_REPAIR_VERSION,),
             )
+        if "is_state_applied" not in change_columns:
+            state_projection_events = self.conn.execute(
+                "SELECT event_id FROM news_events WHERE status != 'merged' ORDER BY event_id"
+            ).fetchall()
+            for state_projection_event in state_projection_events:
+                self._recompute_news_event_state_on(
+                    self.conn,
+                    str(state_projection_event["event_id"] or ""),
+                )
+        topic_rows = self.conn.execute(
+            "SELECT event_id, topic_group FROM news_events WHERE TRIM(topic_group) != ''"
+        ).fetchall()
+        for topic_row in topic_rows:
+            current_topic = str(topic_row["topic_group"] or "")
+            normalized_topic = self._normalize_news_event_topic_group(current_topic)
+            if normalized_topic != current_topic:
+                self.conn.execute(
+                    "UPDATE news_events SET topic_group = ? WHERE event_id = ?",
+                    (normalized_topic, str(topic_row["event_id"] or "")),
+                )
+        self._ensure_news_event_inbox_revision_contract()
+
+    def _ensure_news_event_inbox_revision_contract(self) -> None:
+        """Fence mutable event-inbox pagination with one monotonic revision."""
+
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS news_event_inbox_revision (
+                singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision   INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            INSERT OR IGNORE INTO news_event_inbox_revision (singleton, revision)
+            VALUES (1, 0)
+            """,
+        ]
+        for table in (
+            "news_events",
+            "news_event_changes",
+            "news_event_memberships",
+            "tracked_observations",
+        ):
+            for operation in ("insert", "update", "delete"):
+                statements.append(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS trg_news_event_inbox_{table}_{operation}
+                    AFTER {operation.upper()} ON {table}
+                    BEGIN
+                        UPDATE news_event_inbox_revision
+                        SET revision = revision + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE singleton = 1;
+                    END
+                    """
+                )
+        self.conn.executescript(";\n".join(statement.strip() for statement in statements) + ";")
 
     @staticmethod
     def _tracked_observation_dict(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -19054,9 +19158,7 @@ class Database:
 
         polarity_matches: dict[str, list[tuple[str, int, int]]] = {}
         for candidate_polarity, markers in polarity_markers:
-            candidate_phrases = tuple(
-                f"{marker}{alias}" for marker in markers for alias in aliases
-            )
+            candidate_phrases = tuple(f"{marker}{alias}" for marker in markers for alias in aliases)
             matches = [
                 (phrase, start, end)
                 for phrase in candidate_phrases
@@ -19079,9 +19181,7 @@ class Database:
             f"{marker}{alias}" for marker in positive_markers for alias in aliases
         )
         nonpositive_spans = [
-            (start, end)
-            for matches in polarity_matches.values()
-            for _, start, end in matches
+            (start, end) for matches in polarity_matches.values() for _, start, end in matches
         ]
         decorated_positive_matches = [
             (phrase, start, end)
@@ -19111,9 +19211,7 @@ class Database:
             return f"mixed_{family}", compact
 
         polarity = next(iter(polarity_matches), "positive")
-        matched_polarity_phrases = tuple(
-            match[0] for match in polarity_matches.get(polarity, [])
-        )
+        matched_polarity_phrases = tuple(match[0] for match in polarity_matches.get(polarity, []))
         if polarity != "positive":
             polarity_decorators = (
                 "目前已被",
@@ -19355,15 +19453,22 @@ class Database:
         item["state_version"] = int(item.get("state_version") or 0)
         for field in (
             "total_change_count",
+            "audit_change_count",
             "change_count",
             "unread_change_count",
             "conflict_count",
             "unread_conflict_count",
             "evidence_count",
+            "active_tracking_count",
         ):
             if field in item:
                 item[field] = int(item.get(field) or 0)
         return item
+
+    @staticmethod
+    def _normalize_news_event_topic_group(value: object) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or ""))
+        return " ".join(normalized.split()).strip()[:300]
 
     @staticmethod
     def _news_event_change_dict(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -19371,6 +19476,7 @@ class Database:
         item["confidence"] = float(item.get("confidence") or 0.0)
         item["is_read"] = bool(int(item.get("is_read") or 0))
         item["is_objective_default"] = bool(int(item.get("is_objective_default") or 0))
+        item["is_state_applied"] = bool(int(item.get("is_state_applied") or 0))
         item["evidence_count"] = int(item.get("evidence_count") or 0)
         return item
 
@@ -19471,10 +19577,22 @@ class Database:
         default_rows = conn.execute(
             """
             SELECT change_id, previous_state, new_state, effective_at,
-                   effective_precision, detected_at
+                   effective_precision, detected_at, supersedes_change_id,
+                   supersedes_lifecycle
             FROM news_event_changes
             WHERE event_id = ? AND lifecycle = 'active'
               AND is_objective_default = 1
+            """,
+            (normalized_event_id,),
+        ).fetchall()
+        invalidated_rows = conn.execute(
+            """
+            SELECT change_id, previous_state, new_state, effective_at,
+                   effective_precision, detected_at, supersedes_change_id,
+                   supersedes_lifecycle
+            FROM news_event_changes
+            WHERE event_id = ? AND lifecycle = 'invalidated'
+              AND role = 'objective_change'
             """,
             (normalized_event_id,),
         ).fetchall()
@@ -19483,6 +19601,7 @@ class Database:
             for row in default_rows
             if self._news_event_effective_has_started(row["effective_at"], row["detected_at"])
         ]
+        applied_change_ids: list[str] = []
         if has_contested is not None:
             # A downstream transition is not trustworthy while any state it may
             # depend on is disputed.  Freeze the whole event instead of showing
@@ -19490,20 +19609,88 @@ class Database:
             current_state = ""
             last_change_at = ""
         elif eligible:
-            ordered = sorted(
-                eligible,
-                key=lambda row: (
+
+            def transition_order_key(row: sqlite3.Row) -> tuple[object, str, str]:
+                return (
                     self._news_event_effective_sort_key(
                         row["effective_at"], row["effective_precision"]
                     ),
                     str(row["detected_at"] or ""),
                     str(row["change_id"] or ""),
-                ),
-            )
+                )
 
-            current_state = str(ordered[0]["previous_state"] or "")
+            ordered = sorted(eligible, key=transition_order_key)
+
+            # ``is_state_applied`` means "safe for the current objective feed",
+            # not "member of one scalar chain".  One event can contain several
+            # independent objective dimensions or repeated occurrences.  Keep
+            # all of them visible, but remove a transition whose prerequisite
+            # only came from an invalidated fact; propagate that exclusion to
+            # its descendants.  Superseded facts are intentionally not blockers:
+            # they were once true and can legitimately anchor a later state.
+            started_invalidated_rows = [
+                row
+                for row in invalidated_rows
+                if self._news_event_effective_has_started(row["effective_at"], row["detected_at"])
+            ]
+            blocked_states = [str(row["new_state"] or "") for row in started_invalidated_rows]
+            invalidated_by_id = {
+                str(row["change_id"] or ""): row for row in started_invalidated_rows
+            }
+            safe_rows = list(ordered)
+            while blocked_states:
+                removed: list[sqlite3.Row] = []
+                for transition in safe_rows:
+                    previous_is_blocked = any(
+                        self._news_event_states_semantically_equivalent(
+                            transition["previous_state"], blocked_state
+                        )
+                        for blocked_state in blocked_states
+                    )
+                    if not previous_is_blocked:
+                        continue
+                    invalidated_predecessor = invalidated_by_id.get(
+                        str(transition["supersedes_change_id"] or "")
+                    )
+                    if (
+                        invalidated_predecessor is not None
+                        and str(transition["supersedes_lifecycle"] or "") == "invalidated"
+                        and transition_order_key(invalidated_predecessor)
+                        < transition_order_key(transition)
+                        and self._news_event_states_semantically_equivalent(
+                            invalidated_predecessor["new_state"],
+                            transition["previous_state"],
+                        )
+                    ):
+                        # This row is the evidence-backed replacement that
+                        # explicitly invalidated the matching predecessor that
+                        # existed before it.  It may start from that once-asserted
+                        # state; a pointer to another invalidated fact may not
+                        # cross the blocked branch.
+                        continue
+                    has_safe_producer = any(
+                        producer["change_id"] != transition["change_id"]
+                        and transition_order_key(producer) < transition_order_key(transition)
+                        and self._news_event_states_semantically_equivalent(
+                            producer["new_state"], transition["previous_state"]
+                        )
+                        for producer in safe_rows
+                    )
+                    if not has_safe_producer:
+                        removed.append(transition)
+                if not removed:
+                    break
+                removed_ids = {str(row["change_id"] or "") for row in removed}
+                safe_rows = [
+                    row for row in safe_rows if str(row["change_id"] or "") not in removed_ids
+                ]
+                blocked_states.extend(str(row["new_state"] or "") for row in removed)
+
+            applied_change_ids = [str(row["change_id"] or "") for row in safe_rows]
+
+            current_state = str(safe_rows[0]["previous_state"] or "") if safe_rows else ""
             last_change_at = ""
-            for transition in ordered:
+            for transition in safe_rows:
                 if not self._news_event_states_semantically_equivalent(
                     transition["previous_state"],
                     current_state,
@@ -19525,6 +19712,18 @@ class Database:
         state_version = previous_version + int(
             (current_state, last_change_at) != (previous_state, previous_change_at)
         )
+        conn.execute(
+            "UPDATE news_event_changes SET is_state_applied = 0 "
+            "WHERE event_id = ? AND is_state_applied != 0",
+            (normalized_event_id,),
+        )
+        if applied_change_ids:
+            placeholders = ", ".join("?" for _ in applied_change_ids)
+            conn.execute(
+                f"UPDATE news_event_changes SET is_state_applied = 1 "
+                f"WHERE event_id = ? AND change_id IN ({placeholders})",
+                (normalized_event_id, *applied_change_ids),
+            )
         conn.execute(
             """
             UPDATE news_events
@@ -20843,6 +21042,7 @@ class Database:
         normalized_id = str(event_id or "").strip()
         normalized_key = str(event_key or "").strip()[:512]
         normalized_title = " ".join(str(canonical_title or "").split()).strip()[:1_000]
+        normalized_topic = self._normalize_news_event_topic_group(topic_group)
         normalized_status = str(status or "active").strip().lower()
         normalized_origin = str(origin_tracking_id or "").strip()
         normalized_merge_target = str(merged_into_event_id or "").strip()
@@ -20937,7 +21137,7 @@ class Database:
                 _NEWS_EVENT_KEY_VERSION,
                 normalized_title,
                 str(event_type or "unknown").strip()[:120] or "unknown",
-                str(topic_group or "").strip()[:300],
+                normalized_topic,
                 str(story_key or "").strip()[:512],
                 self._news_event_entities_json(entities),
                 str(current_state or "").strip()[:8_000],
@@ -21998,7 +22198,7 @@ class Database:
         self._ensure_fresh_read()
         objective_filter = (
             """
-              AND c.is_objective_default = 1
+              AND c.is_state_applied = 1
             """
             if objective_only
             else ""
@@ -22012,6 +22212,21 @@ class Database:
                 SELECT e.*,
                        (SELECT COUNT(*) FROM news_event_changes c
                         WHERE c.event_id = e.event_id) AS total_change_count,
+                       (SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND c.role = 'objective_change'
+                          AND (
+                              (c.objectivity_status = 'confirmed'
+                               AND c.conflict_status IN ('none', 'resolved')
+                               AND c.evidence_status IN (
+                                   'source_supported', 'cross_source_supported'
+                               ))
+                              OR
+                              (c.lifecycle IN ('superseded', 'invalidated')
+                               AND c.objectivity_status = 'disputed'
+                               AND c.conflict_status = 'contested'
+                               AND c.evidence_status = 'contested')
+                          )) AS audit_change_count,
                        (SELECT COUNT(*) FROM news_event_changes c
                         WHERE c.event_id = e.event_id AND c.lifecycle = 'active'
                         """
@@ -22060,6 +22275,313 @@ class Database:
                 continue
             return self._news_event_dict(row)
         raise RuntimeError("news event merge cycle detected")
+
+    def list_news_events(
+        self,
+        *,
+        status: str = "active",
+        attention: str = "all",
+        topic_group: str = "",
+        before_sort_at: str = "",
+        before_event_id: str = "",
+        limit: int = 30,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List canonical events as a stable, objective event inbox."""
+
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {"active", "resolved", "archived", "all"}:
+            raise ValueError("unsupported news event status filter")
+        normalized_attention = str(attention or "all").strip().lower()
+        if normalized_attention not in {"all", "unread", "conflict"}:
+            raise ValueError("unsupported news event attention filter")
+        cursor_at = str(before_sort_at or "").strip()
+        cursor_id = str(before_event_id or "").strip()
+        if bool(cursor_at) != bool(cursor_id):
+            raise ValueError("both news event cursor fields are required")
+
+        objective_clause = "c.lifecycle = 'active' AND c.is_state_applied = 1"
+        conflict_clause = (
+            "c.lifecycle = 'active' AND c.role = 'objective_change' "
+            "AND c.objectivity_status = 'disputed' "
+            "AND c.conflict_status = 'contested' "
+            "AND c.evidence_status = 'contested'"
+        )
+        change_sort_expression = (
+            "printf('%020.9f', COALESCE("
+            "julianday(NULLIF(c.detected_at, '')), "
+            "julianday(NULLIF(c.effective_at, '')), "
+            "julianday(NULLIF(c.created_at, '')), 0.0))"
+        )
+        event_fallback_sort_expression = (
+            "printf('%020.9f', COALESCE("
+            "julianday(NULLIF(e.last_change_at, '')), "
+            "julianday(NULLIF(e.last_seen_at, '')), "
+            "julianday(NULLIF(e.created_at, '')), 0.0))"
+        )
+        sort_expression = (
+            f"COALESCE((SELECT MAX({change_sort_expression}) FROM news_event_changes c "
+            "WHERE c.event_id = e.event_id AND "
+            f"(({objective_clause}) OR ({conflict_clause}))), "
+            f"{event_fallback_sort_expression})"
+        )
+        clauses = ["e.status != 'merged'"]
+        params: list[object] = []
+        if normalized_status != "all":
+            clauses.append("e.status = ?")
+            params.append(normalized_status)
+        normalized_topic = self._normalize_news_event_topic_group(topic_group)
+        if normalized_topic:
+            clauses.append("LOWER(e.topic_group) = LOWER(?)")
+            params.append(normalized_topic)
+        if normalized_attention == "unread":
+            clauses.append(
+                "(EXISTS (SELECT 1 FROM news_event_changes c "
+                f"WHERE c.event_id = e.event_id AND {objective_clause} AND c.is_read = 0) "
+                "OR EXISTS (SELECT 1 FROM news_event_changes c "
+                f"WHERE c.event_id = e.event_id AND {conflict_clause} AND c.is_read = 0))"
+            )
+        elif normalized_attention == "conflict":
+            clauses.append(
+                "EXISTS (SELECT 1 FROM news_event_changes c "
+                f"WHERE c.event_id = e.event_id AND {conflict_clause})"
+            )
+        if cursor_at:
+            clauses.append(f"({sort_expression} < ? OR ({sort_expression} = ? AND e.event_id < ?))")
+            params.extend((cursor_at, cursor_at, cursor_id))
+
+        params.extend((max(1, min(200, int(limit))), max(0, int(offset))))
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            f"""
+            SELECT e.*,
+                   {sort_expression} AS inbox_sort_at,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id) AS total_change_count,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id
+                      AND c.role = 'objective_change'
+                      AND (
+                          (c.objectivity_status = 'confirmed'
+                           AND c.conflict_status IN ('none', 'resolved')
+                           AND c.evidence_status IN (
+                               'source_supported', 'cross_source_supported'
+                           ))
+                          OR
+                          (c.lifecycle IN ('superseded', 'invalidated')
+                           AND c.objectivity_status = 'disputed'
+                           AND c.conflict_status = 'contested'
+                           AND c.evidence_status = 'contested')
+                      )) AS audit_change_count,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id AND {objective_clause}) AS change_count,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id AND {objective_clause}
+                      AND c.is_read = 0) AS unread_change_count,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id AND {conflict_clause}) AS conflict_count,
+                   (SELECT COUNT(*) FROM news_event_changes c
+                    WHERE c.event_id = e.event_id AND {conflict_clause}
+                      AND c.is_read = 0) AS unread_conflict_count,
+                   (SELECT COUNT(*) FROM news_event_memberships m
+                    WHERE m.event_id = e.event_id) AS evidence_count,
+                   (SELECT COUNT(*) FROM tracked_observations o
+                    WHERE o.event_id = e.event_id AND o.status = 'active')
+                    AS active_tracking_count,
+                   (SELECT MIN(o.next_check_at) FROM tracked_observations o
+                    WHERE o.event_id = e.event_id AND o.status = 'active'
+                      AND o.next_check_at != '') AS next_check_at,
+                   (SELECT c.change_id FROM news_event_changes c
+                    WHERE c.event_id = e.event_id AND {objective_clause}
+                    ORDER BY {change_sort_expression} DESC, c.change_id DESC LIMIT 1)
+                    AS latest_change_id
+            FROM news_events e
+            WHERE {" AND ".join(clauses)}
+            ORDER BY inbox_sort_at DESC, e.event_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [self._news_event_dict(row) for row in rows]
+
+    def load_news_event_inbox_snapshot(
+        self,
+        *,
+        status: str = "active",
+        attention: str = "all",
+        topic_group: str = "",
+        before_sort_at: str = "",
+        before_event_id: str = "",
+        limit: int = 30,
+        expected_revision: int | None = None,
+    ) -> NewsEventInboxSnapshot:
+        """Read one event-inbox page and its metadata from one WAL snapshot.
+
+        The event inbox is mutable: new changes reorder rows, read actions alter
+        filters, and conflict or tracking updates can change visible metadata.
+        A keyset cursor is therefore safe only while the global inbox revision
+        stays unchanged.  Stale callers receive an explicit refresh signal
+        instead of a silently incomplete page.
+        """
+
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool) or int(expected_revision) < 0
+        ):
+            raise ValueError("news event inbox revision must be non-negative")
+        isolated = self._isolated_database(busy_timeout_ms=_INTERACTIVE_DB_BUSY_TIMEOUT_MS)
+        isolated._preserve_read_transaction = True
+        try:
+            isolated.conn.execute("BEGIN")
+            revision_row = isolated.conn.execute(
+                "SELECT revision FROM news_event_inbox_revision WHERE singleton = 1"
+            ).fetchone()
+            revision = int(revision_row["revision"] or 0) if revision_row is not None else 0
+            if expected_revision is not None and revision != int(expected_revision):
+                raise NewsEventInboxChangedError("news event inbox changed; refresh")
+            rows = isolated.list_news_events(
+                status=status,
+                attention=attention,
+                topic_group=topic_group,
+                before_sort_at=before_sort_at,
+                before_event_id=before_event_id,
+                limit=limit,
+            )
+            enriched_rows: list[dict[str, Any]] = []
+            for source_row in rows:
+                row = dict(source_row)
+                latest_change_id = str(row.get("latest_change_id") or "")
+                latest_change = (
+                    isolated.get_news_event_change(latest_change_id, objective_only=True)
+                    if latest_change_id
+                    else None
+                )
+                row["latest_change"] = (
+                    dict(latest_change) if isinstance(latest_change, Mapping) else None
+                )
+                enriched_rows.append(row)
+            summary = isolated.news_event_inbox_summary(
+                status=status,
+                topic_group=topic_group,
+            )
+            topics = isolated.list_news_event_topics(status=status)
+            isolated.conn.commit()
+            return NewsEventInboxSnapshot(
+                revision=revision,
+                rows=tuple(enriched_rows),
+                summary=summary,
+                topics=tuple(topics),
+            )
+        except Exception:
+            isolated.conn.rollback()
+            raise
+        finally:
+            isolated._preserve_read_transaction = False
+            isolated.close()
+
+    def news_event_inbox_summary(
+        self,
+        *,
+        status: str = "active",
+        topic_group: str = "",
+    ) -> dict[str, int]:
+        """Count event-level attention without confusing it with check-run unread state."""
+
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {"active", "resolved", "archived", "all"}:
+            raise ValueError("unsupported news event status filter")
+        clauses = ["e.status != 'merged'"]
+        params: list[object] = []
+        if normalized_status != "all":
+            clauses.append("e.status = ?")
+            params.append(normalized_status)
+        normalized_topic = self._normalize_news_event_topic_group(topic_group)
+        if normalized_topic:
+            clauses.append("LOWER(e.topic_group) = LOWER(?)")
+            params.append(normalized_topic)
+        objective_clause = "c.lifecycle = 'active' AND c.is_state_applied = 1"
+        conflict_clause = (
+            "c.lifecycle = 'active' AND c.role = 'objective_change' "
+            "AND c.objectivity_status = 'disputed' "
+            "AND c.conflict_status = 'contested' "
+            "AND c.evidence_status = 'contested'"
+        )
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS event_count,
+                   SUM(CASE WHEN
+                       EXISTS (SELECT 1 FROM news_event_changes c
+                               WHERE c.event_id = e.event_id
+                                 AND {objective_clause} AND c.is_read = 0)
+                       OR EXISTS (SELECT 1 FROM news_event_changes c
+                                  WHERE c.event_id = e.event_id
+                                    AND {conflict_clause} AND c.is_read = 0)
+                       THEN 1 ELSE 0 END) AS unread_event_count,
+                   SUM(CASE WHEN EXISTS (
+                       SELECT 1 FROM news_event_changes c
+                       WHERE c.event_id = e.event_id AND {conflict_clause}
+                   ) THEN 1 ELSE 0 END) AS conflict_event_count,
+                   SUM((SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND {objective_clause} AND c.is_read = 0))
+                       AS unread_change_count,
+                   SUM((SELECT COUNT(*) FROM news_event_changes c
+                        WHERE c.event_id = e.event_id
+                          AND {conflict_clause} AND c.is_read = 0))
+                       AS unread_conflict_count
+            FROM news_events e
+            WHERE {" AND ".join(clauses)}
+            """,
+            params,
+        ).fetchone()
+        return {
+            "event_count": int(row["event_count"] or 0) if row is not None else 0,
+            "unread_event_count": (int(row["unread_event_count"] or 0) if row is not None else 0),
+            "conflict_event_count": (
+                int(row["conflict_event_count"] or 0) if row is not None else 0
+            ),
+            "unread_change_count": (int(row["unread_change_count"] or 0) if row is not None else 0),
+            "unread_conflict_count": (
+                int(row["unread_conflict_count"] or 0) if row is not None else 0
+            ),
+        }
+
+    def list_news_event_topics(
+        self,
+        *,
+        status: str = "active",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return server-side topic filters for canonical event inboxes."""
+
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {"active", "resolved", "archived", "all"}:
+            raise ValueError("unsupported news event status filter")
+        clauses = ["e.status != 'merged'", "TRIM(e.topic_group) != ''"]
+        params: list[object] = []
+        if normalized_status != "all":
+            clauses.append("e.status = ?")
+            params.append(normalized_status)
+        params.append(max(1, min(100, int(limit))))
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            f"""
+            SELECT MIN(e.topic_group) AS topic_group, COUNT(*) AS event_count
+            FROM news_events e
+            WHERE {" AND ".join(clauses)}
+            GROUP BY LOWER(e.topic_group)
+            ORDER BY event_count DESC, e.topic_group
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "topic_group": str(row["topic_group"] or ""),
+                "event_count": int(row["event_count"] or 0),
+            }
+            for row in rows
+        ]
 
     def bind_tracked_observation_event(
         self,
@@ -22300,10 +22822,14 @@ class Database:
         limit: int = 50,
         offset: int = 0,
         objective_only: bool = True,
+        objective_history: bool = False,
         conflicts_only: bool = False,
     ) -> list[dict[str, Any]]:
-        if objective_only and conflicts_only:
-            raise ValueError("objective_only and conflicts_only are mutually exclusive")
+        selected_views = sum(
+            bool(value) for value in (objective_only, objective_history, conflicts_only)
+        )
+        if selected_views > 1:
+            raise ValueError("news event change views are mutually exclusive")
         normalized_lifecycle = str(lifecycle or "active").strip().lower()
         if normalized_lifecycle not in {*_NEWS_EVENT_CHANGE_LIFECYCLES, "all"}:
             raise ValueError("unsupported news event change lifecycle")
@@ -22321,8 +22847,21 @@ class Database:
             params.append(normalized_lifecycle)
         if unread_only:
             clauses.append("c.is_read = 0")
+            if objective_history:
+                clauses.extend(("c.lifecycle = 'active'", "c.is_state_applied = 1"))
         if objective_only:
-            clauses.append("c.is_objective_default = 1")
+            clauses.append("c.is_state_applied = 1")
+        if objective_history:
+            clauses.append(
+                "c.role = 'objective_change' AND ("
+                "(c.objectivity_status = 'confirmed' "
+                "AND c.conflict_status IN ('none', 'resolved') "
+                "AND c.evidence_status IN ('source_supported', 'cross_source_supported')) "
+                "OR (c.lifecycle IN ('superseded', 'invalidated') "
+                "AND c.objectivity_status = 'disputed' "
+                "AND c.conflict_status = 'contested' "
+                "AND c.evidence_status = 'contested'))"
+            )
         if conflicts_only:
             clauses.extend(
                 (
@@ -22332,22 +22871,31 @@ class Database:
                     "c.evidence_status = 'contested'",
                 )
             )
+        sort_expression = (
+            "printf('%020.9f', COALESCE("
+            "julianday(NULLIF(c.detected_at, '')), "
+            "julianday(NULLIF(c.effective_at, '')), "
+            "julianday(NULLIF(c.created_at, '')), 0.0))"
+        )
         if cursor_at:
-            clauses.append("(c.detected_at < ? OR (c.detected_at = ? AND c.change_id < ?))")
+            clauses.append(
+                f"({sort_expression} < ? OR ({sort_expression} = ? AND c.change_id < ?))"
+            )
             params.extend((cursor_at, cursor_at, cursor_id))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.extend((max(1, min(200, int(limit))), max(0, int(offset))))
         self._ensure_fresh_read()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT c.*, e.canonical_title, e.topic_group, e.story_key,
+                   {sort_expression} AS timeline_sort_at,
                    (SELECT COUNT(*) FROM news_event_memberships m
                     WHERE m.change_id = c.change_id) AS evidence_count
             FROM news_event_changes c
             JOIN news_events e ON e.event_id = c.event_id
             """
             + where
-            + " ORDER BY c.detected_at DESC, c.change_id DESC LIMIT ? OFFSET ?",
+            + f" ORDER BY {sort_expression} DESC, c.change_id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
         items = [self._news_event_change_dict(row) for row in rows]
@@ -22394,7 +22942,7 @@ class Database:
             clauses.append("event_id = ?")
             params.append(str(event_id).strip())
         if objective_only:
-            clauses.append("is_objective_default = 1")
+            clauses.append("is_state_applied = 1")
         self._ensure_fresh_read()
         row = self.conn.execute(
             """
@@ -22428,7 +22976,7 @@ class Database:
             clauses.extend(
                 (
                     "c.lifecycle = 'active'",
-                    "c.is_objective_default = 1",
+                    "c.is_state_applied = 1",
                 )
             )
         row = self.conn.execute(
@@ -22469,7 +23017,7 @@ class Database:
                   AND (
                       ? = 0 OR (
                           c.lifecycle = 'active'
-                          AND c.is_objective_default = 1
+                          AND c.is_state_applied = 1
                       )
                   )
                   AND (

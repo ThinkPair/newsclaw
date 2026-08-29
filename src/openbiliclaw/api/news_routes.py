@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import importlib
 import json
 import logging
 import os
 import re
 import shutil
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
@@ -52,6 +54,7 @@ from openbiliclaw.research.routes import register_research_routes
 from openbiliclaw.research.service import ResearchService
 from openbiliclaw.research.store import ResearchStore
 from openbiliclaw.sources.event_format import build_event
+from openbiliclaw.storage.database import NewsEventInboxChangedError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,8 +63,10 @@ NewsSourceKind = Literal["tushare", "rss"]
 MaybeAwaitable = Callable[..., Awaitable[object] | object]
 RuntimeSettingsApplier = Callable[[Mapping[str, object]], Awaitable[object] | object]
 
-_NEWS_CHANGE_CURSOR_VERSION = 1
+_NEWS_CHANGE_CURSOR_VERSION = 2
 _NEWS_CHANGE_CURSOR_MAX_LENGTH = 1_024
+_NEWS_EVENT_CURSOR_VERSION = 3
+_NEWS_EVENT_CURSOR_MAX_LENGTH = 1_024
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +401,7 @@ class NewsEventOut(BaseModel):
     first_seen_at: str = ""
     last_seen_at: str = ""
     last_change_at: str = ""
+    audit_change_count: int = 0
     change_count: int = 0
     unread_change_count: int = 0
     conflict_count: int = 0
@@ -404,7 +410,7 @@ class NewsEventOut(BaseModel):
 
 
 class NewsObjectiveChangeOut(BaseModel):
-    """A confirmed objective change; interpretation fields stay out of this DTO."""
+    """An objective change in the current feed or retained audit history."""
 
     change_id: str
     event_id: str
@@ -418,16 +424,51 @@ class NewsObjectiveChangeOut(BaseModel):
     summary: str = ""
     evidence_quote: str = ""
     role: Literal["objective_change"]
-    objectivity_status: Literal["confirmed"]
-    conflict_status: Literal["none", "resolved"] = "none"
+    objectivity_status: Literal["confirmed", "disputed"]
+    conflict_status: Literal["none", "resolved", "contested"] = "none"
     source_scope: Literal["unknown", "single_source", "multi_source"] = "unknown"
-    evidence_status: Literal["source_supported", "cross_source_supported"]
+    evidence_status: Literal["source_supported", "cross_source_supported", "contested"]
+    lifecycle: Literal["active", "superseded", "invalidated"] = "active"
+    is_state_applied: bool = False
     supersedes_change_id: str | None = None
+    supersedes_lifecycle: Literal["superseded", "invalidated"] = "superseded"
+    can_mark_read: bool = False
     is_read: bool = False
     effective_at: str
     effective_precision: Literal["unknown", "date", "minute"] = "unknown"
     detected_at: str = ""
     evidence_count: int = 0
+
+
+class NewsEventInboxItemOut(NewsEventOut):
+    """One event row for the objective event inbox."""
+
+    inbox_sort_at: str = ""
+    latest_change_id: str | None = None
+    latest_change: NewsObjectiveChangeOut | None = None
+    active_tracking_count: int = 0
+    next_check_at: str | None = None
+
+
+class NewsEventInboxSummaryOut(BaseModel):
+    event_count: int = 0
+    unread_event_count: int = 0
+    conflict_event_count: int = 0
+    unread_change_count: int = 0
+    unread_conflict_count: int = 0
+
+
+class NewsEventTopicCountOut(BaseModel):
+    topic_group: str
+    event_count: int = 0
+
+
+class NewsEventInboxResponse(BaseModel):
+    items: list[NewsEventInboxItemOut] = Field(default_factory=list)
+    summary: NewsEventInboxSummaryOut = Field(default_factory=NewsEventInboxSummaryOut)
+    topics: list[NewsEventTopicCountOut] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
 
 
 class NewsEventEvidenceOut(BaseModel):
@@ -515,6 +556,7 @@ class NewsEventDetailResponse(BaseModel):
 class NewsEventChangeTimelineResponse(BaseModel):
     event: NewsEventOut
     items: list[NewsObjectiveChangeOut] = Field(default_factory=list)
+    view: Literal["current", "audit"] = "current"
     next_cursor: str | None = None
     has_more: bool = False
 
@@ -549,6 +591,7 @@ def _encode_news_change_cursor(
     *,
     event_id: str,
     unread_only: bool,
+    view: Literal["current", "audit"] = "current",
     position: tuple[str, str],
 ) -> str:
     """Bind one opaque keyset cursor to its event and objective-feed filters."""
@@ -558,8 +601,7 @@ def _encode_news_change_cursor(
         "scope": "event" if event_id else "global",
         "event_id": event_id,
         "unread_only": unread_only,
-        "lifecycle": "active",
-        "objective_only": True,
+        "view": view,
         "after": list(position),
     }
     raw = json.dumps(
@@ -579,6 +621,7 @@ def _decode_news_change_cursor(
     *,
     event_id: str,
     unread_only: bool,
+    view: Literal["current", "audit"] = "current",
 ) -> tuple[str, str]:
     """Strictly decode a restart-safe objective-change cursor."""
 
@@ -603,8 +646,7 @@ def _decode_news_change_cursor(
         "scope",
         "event_id",
         "unread_only",
-        "lifecycle",
-        "objective_only",
+        "view",
         "after",
     }
     expected_scope = "event" if event_id else "global"
@@ -615,8 +657,7 @@ def _decode_news_change_cursor(
         or payload["scope"] != expected_scope
         or payload["event_id"] != event_id
         or payload["unread_only"] is not unread_only
-        or payload["lifecycle"] != "active"
-        or payload["objective_only"] is not True
+        or payload["view"] != view
     ):
         raise ValueError("invalid news change cursor")
     after = payload["after"]
@@ -627,6 +668,91 @@ def _decode_news_change_cursor(
     ):
         raise ValueError("invalid news change cursor")
     return after[0], after[1]
+
+
+def _encode_news_event_cursor(
+    *,
+    status_filter: str,
+    attention: str,
+    topic_group: str,
+    revision: int,
+    position: tuple[str, str],
+) -> str:
+    """Bind an opaque inbox cursor to every server-side event filter."""
+
+    payload = {
+        "v": _NEWS_EVENT_CURSOR_VERSION,
+        "status": status_filter,
+        "attention": attention,
+        "topic_group_hash": hashlib.sha256(topic_group.encode("utf-8")).hexdigest(),
+        "revision": revision,
+        "after": list(position),
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    if len(token) > _NEWS_EVENT_CURSOR_MAX_LENGTH:  # pragma: no cover - trusted bound
+        raise RuntimeError("news event cursor exceeds its encoded length bound")
+    return token
+
+
+def _decode_news_event_cursor(
+    token: str,
+    *,
+    status_filter: str,
+    attention: str,
+    topic_group: str,
+) -> tuple[int, str, str]:
+    """Strictly decode a stable event-inbox cursor."""
+
+    if (
+        not token
+        or len(token) > _NEWS_EVENT_CURSOR_MAX_LENGTH
+        or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None
+    ):
+        raise ValueError("invalid news event cursor")
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.b64decode(
+            (token + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid news event cursor") from error
+    expected_keys = {
+        "v",
+        "status",
+        "attention",
+        "topic_group_hash",
+        "revision",
+        "after",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload["v"] != _NEWS_EVENT_CURSOR_VERSION
+        or payload["status"] != status_filter
+        or payload["attention"] != attention
+        or payload["topic_group_hash"] != hashlib.sha256(topic_group.encode("utf-8")).hexdigest()
+        or isinstance(payload["revision"], bool)
+        or not isinstance(payload["revision"], int)
+        or payload["revision"] < 0
+    ):
+        raise ValueError("invalid news event cursor")
+    after = payload["after"]
+    if (
+        not isinstance(after, list)
+        or len(after) != 2
+        or any(not isinstance(value, str) or not value for value in after)
+    ):
+        raise ValueError("invalid news event cursor")
+    return payload["revision"], after[0], after[1]
 
 
 async def _maybe_await(callback: MaybeAwaitable, *args: object, **kwargs: object) -> object:
@@ -1864,6 +1990,9 @@ def register_newsclaw_routes(
 
     def _objective_change_out(row: Mapping[str, Any]) -> NewsObjectiveChangeOut:
         item = dict(row)
+        item["can_mark_read"] = (
+            bool(item.get("is_state_applied")) and str(item.get("lifecycle") or "") == "active"
+        )
         if not item.get("canonical_title"):
             event, _resolved_from = _resolved_news_event(str(item.get("event_id") or ""))
             for field in ("canonical_title", "topic_group", "story_key"):
@@ -1876,6 +2005,7 @@ def register_newsclaw_routes(
         unread_only: bool,
         limit: int,
         cursor: str | None,
+        view: Literal["current", "audit"] = "current",
     ) -> tuple[list[NewsObjectiveChangeOut], str | None, bool]:
         before_detected_at = ""
         before_change_id = ""
@@ -1885,17 +2015,19 @@ def register_newsclaw_routes(
                     cursor,
                     event_id=event_id,
                     unread_only=unread_only,
+                    view=view,
                 )
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         rows = database.list_news_event_changes(
             event_id=event_id,
             unread_only=unread_only,
-            lifecycle="active",
+            lifecycle="active" if view == "current" else "all",
             before_detected_at=before_detected_at,
             before_change_id=before_change_id,
             limit=limit + 1,
-            objective_only=True,
+            objective_only=view == "current",
+            objective_history=view == "audit",
         )
         page = [dict(row) for row in rows[:limit] if isinstance(row, Mapping)]
         has_more = len(rows) > limit
@@ -1905,12 +2037,92 @@ def register_newsclaw_routes(
             next_cursor = _encode_news_change_cursor(
                 event_id=event_id,
                 unread_only=unread_only,
+                view=view,
                 position=(
-                    str(last.get("detected_at") or ""),
+                    str(
+                        last.get("timeline_sort_at")
+                        or last.get("detected_at")
+                        or last.get("effective_at")
+                        or last.get("created_at")
+                        or ""
+                    ),
                     str(last.get("change_id") or ""),
                 ),
             )
         return [_objective_change_out(row) for row in page], next_cursor, has_more
+
+    def _event_inbox_page(
+        *,
+        status_filter: str,
+        attention: str,
+        topic_group: str,
+        limit: int,
+        cursor: str | None,
+    ) -> tuple[
+        list[NewsEventInboxItemOut],
+        NewsEventInboxSummaryOut,
+        list[NewsEventTopicCountOut],
+        str | None,
+        bool,
+    ]:
+        before_sort_at = ""
+        before_event_id = ""
+        expected_revision: int | None = None
+        if cursor is not None:
+            try:
+                expected_revision, before_sort_at, before_event_id = _decode_news_event_cursor(
+                    cursor,
+                    status_filter=status_filter,
+                    attention=attention,
+                    topic_group=topic_group,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            snapshot = database.load_news_event_inbox_snapshot(
+                status=status_filter,
+                attention=attention,
+                topic_group=topic_group,
+                before_sort_at=before_sort_at,
+                before_event_id=before_event_id,
+                limit=limit + 1,
+                expected_revision=expected_revision,
+            )
+        except NewsEventInboxChangedError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="news event inbox changed; refresh",
+            ) from error
+        rows = list(snapshot.rows)
+        page = [dict(row) for row in rows[:limit] if isinstance(row, Mapping)]
+        items: list[NewsEventInboxItemOut] = []
+        for row in page:
+            latest_change = row.get("latest_change")
+            row["latest_change"] = (
+                _objective_change_out(latest_change) if isinstance(latest_change, Mapping) else None
+            )
+            items.append(NewsEventInboxItemOut.model_validate(row))
+        has_more = len(rows) > limit
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_news_event_cursor(
+                status_filter=status_filter,
+                attention=attention,
+                topic_group=topic_group,
+                revision=snapshot.revision,
+                position=(
+                    str(last.get("inbox_sort_at") or ""),
+                    str(last.get("event_id") or ""),
+                ),
+            )
+        return (
+            items,
+            NewsEventInboxSummaryOut.model_validate(snapshot.summary),
+            [NewsEventTopicCountOut.model_validate(item) for item in snapshot.topics],
+            next_cursor,
+            has_more,
+        )
 
     @app.get("/api/news/changes", response_model=NewsChangeFeedResponse)
     async def news_objective_changes(
@@ -1932,6 +2144,53 @@ def register_newsclaw_routes(
             items=items,
             next_cursor=next_cursor,
             has_more=has_more,
+        )
+
+    @app.get("/api/news/events", response_model=NewsEventInboxResponse)
+    async def news_event_inbox(
+        status_filter: Literal["active", "resolved", "archived", "all"] = Query(
+            default="active",
+            alias="status",
+        ),
+        attention: Literal["all", "unread", "conflict"] = Query(default="all"),
+        topic_group: str = Query(default="", max_length=300),
+        limit: int = Query(default=30, ge=1, le=100),
+        cursor: str | None = Query(
+            default=None,
+            min_length=1,
+            max_length=_NEWS_EVENT_CURSOR_MAX_LENGTH,
+        ),
+    ) -> NewsEventInboxResponse:
+        normalized_topic = " ".join(unicodedata.normalize("NFKC", topic_group).split()).strip()[
+            :300
+        ]
+        items, summary, topics, next_cursor, has_more = _event_inbox_page(
+            status_filter=status_filter,
+            attention=attention,
+            topic_group=normalized_topic,
+            limit=limit,
+            cursor=cursor,
+        )
+        return NewsEventInboxResponse(
+            items=items,
+            summary=summary,
+            topics=topics,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    @app.get(
+        "/api/news/events/summary",
+        response_model=NewsEventInboxSummaryOut,
+    )
+    async def news_event_global_summary(
+        status_filter: Literal["active", "resolved", "archived", "all"] = Query(
+            default="active",
+            alias="status",
+        ),
+    ) -> NewsEventInboxSummaryOut:
+        return NewsEventInboxSummaryOut.model_validate(
+            database.news_event_inbox_summary(status=status_filter)
         )
 
     @app.get("/api/news/events/{event_id}", response_model=NewsEventDetailResponse)
@@ -1956,6 +2215,7 @@ def register_newsclaw_routes(
             max_length=_NEWS_CHANGE_CURSOR_MAX_LENGTH,
         ),
         unread_only: bool = Query(default=False),
+        view: Literal["current", "audit"] = Query(default="current"),
     ) -> NewsEventChangeTimelineResponse:
         event, _resolved_from = _resolved_news_event(_uuid_text(event_id, field="event_id"))
         canonical_event_id = str(event["event_id"])
@@ -1964,10 +2224,12 @@ def register_newsclaw_routes(
             unread_only=unread_only,
             limit=limit,
             cursor=cursor,
+            view=view,
         )
         return NewsEventChangeTimelineResponse(
             event=NewsEventOut.model_validate(event),
             items=items,
+            view=view,
             next_cursor=next_cursor,
             has_more=has_more,
         )

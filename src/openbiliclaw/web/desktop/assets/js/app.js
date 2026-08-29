@@ -42,6 +42,9 @@
       watchLater: "/watch-later",
       favorites: "/favorites",
       trackedObservations: "/news/tracked-observations",
+      newsEvents: "/news/events",
+      newsChanges: "/news/changes",
+      newsConflicts: "/news/conflicts",
       profileEdit: "/profile/edit",
       profileEditState: "/profile/edit-state"
     };
@@ -128,6 +131,7 @@
       selectedRecommendationKey: "",
       recommendationDetailSheetOpen: false,
       workbenchView: "recommendations",
+      homeMode: "events",
       messages: [],
       messageListSnapshot: null,
       messageListDomLocked: false,
@@ -146,6 +150,7 @@
     };
     let recommendationDetailOpener = null;
     let recommendationSyncChannel = null;
+    let eventWorkspaceController = null;
 
     const $ = (selector) => document.querySelector(selector);
 
@@ -988,6 +993,8 @@
       storageSet(ACCENT_STORAGE_KEY, state.accentStyle);
     }
     const SIDE_DRAWER_OPEN_KEY = "openbiliclaw.sideDrawerOpen";
+    const HOME_MODE_STORAGE_KEY = "newsclaw.webui.homeMode";
+    state.homeMode = storageGet(HOME_MODE_STORAGE_KEY) === "materials" ? "materials" : "events";
     const DELIGHT_QUEUE_LIMIT_KEY = "openbiliclaw.webui.delightQueueLimit";
     // 加载更多一次向后端请求的条数（后端 append 端点固定 limit=10）；
     // 返回少于这个数说明候选池当轮见底，据此切换文案并等待补货重试。
@@ -3102,6 +3109,10 @@
       document.body.classList.toggle("profile-page-open", pageId === "profilePage");
       document.body.classList.toggle("chat-page-open", pageId === "chatPage");
       document.body.classList.toggle("content-page-open", pageId !== "homePage");
+      if (pageId !== "homePage") {
+        document.body.classList.remove("event-workspace-open", "new-materials-open");
+        eventWorkspaceController?.deactivate();
+      }
     }
 
     function syncTopbarHeight() {
@@ -3110,11 +3121,50 @@
       document.documentElement.style.setProperty("--topbar-height", `${Math.ceil(topbar.getBoundingClientRect().height)}px`);
     }
 
-    function openHomePage() {
+    function syncHomeSearch() {
+      const eventsMode = state.homeMode === "events";
+      const desktopInput = $("#searchInput");
+      const mobileInput = $("#mobileSearchInput");
+      const value = eventsMode
+        ? String(eventWorkspaceController?.snapshot?.()?.query || "")
+        : state.query;
+      const placeholder = eventsMode ? "筛选当前已加载的事件" : "筛选当前已加载的新材料";
+      [desktopInput, mobileInput].forEach((input) => {
+        if (!input) return;
+        input.value = value;
+        input.placeholder = placeholder;
+      });
+    }
+
+    function setHomeMode(value, { persist = true } = {}) {
+      const mode = value === "materials" ? "materials" : "events";
+      state.homeMode = mode;
+      if (persist) storageSet(HOME_MODE_STORAGE_KEY, mode);
+      const eventWorkspace = document.getElementById("eventWorkspace");
+      const recommendationWorkspace = document.getElementById("recommendationWorkspace");
+      if (eventWorkspace) eventWorkspace.hidden = mode !== "events";
+      if (recommendationWorkspace) recommendationWorkspace.hidden = mode !== "materials";
+      const homeVisible = !document.getElementById("homePage")?.hidden;
+      document.body.classList.toggle("event-workspace-open", mode === "events" && homeVisible);
+      document.body.classList.toggle("new-materials-open", mode === "materials" && homeVisible);
+      document.getElementById("homeBtn")?.setAttribute("aria-current", mode === "events" ? "page" : "false");
+      document.getElementById("newMaterialsBtn")?.setAttribute("aria-current", mode === "materials" ? "page" : "false");
+      syncHomeSearch();
+      if (mode === "events" && homeVisible) eventWorkspaceController?.activate();
+      else eventWorkspaceController?.deactivate();
+    }
+
+    function openHomePage(mode = "events") {
       leaveDesktopContentLibrary();
       clearDesktopContentLibraryRoute();
       showMainPage("homePage");
+      setHomeMode(mode);
+      closeMobileMenu();
       window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    function openNewMaterialsPage() {
+      openHomePage("materials");
     }
 
     function openProfilePage() {
@@ -4381,6 +4431,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         else if (desktopContentLibraryVisible) {
           leaveDesktopContentLibrary();
           showMainPage("homePage");
+          setHomeMode(state.homeMode, { persist: false });
           window.scrollTo({ top: 0, behavior: "auto" });
         }
       });
@@ -4424,8 +4475,7 @@ ${savedCardFeedbackBarHtml(listKind)}
     }
 
     function syncMobileSearch() {
-      const input = $("#mobileSearchInput");
-      if (input && input.value !== state.query) input.value = state.query || "";
+      syncHomeSearch();
     }
 
     function openMobileMenu() {
@@ -4990,7 +5040,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       const hasStock = scopedAvailable === null
         ? state.runtimeStatus?.pool_available_count > 0
         : scopedAvailable > 0;
-      const homePage = $("#homePage");
+      const recommendationWorkspace = $("#recommendationWorkspace");
       const loadMore = $("#loadMoreBtn");
       return recommendationAutoLoadContextReason({
         enabled: state.autoLoadOnScroll,
@@ -4998,7 +5048,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         localFilters: recommendationLocalFiltersActive(),
         queueView: state.workbenchView === "recommendations",
         hasStock,
-        homeVisible: Boolean(homePage && !homePage.hidden),
+        homeVisible: Boolean(recommendationWorkspace && !recommendationWorkspace.hidden),
         buttonVisible: Boolean(loadMore && !loadMore.hidden),
         hasCards: Boolean(grid.querySelector(".video-card:not(.is-skeleton)")),
         cooldownReady: now - lastAutoLoadAt >= AUTO_LOAD_COOLDOWN_MS,
@@ -12651,13 +12701,53 @@ ${cardFeedbackBarHtml()}`;
       }, 5000);
     }
 
+    try {
+      const eventWorkspace = globalThis.NewsClawEventWorkspace;
+      if (!eventWorkspace?.createController) throw new Error("event-workspace helper did not load");
+      eventWorkspaceController = eventWorkspace.createController({
+        requestJsonStrict,
+        endpoints: {
+          events: ENDPOINTS.newsEvents,
+          changes: ENDPOINTS.newsChanges,
+          conflicts: ENDPOINTS.newsConflicts,
+        },
+        openMaterials: openNewMaterialsPage,
+        openTracking: () => openContentLibraryPage("tracking", { forceLoad: true }),
+        showToast,
+        onUnreadChange: ({ unreadChangeCount = 0, unreadConflictCount = 0 }) => {
+          const badge = $("#eventUnreadBadge");
+          if (!badge) return;
+          const total = Math.max(0, Number(unreadChangeCount || 0) + Number(unreadConflictCount || 0));
+          badge.textContent = total > 99 ? "99+" : String(total);
+          badge.hidden = total <= 0;
+        },
+      });
+      void eventWorkspaceController.refreshSummary();
+    } catch (error) {
+      console.error("事件脉冲台初始化失败", error);
+      showFatal(error, "初始化事件脉冲台");
+    }
+
+    function applyHomeSearch(value) {
+      const query = String(value || "");
+      if (state.homeMode === "events") eventWorkspaceController?.applySearch(query);
+      else {
+        state.query = query;
+        renderAll();
+      }
+      const desktopInput = $("#searchInput");
+      const mobileInput = $("#mobileSearchInput");
+      if (desktopInput && desktopInput.value !== query) desktopInput.value = query;
+      if (mobileInput && mobileInput.value !== query) mobileInput.value = query;
+    }
+
     safeBind("#sideDrawerBtn", "click", toggleSideDrawer);
-    safeBind(".brand", "click", (event) => { event.preventDefault(); openHomePage(); });
+    safeBind(".brand", "click", (event) => { event.preventDefault(); openHomePage("events"); });
     safeBind("#sideDrawerScrim", "click", closeSideDrawer);
     safeBind("#mobileMenuBtn", "click", openMobileMenu);
     safeBind("#mobileMenuClose", "click", closeMobileMenu);
-    safeBind("#mobileSearchInput", "input", (event) => { state.query = event.target.value || ""; const desktopInput = $("#searchInput"); if (desktopInput) desktopInput.value = state.query; renderAll(); });
-    safeBind("#mobileSearchForm", "submit", (event) => { event.preventDefault(); state.query = $("#mobileSearchInput")?.value || ""; const desktopInput = $("#searchInput"); if (desktopInput) desktopInput.value = state.query; renderAll(); closeMobileMenu(); });
+    safeBind("#mobileSearchInput", "input", (event) => applyHomeSearch(event.target.value));
+    safeBind("#mobileSearchForm", "submit", (event) => { event.preventDefault(); applyHomeSearch($("#mobileSearchInput")?.value || ""); closeMobileMenu(); });
     document.querySelectorAll("[data-mobile-panel]").forEach((button) => {
       button.addEventListener("click", () => openMobilePanel(button.dataset.mobilePanel, { settingsPanel: button.dataset.settings }));
     });
@@ -12665,6 +12755,9 @@ ${cardFeedbackBarHtml()}`;
       button.addEventListener("click", () => {
         openMobilePage(button.dataset.mobilePage, { settingsPanel: button.dataset.settings });
       });
+    });
+    document.querySelectorAll("[data-mobile-home-mode]").forEach((button) => {
+      button.addEventListener("click", () => openHomePage(button.dataset.mobileHomeMode));
     });
     document.querySelectorAll("[data-mobile-back]").forEach((button) => {
       button.addEventListener("click", returnToMobileMenu);
@@ -12778,7 +12871,8 @@ ${cardFeedbackBarHtml()}`;
       }
     });
     safeBind("#profileBtn", "click", openProfilePage);
-    safeBind("#homeBtn", "click", openHomePage);
+    safeBind("#homeBtn", "click", () => openHomePage("events"));
+    safeBind("#newMaterialsBtn", "click", openNewMaterialsPage);
     safeBind("#contentLibraryBtn", "click", () => openContentLibraryPage());
     bindDesktopContentLibrary();
     safeBind("#historyRefreshBtn", "click", () => refreshContentHistory(true));
@@ -12903,8 +12997,8 @@ ${cardFeedbackBarHtml()}`;
       renderAll();
       $("#mediaFilterSelect")?.focus({ preventScroll: true });
     });
-    safeBind("#searchInput", "input", (event) => { state.query = event.target.value || ""; renderAll(); });
-    safeBind("#searchForm", "submit", (event) => { event.preventDefault(); state.query = $("#searchInput")?.value || ""; renderAll(); });
+    safeBind("#searchInput", "input", (event) => applyHomeSearch(event.target.value));
+    safeBind("#searchForm", "submit", (event) => { event.preventDefault(); applyHomeSearch($("#searchInput")?.value || ""); });
     window.addEventListener("resize", scheduleActivityRailHeightSync);
     safeBind("#desktopPendingToggle", "click", () => {
       state.pendingConfirmations.expanded = !state.pendingConfirmations.expanded;
@@ -13771,6 +13865,7 @@ ${cardFeedbackBarHtml()}`;
     toastManager.init();
     setupThemeNotice();
     setWorkbenchView(state.workbenchView);
+    setHomeMode(state.homeMode, { persist: false });
     try {
       renderAll();
     } catch (error) {

@@ -21173,6 +21173,11 @@ def create_app(
             for relative, root in (
                 ("assets/css/app.css", _desktop_dir),
                 ("assets/css/classic.css", _desktop_dir),
+                ("assets/icons/phosphor/style.css", _desktop_dir),
+                ("assets/icons/phosphor/Phosphor.ttf", _desktop_dir),
+                ("assets/icons/phosphor/Phosphor.woff", _desktop_dir),
+                ("assets/icons/phosphor/Phosphor.woff2", _desktop_dir),
+                ("assets/js/event-workspace.js", _desktop_dir),
                 ("assets/js/app.js", _desktop_dir),
                 ("dialogue-confirmation.js", _shared_web_dir),
                 ("source-status.js", _shared_web_dir),
@@ -21198,6 +21203,14 @@ def create_app(
             html = html.replace(
                 'href="/web/assets/css/classic.css"',
                 f'href="/web/assets/css/classic.css?v={version}"',
+            )
+            html = html.replace(
+                'href="/web/assets/icons/phosphor/style.css"',
+                f'href="/web/assets/icons/phosphor/style.css?v={version}"',
+            )
+            html = html.replace(
+                'src="/web/assets/js/event-workspace.js"',
+                f'src="/web/assets/js/event-workspace.js?v={version}"',
             )
             html = html.replace(
                 'src="/web/assets/js/app.js"',
