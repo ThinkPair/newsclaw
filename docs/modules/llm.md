@@ -16,6 +16,19 @@
 - **Service 门面** — `LLMService` 封装 prompt 组装 + 调用 + 校验
 - **统一异常** — 所有 provider 错误归一化为标准异常类型
 
+### NewsClaw P4 个人记忆发送边界
+
+个人记忆不是默认 core memory。`LLMService.complete_with_core_memory()` 的
+`inject_personal_memory` 默认为 `False`；结构化评估、多模态评估、兴趣探测、画像构建、
+Soul 重建和其它通用任务都不会得到 P4 内容。只有用户对话入口
+`complete_socratic_dialogue()` 与带工具对话 `complete_with_tools()` 显式开启该参数，且
+只读取活动 `confirmed_fact`。`research_direction` 不进入聊天，它由推荐模块单独投影。
+
+该边界是“按调用实时读取”，不是启动时缓存：管理页面、增删改和候选处理本身不调用
+外部模型；编辑或删除后，下一次对应对话立即使用新版本。NewsClaw 模式同时排除旧 Soul
+洞察，避免待确认候选在接受前经兼容画像偷偷进入模型；普通 OpenBiliClaw 模式不改变
+原 core-memory 合同。
+
 ## 已实现功能
 
 | 任务 | 状态 | 说明 |

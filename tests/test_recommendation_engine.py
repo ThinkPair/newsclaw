@@ -193,6 +193,72 @@ def test_recommendation_profile_summary_includes_disliked_topics() -> None:
     assert summary["disliked_topics"] == [f"话题{i}" for i in range(1, 129)]
 
 
+def test_recommendation_profile_uses_live_user_research_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    database = Database(tmp_path / "recommendation-personal-memory.db")
+    database.initialize()
+    research = database.create_personal_memory_item(
+        kind="research_direction",
+        title="黄金政策",
+        content="持续观察黄金政策向利率和资金面的传导",
+        request_id="recommendation-research-create",
+    )["item"]
+    database.create_personal_memory_item(
+        kind="confirmed_fact",
+        title="私人事实",
+        content="这条不进入高频推荐评估投影",
+        request_id="recommendation-fact-create",
+    )
+    engine = RecommendationEngine(llm=_DummyLLM(), database=database)
+
+    profile = _build_profile()
+    profile.active_insights = [InsightHypothesis(hypothesis="旧画像隐藏洞察")]
+    summary = engine._profile_summary_with_personal_memory(profile)
+
+    assert summary["user_research_directions"] == [
+        {
+            "title": "黄金政策",
+            "content": "持续观察黄金政策向利率和资金面的传导",
+        }
+    ]
+    assert "user_confirmed_facts" not in summary
+    assert "active_insights" not in summary
+
+    database.delete_personal_memory_item(
+        research["memory_id"],
+        expected_version=1,
+        request_id="recommendation-research-delete",
+    )
+    refreshed = engine._profile_summary_with_personal_memory(_build_profile())
+    assert "user_research_directions" not in refreshed
+
+
+def test_ordinary_recommendation_does_not_read_p4_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("NEWSCLAW_MODE", raising=False)
+    database = Database(tmp_path / "ordinary-recommendation.db")
+    database.initialize()
+    database.create_personal_memory_item(
+        kind="research_direction",
+        title="不应进入普通版",
+        content="普通 OpenBiliClaw 不读取 P4 研究方向",
+        request_id="ordinary-research-create",
+    )
+    profile = _build_profile()
+    profile.active_insights = [InsightHypothesis(hypothesis="普通版原有洞察")]
+    engine = RecommendationEngine(llm=_DummyLLM(), database=database)
+
+    summary = engine._profile_summary_with_personal_memory(profile)
+
+    assert "user_research_directions" not in summary
+    assert summary["active_insights"][0]["hypothesis"] == "普通版原有洞察"
+
+
 def test_recommendation_profile_summary_compacts_maxed_profile() -> None:
     from openbiliclaw.discovery.strategies._utils import compact_content_prompt_profile_summary
 

@@ -1968,6 +1968,15 @@ def register_newsclaw_routes(
     )
     app.state.newsclaw_runtime = runtime
     register_research_routes(app, runtime=runtime)
+    from openbiliclaw.api.personal_memory_routes import register_personal_memory_routes
+
+    sync_legacy_candidates = getattr(soul_engine, "sync_personal_memory_insight_candidates", None)
+    if callable(sync_legacy_candidates):
+        try:
+            sync_legacy_candidates()
+        except Exception:
+            logger.warning("personal memory legacy candidate sync failed", exc_info=True)
+    register_personal_memory_routes(app, database=database)
 
     def _resolved_news_event(event_id: str) -> tuple[dict[str, Any], str]:
         try:

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from openbiliclaw.llm.service import ModuleOverride, SupportsComplete
     from openbiliclaw.memory.manager import MemoryManager
 
+from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
 from openbiliclaw.llm.service import LLMService
 
 from .avoidance_speculator import AvoidanceSpeculator
@@ -87,6 +88,8 @@ from .profile import (
     awareness_note_to_dict,
     insight_hypothesis_from_dict,
     insight_hypothesis_to_dict,
+    insight_is_confirmed_memory,
+    insight_memory_state,
 )
 from .profile_builder import ProfileBuilder
 from .speculator import InterestSpeculator
@@ -1188,17 +1191,24 @@ class SoulEngine:
             "signal": signal,
             "validated": False,
             "confidence": 0.0,
+            "user_verdict": "",
+            "verdict_source": "",
+            "memory_state": "pending",
         }
         changed = False
+        matched_item: InsightHypothesis | None = None
         for item in hypotheses:
             if self._normalize_text(item.hypothesis) != target:
                 continue
             previous_validated = item.validated
             previous_confidence = item.confidence
+            previous_verdict = item.user_verdict
+            previous_verdict_source = item.verdict_source
             if signal in {"confirm", "like", "support"}:
                 item.validated = True
                 item.confidence = min(1.0, round(max(item.confidence, 0.75), 4))
                 item.user_verdict = "confirmed"
+                item.verdict_source = "insight_feedback"
             elif signal in {"reject", "dislike", "deny"}:
                 item.validated = False
                 item.confidence = max(0.0, round(min(item.confidence, 0.35), 4))
@@ -1206,11 +1216,21 @@ class SoulEngine:
                 # a later insight pass must not talk it back up (see
                 # InsightAnalyzer._merge_confidence).
                 item.user_verdict = "rejected"
-            changed = item.validated != previous_validated or item.confidence != previous_confidence
+                item.verdict_source = "insight_feedback"
+            changed = (
+                item.validated != previous_validated
+                or item.confidence != previous_confidence
+                or item.user_verdict != previous_verdict
+                or item.verdict_source != previous_verdict_source
+            )
             result["matched"] = True
             result["hypothesis"] = item.hypothesis
             result["validated"] = item.validated
             result["confidence"] = item.confidence
+            result["user_verdict"] = item.user_verdict
+            result["verdict_source"] = item.verdict_source
+            result["memory_state"] = insight_memory_state(item)
+            matched_item = item
             break
         if result["matched"] and changed:
             self._save_insights(hypotheses)
@@ -1220,11 +1240,16 @@ class SoulEngine:
             # mirroring the calibration there, a confirm/reject wouldn't take
             # visible or recommendation effect until the next 12h cognition
             # sync. Patch the snapshot in place so the change is immediate.
-            self._sync_insight_to_soul_snapshot(
-                target_normalized=target,
-                validated=bool(result["validated"]),
-                confidence=float(result["confidence"]),
-            )
+            if not self._newsclaw_personal_memory_enabled():
+                self._sync_insight_to_soul_snapshot(
+                    target_normalized=target,
+                    validated=bool(result["validated"]),
+                    confidence=float(result["confidence"]),
+                    user_verdict=str(item.user_verdict),
+                    verdict_source=str(item.verdict_source),
+                )
+        if matched_item is not None and result["memory_state"] == "confirmed":
+            self._propose_insight_personal_memory_candidate(matched_item)
         return result
 
     async def mark_feedback_rebuild(
@@ -1233,6 +1258,11 @@ class SoulEngine:
         result: dict[str, Any],
     ) -> None:
         """Apply the idempotent rebuild-marker segment for matched feedback."""
+        if self._newsclaw_personal_memory_enabled():
+            # NewsClaw turns a confirmed legacy insight into a visible pending
+            # P4 candidate. Until the user accepts that candidate, it must not
+            # rebuild Soul or influence recommendations through an old path.
+            return
         signal = str(feedback.get("signal", "")).strip().lower()
         if not bool(result.get("matched", False)) or signal not in {
             "confirm",
@@ -1257,6 +1287,9 @@ class SoulEngine:
             "signal": signal,
             "validated": False,
             "confidence": 0.0,
+            "user_verdict": "",
+            "verdict_source": "",
+            "memory_state": "pending",
         }
         for item in self._load_insights():
             if self._normalize_text(item.hypothesis) != target:
@@ -1267,6 +1300,9 @@ class SoulEngine:
                     "hypothesis": item.hypothesis,
                     "validated": item.validated,
                     "confidence": item.confidence,
+                    "user_verdict": item.user_verdict,
+                    "verdict_source": item.verdict_source,
+                    "memory_state": insight_memory_state(item),
                 }
             )
             break
@@ -2265,6 +2301,8 @@ class SoulEngine:
         target_normalized: str,
         validated: bool,
         confidence: float,
+        user_verdict: str,
+        verdict_source: str,
     ) -> None:
         """Mirror an insight calibration onto the soul layer's active_insights.
 
@@ -2285,6 +2323,8 @@ class SoulEngine:
             if self._normalize_text(insight.hypothesis) == target_normalized:
                 insight.validated = validated
                 insight.confidence = confidence
+                insight.user_verdict = user_verdict
+                insight.verdict_source = verdict_source
                 changed = True
         if not changed:
             return
@@ -2579,19 +2619,23 @@ class SoulEngine:
         # ``enforce`` drops rejected candidates and demotes downgraded ones to
         # insight hypotheses (confidence × 0.6).
         gated_candidates = await self._gate_dialogue_candidates(eligible_candidates)
-        # Dialogue fast lane (user decision 2026-07-27): a gate-accepted deep
-        # candidate is the user's own first-person statement — that IS the
-        # confirmation the deep unique mode asks for. Persist it as a validated
-        # hypothesis so it becomes a durable rebuild input instead of vanishing
-        # after one preference prompt, and force a same-turn rebuild below even
-        # when no interest weight moved (a pure self-statement often doesn't).
-        accepted_deep_candidates = [
+        # P4 personal-memory boundary: ordinary dialogue may suggest a durable
+        # fact, but it is not the same as an explicit "remember this" or a click
+        # on Accept. Keep these as local pending candidates and do not let them
+        # rebuild the user's profile in the same turn.
+        deep_candidates = [
             item
             for item in gated_candidates
             if str(item.get("kind", "")).strip() in _DEEP_CANDIDATE_KINDS
         ]
-        if accepted_deep_candidates:
-            self._persist_confirmed_deep_candidates(accepted_deep_candidates, turn_id=turn_id)
+        if deep_candidates:
+            if self._newsclaw_personal_memory_enabled():
+                self._persist_pending_personal_memory_candidates(
+                    deep_candidates,
+                    turn_id=turn_id,
+                )
+            else:
+                self._persist_confirmed_deep_candidates(deep_candidates, turn_id=turn_id)
         if not gated_candidates:
             return self._with_anchor_outcome(
                 {
@@ -2708,7 +2752,10 @@ class SoulEngine:
         profile_rebuilt = False
         rebuild_gate_ok = (
             self._preference_changed_significantly(existing_preference, updated_preference)
-            or bool(accepted_deep_candidates)
+            or (
+                bool(deep_candidates)
+                and not self._newsclaw_personal_memory_enabled()
+            )
         ) and not (
             await self._gate_soul_rebuild(
                 trigger=_REBUILD_TRIGGER_DIALOGUE,
@@ -3886,14 +3933,15 @@ class SoulEngine:
         return age >= timedelta(days=_AUTO_VALIDATE_MIN_AGE_DAYS)
 
     def _rebuild_active_insights(self) -> list[dict[str, object]]:
-        """Insight dicts eligible to shape a soul rebuild (spec invariant 3 / F1).
+        """Return insight rows allowed to shape the current product's Soul.
 
-        Two doors in: user-confirmed (validated, confidence >= 0.75) and
-        behaviour-earned autonomy (``_hypothesis_auto_validated`` — stricter
-        bar, never available to anything the user rejected). Everything else is
-        filtered out, so a reject's next rebuild squeezes the old conclusion
-        out instead of leaving it forever.
+        NewsClaw P4 never lets the legacy hypothesis layer rebuild Soul: even a
+        previously explicit confirmation first becomes a visible P4 candidate.
+        Ordinary OpenBiliClaw preserves its historical validated and
+        behaviour-matured paths exactly.
         """
+        if self._newsclaw_personal_memory_enabled():
+            return []
         return [
             insight_hypothesis_to_dict(item)
             for item in self._load_insights()
@@ -4016,21 +4064,21 @@ class SoulEngine:
         intact rather than clobbered by this run's outcome.
         """
         current = now or datetime.now()
-        # Behaviour-earned hypotheses join the same debounced pending machine
-        # user confirmations use — same gate, same ledger, same retry bounds.
-        # _mark_rebuild_pending is idempotent for already-known refs, so
-        # re-scanning at every checkpoint cannot extend the debounce.
-        try:
-            auto_refs = sorted(
-                f"{_AUTO_HYPOTHESIS_REF_PREFIX}"
-                f"{hashlib.sha1(item.hypothesis.encode('utf-8')).hexdigest()[:12]}"
-                for item in self._load_insights()
-                if self._hypothesis_auto_validated(item, now=current)
-            )
-            if auto_refs:
-                await self._mark_rebuild_pending(auto_refs)
-        except Exception:
-            logger.debug("auto-validated hypothesis scan failed", exc_info=True)
+        if not self._newsclaw_personal_memory_enabled():
+            # Preserve OpenBiliClaw's behaviour-earned autonomy. NewsClaw P4
+            # intentionally omits this scan because system inference can only
+            # become durable personal memory through the visible accept flow.
+            try:
+                auto_refs = sorted(
+                    f"{_AUTO_HYPOTHESIS_REF_PREFIX}"
+                    f"{hashlib.sha1(item.hypothesis.encode('utf-8')).hexdigest()[:12]}"
+                    for item in self._load_insights()
+                    if self._hypothesis_auto_validated(item, now=current)
+                )
+                if auto_refs:
+                    await self._mark_rebuild_pending(auto_refs)
+            except Exception:
+                logger.debug("auto-validated hypothesis scan failed", exc_info=True)
 
         async with self._rebuild_pending_lock:
             if self._rebuild_running:
@@ -4090,6 +4138,11 @@ class SoulEngine:
         ``accept`` (rebuilt), ``refusal`` (gate downgrade/reject, real verdict),
         or ``error`` (gate is_error, or a build exception).
         """
+        if self._newsclaw_personal_memory_enabled():
+            # Clear any marker left by a pre-P4 runtime without invoking the
+            # legacy Soul rebuild. P4 acceptance writes to its own memory table.
+            return "accept"
+
         preference = dict(self._memory.get_layer("preference").data)
         existing_profile = dict(self._memory.get_layer("soul").data)
         insights = self._load_insights()
@@ -4771,6 +4824,7 @@ class SoulEngine:
                     # so it counts as a user verdict — a later insight pass must
                     # not talk its confidence down.
                     user_verdict="confirmed",
+                    verdict_source="dialogue_anchor",
                 )
                 existing.append(hypothesis)
                 by_text[normalized] = hypothesis
@@ -4782,6 +4836,9 @@ class SoulEngine:
                     changed = True
                 if hypothesis.user_verdict != "confirmed":
                     hypothesis.user_verdict = "confirmed"
+                    changed = True
+                if hypothesis.verdict_source != "dialogue_anchor":
+                    hypothesis.verdict_source = "dialogue_anchor"
                     changed = True
                 if hypothesis.confidence != next_confidence:
                     hypothesis.confidence = next_confidence
@@ -5202,13 +5259,7 @@ class SoulEngine:
         *,
         turn_id: str | None = None,
     ) -> None:
-        """Persist gate-accepted deep self-statements as validated hypotheses.
-
-        First-person statements carry ``user_verdict="confirmed"`` — the user
-        said it themselves, in their own words, and the posture gate already
-        judged it consistent. Merged through ``merge_insights`` so a repeated
-        statement reinforces one row instead of duplicating.
-        """
+        """Preserve OpenBiliClaw's confirmed deep-self-statement fast lane."""
         hypotheses: list[InsightHypothesis] = []
         for item in candidates:
             content = str(item.get("content", "")).strip()
@@ -5242,6 +5293,112 @@ class SoulEngine:
             )
         except Exception:
             logger.warning("deep self-statement persistence failed", exc_info=True)
+
+    def _persist_pending_personal_memory_candidates(
+        self,
+        candidates: list[dict[str, object]],
+        *,
+        turn_id: str | None = None,
+    ) -> None:
+        """Persist NewsClaw deep self-statements as pending P4 candidates."""
+        persisted = 0
+        source_refs: list[str] = []
+        for item in candidates:
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            evidence_text = str(item.get("evidence", "")).strip()
+            kind = str(item.get("kind", "state")).strip().lower() or "state"
+            source_material = str(turn_id or "").strip() or f"{kind}\0{content}\0{evidence_text}"
+            source_suffix = hashlib.sha256(source_material.encode()).hexdigest()[:24]
+            source_ref = f"chat:{source_suffix}"
+            source_refs.append(source_ref)
+            try:
+                _candidate, created = self._memory._database.propose_personal_memory_candidate(
+                    proposed_kind="confirmed_fact",
+                    title=f"{kind} · {content[:48]}",
+                    content=content,
+                    proposal_reason="对话中出现可能值得长期记住的信息，等待用户确认",
+                    source_type="chat",
+                    source_ref=source_ref,
+                    confidence=_clamp_init_draft_confidence(item.get("confidence", 0.8)),
+                    evidence=[
+                        {
+                            "type": "chat",
+                            "ref": source_ref,
+                            "excerpt": evidence_text[:500] or content[:500],
+                        }
+                    ],
+                )
+                persisted += int(created)
+            except Exception:
+                logger.warning("deep self-statement candidate persistence failed", exc_info=True)
+        if persisted:
+            self._ledger.record(
+                write_point="dialogue_deep_selfstatement_candidate",
+                source="chat",
+                after={
+                    "count": persisted,
+                    "kinds": sorted({str(c.get("kind", "")) for c in candidates}),
+                },
+                source_refs=source_refs,
+                turn_id=turn_id or "",
+            )
+
+    @staticmethod
+    def _newsclaw_personal_memory_enabled() -> bool:
+        return newsclaw_mode_enabled()
+
+    def _propose_insight_personal_memory_candidate(
+        self,
+        insight: InsightHypothesis,
+    ) -> bool:
+        """Mirror an explicitly confirmed legacy insight into P4 for review.
+
+        Even an old explicit Insight confirmation remains system inference in
+        the new product boundary. It becomes a visible pending candidate, never
+        an automatically active P4 item.
+        """
+
+        if not self._newsclaw_personal_memory_enabled():
+            return False
+        hypothesis = str(insight.hypothesis or "").strip()
+        if not hypothesis:
+            return False
+        source_ref = f"insight:{hashlib.sha256(hypothesis.encode()).hexdigest()[:24]}"
+        evidence = [str(value).strip() for value in insight.evidence if str(value).strip()]
+        try:
+            _candidate, created = self._memory._database.propose_personal_memory_candidate(
+                proposed_kind="confirmed_fact",
+                title=f"系统洞察 · {hypothesis[:48]}",
+                content=hypothesis,
+                proposal_reason="旧画像中有一条由你明确确认过的系统洞察，等待迁入个人记忆",
+                source_type="system_inference",
+                source_ref=source_ref,
+                confidence=max(0.0, min(1.0, float(insight.confidence))),
+                evidence=[
+                    {
+                        "type": "insight",
+                        "ref": source_ref,
+                        "excerpt": (evidence[0] if evidence else hypothesis)[:500],
+                    }
+                ],
+            )
+        except Exception:
+            logger.warning("legacy insight candidate persistence failed", exc_info=True)
+            return False
+        return bool(created)
+
+    def sync_personal_memory_insight_candidates(self) -> int:
+        """Backfill only explicitly sourced legacy confirmations as P4 candidates."""
+
+        if not self._newsclaw_personal_memory_enabled():
+            return 0
+        created = 0
+        for insight in self._load_insights():
+            if insight_is_confirmed_memory(insight):
+                created += int(self._propose_insight_personal_memory_candidate(insight))
+        return created
 
     def _persist_downgraded_insights(self, insights: list[InsightHypothesis]) -> None:
         existing = self._load_insights()

@@ -149,6 +149,18 @@ canonical owner；`discovery.strategies._utils` 的同名符号仅用于旧调�
 > 新增携带画像的 prompt 前先查 [画像使用登记表](../profile-usage.md)，并复用本模块
 > 的 view，不要自建序列化器。
 
+### NewsClaw P4：系统推断与用户确认分离
+
+在 NewsClaw 模式中，Soul 五层仍可形成“系统怎样理解用户”的推断，但不能把推断冒充
+成个人记忆。用户对旧 insight 点确认时，系统只生成一个带来源的 P4 待确认候选：不再
+同步进 Soul 快照、不标记画像重建，也不让旧 `active_insights` 进入聊天、推荐或
+`SoulProfile/OnionProfile.to_llm_context()`。行为成熟、模型高置信、`validated=True` 与
+来源未知的旧 verdict 同样不能绕过候选确认。
+
+对话中的 goal/value/state 在 NewsClaw 模式也只形成待确认个人记忆候选；接受前不触发
+同轮 Soul 重建。普通 OpenBiliClaw 模式继续保留既有深层对话快线、行为成熟假设、画像
+重建和旧洞察序列化，P4 不改变其行为。
+
 ## 猜测兴趣系统 (Speculative Interest Lifecycle)
 
 系统会主动探索用户可能感兴趣但尚未接触的领域。通过心理学桥接推理，从已有兴趣模式中推断新方向。

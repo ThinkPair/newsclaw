@@ -35,6 +35,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -307,7 +309,11 @@ def _chat_dict_list(value: object) -> list[dict[str, object]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
+def chat_core_memory(
+    core_memory: Mapping[str, object],
+    *,
+    newsclaw_mode: bool = False,
+) -> ChatCoreMemory:
     """Render the chat core-memory dict into stable + volatile prompt blocks.
 
     Consumes the ``MemoryManager.get_core_memory()`` shape (``soul_summary`` /
@@ -325,7 +331,15 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
     soul = _chat_mapping(core_memory.get("soul_summary"))
     preference = _chat_mapping(core_memory.get("preference_summary"))
     recent_awareness = _chat_dict_list(core_memory.get("recent_awareness"))
-    active_insights = _chat_dict_list(core_memory.get("active_insights"))
+    active_insights = (
+        [] if newsclaw_mode else _chat_dict_list(core_memory.get("active_insights"))
+    )
+    confirmed_facts = (
+        _chat_dict_list(core_memory.get("confirmed_facts")) if newsclaw_mode else []
+    )
+    research_directions = (
+        _chat_dict_list(core_memory.get("research_directions")) if newsclaw_mode else []
+    )
 
     top_interests = _chat_dict_list(preference.get("top_interests"))
     disliked_topics = _chat_str_list(preference.get("disliked_topics"))
@@ -333,14 +347,22 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
 
     has_soul = any(soul.values())
     has_preference = bool(top_interests or disliked_topics or favorite_up_users)
-    if not has_soul and not has_preference and not recent_awareness and not active_insights:
+    if (
+        not has_soul
+        and not has_preference
+        and not recent_awareness
+        and not active_insights
+        and not confirmed_facts
+        and not research_directions
+    ):
         return ChatCoreMemory(stable_block=_CHAT_EMPTY_PROFILE, volatile_block="")
 
     stable_sections: list[str] = []
 
     portrait = soul.get("personality_portrait")
     if portrait:
-        stable_sections.append(f"## 用户画像\n{portrait}")
+        portrait_heading = "系统推断画像（非用户确认事实）" if newsclaw_mode else "用户画像"
+        stable_sections.append(f"## {portrait_heading}\n{portrait}")
 
     identity_lines: list[str] = []
     core_traits = _chat_str_list(soul.get("core_traits"))
@@ -356,7 +378,8 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
     if mbti_type:
         identity_lines.append(f"MBTI: {mbti_type}")
     if identity_lines:
-        stable_sections.append("## 核心特质\n" + "\n".join(identity_lines))
+        identity_heading = "系统推断特质（非用户确认事实）" if newsclaw_mode else "核心特质"
+        stable_sections.append(f"## {identity_heading}\n" + "\n".join(identity_lines))
 
     preference_lines: list[str] = []
     if top_interests:
@@ -368,7 +391,20 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
     if favorite_up_users:
         preference_lines.append(f"常看UP主: {', '.join(favorite_up_users)}")
     if preference_lines:
-        stable_sections.append("## 偏好摘要\n" + "\n".join(preference_lines))
+        preference_heading = (
+            "系统偏好摘要（非用户确认事实）" if newsclaw_mode else "偏好摘要"
+        )
+        stable_sections.append(f"## {preference_heading}\n" + "\n".join(preference_lines))
+
+    if confirmed_facts:
+        fact_lines = []
+        for item in confirmed_facts:
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if content:
+                fact_lines.append(f"- {title + '：' if title else ''}{content}")
+        if fact_lines:
+            stable_sections.append("## 用户明确确认的个人记忆\n" + "\n".join(fact_lines))
 
     volatile_sections: list[str] = []
     if recent_awareness:
@@ -376,7 +412,10 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
             f"- [{item.get('date', '')}] {item.get('observation', '')}".strip()
             for item in recent_awareness
         )
-        volatile_sections.append(f"## 近期观察\n{awareness_text}")
+        awareness_heading = (
+            "系统近期观察（非用户确认事实）" if newsclaw_mode else "近期观察"
+        )
+        volatile_sections.append(f"## {awareness_heading}\n{awareness_text}")
     if active_insights:
         insights_text = "\n".join(
             f"- {item.get('hypothesis', '')} "
@@ -384,6 +423,15 @@ def chat_core_memory(core_memory: Mapping[str, object]) -> ChatCoreMemory:
             for item in active_insights
         )
         volatile_sections.append(f"## 当前洞察\n{insights_text}")
+    if research_directions:
+        research_lines = []
+        for item in research_directions:
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if content:
+                research_lines.append(f"- {title + '：' if title else ''}{content}")
+        if research_lines:
+            volatile_sections.append("## 用户当前研究方向\n" + "\n".join(research_lines))
 
     return ChatCoreMemory(
         stable_block="\n\n".join(stable_sections),
@@ -667,6 +715,8 @@ def _summarize_recent_awareness(profile: SoulProfile) -> list[dict[str, str]]:
 
 
 def _summarize_active_insights(profile: SoulProfile) -> list[dict[str, object]]:
+    if newsclaw_mode_enabled():
+        return []
     insights: list[dict[str, object]] = []
     # Chronological window: newest insights are at the tail.
     for insight in profile.active_insights[-30:]:

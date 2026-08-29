@@ -55,7 +55,7 @@ NewsClaw judgment workbench
                   ├─ corroboration → stronger evidence, no duplicate unread
                   ├─ mutually exclusive outcome → contested ledger + frozen current state
                   └─ expectation / sentiment / analysis → secondary, excluded from objective feed
-             Phase 4 desktop event workspace
+             Phase 3 desktop event dossier
                   ├─ /api/news/events + /summary → inbox, unread/conflict/topic truth
                   ├─ is_state_applied safe change set → change pulse; scalar current_state → reachable chain
                   ├─ evidence/conflict pagination + idempotent read actions
@@ -65,6 +65,14 @@ NewsClaw judgment workbench
                   └─ analysis + unconfirmed + provisional; excluded from objective feed
              restart-safe origin/fact/identity repair → aliases + revalidated evidence depth
              (no automatic Tavily call; no profile-learning event)
+
+NewsClaw Phase 4 personal memory (separate from inferred Soul profile)
+        ├─ manual user entry ───────────────────────────────→ confirmed_fact / research_direction
+        ├─ behaviour / chat / legacy Soul → sourced pending candidate
+        │                                      ├─ explicit accept/edit+accept → active memory
+        │                                      └─ explicit reject → durable rejection
+        ├─ expected_version + request_id → atomic state + revision + minimal receipt
+        └─ edit / soft delete / restore → same stable identity + append-only local history
 
 migration control plane (real loopback; browser calls also require same origin)
                 ├─ export → config minus api.auth + online SQLite snapshot + portable files → checksummed plaintext .obcbackup
@@ -252,6 +260,16 @@ cookie 补 `Secure`，并把已验证的 Web Origin 做最小 `https→http` 适
 - 事件、变化、证据成员或跟踪状态的写入都会提升 `news_event_inbox_revision`。事件收件箱 v3 keyset 游标同时绑定筛选条件摘要、排序位置与 revision；长主题只进入 SHA-256 摘要而不膨胀游标。续页发现 revision 变化时 fail closed 返回 409，让客户端回到首屏重取
 - 桌面端采用事件收件箱、变化脉搏和证据抽屉的主从布局；证据与争议有界分页，标记已读复用后端幂等写入口；窄屏一次只显示收件箱或详情，不建立客户端副本
 - 预测、市场情绪、AI 推断和无法通过本地证据门的记录仍只属于审计/次级账本，事件工作台不得把它们投影为客观主流
+
+### NewsClaw personal memory (`api/personal_memory_routes.py`, `storage/database.py`, `web/desktop/`)
+
+- 与五层 Soul/画像隔离：Soul 保留系统推断语义，个人记忆只保存用户主动写入或明确接受的长期信息与当前研究
+- 内部 producer 只能提出带来源的 pending candidate；没有公开候选创建 API，旧 `validated` 或来源不明 verdict 不会迁移成 confirmed
+- `personal_memory_items/candidates/revisions/requests` 在一个 SQLite 事务完成版本校验、状态变化、审计历史和最小幂等收据；删除后按同一 identity 恢复，不重建平行记录
+- 桌面端四个 hash 面板只读取后端真值，支持新增、修改、软删除、候选接受/否定、历史恢复；超时先核账，409 刷新，不做乐观假成功
+- 消费严格分流：活动长期信息只进入显式对话调用，活动当前研究只进入推荐评估/表达；通用 LLM、探测、画像和 Soul 重建不接收 P4 数据
+- NewsClaw 模式移除旧 Soul 洞察的聊天/推荐/重建隐藏通道；普通 OpenBiliClaw 保留原行为。页面查看和本地管理不触发外部模型，删除后下一次对应调用失效
+- P5 网页/PDF 监控与可靠通知不属于本模块
 
 ### Saved Sync (`saved_sync/`)
 - `NativeSaveRouter` 根据 adapter capability 确定 favorite / watch-later 路由；watch-later 仅在平台不支持原生动作且支持 favorite 时回退

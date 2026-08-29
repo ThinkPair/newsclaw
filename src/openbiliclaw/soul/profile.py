@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -107,6 +109,38 @@ class InsightHypothesis:
     # could hand the hypothesis a high score again, silently undoing the user's
     # 「不准」and putting it back in the 待聊 list. Legacy rows load as "".
     user_verdict: str = ""
+    # Durable provenance for ``user_verdict``. Only an explicit user action may
+    # populate this field. Legacy ``validated`` rows and old ``confirmed`` rows
+    # without a source remain system inferences, never chat core memory.
+    verdict_source: str = ""
+
+
+EXPLICIT_USER_VERDICT_SOURCES = frozenset({"insight_feedback", "dialogue_anchor"})
+
+
+def insight_memory_state(item: InsightHypothesis | dict[str, object]) -> str:
+    """Return the safe user-memory state for a legacy Soul hypothesis.
+
+    ``validated`` is deliberately ignored: it was historically set by model
+    confidence and behaviour. A hypothesis becomes confirmed memory only when
+    both the user's verdict and a durable explicit-action source are present.
+    """
+    if isinstance(item, dict):
+        verdict = _as_user_verdict(item.get("user_verdict"))
+        source = _as_verdict_source(item.get("verdict_source"))
+    else:
+        verdict = _as_user_verdict(item.user_verdict)
+        source = _as_verdict_source(item.verdict_source)
+    if verdict == "rejected":
+        return "rejected"
+    if verdict == "confirmed" and source in EXPLICIT_USER_VERDICT_SOURCES:
+        return "confirmed"
+    return "pending"
+
+
+def insight_is_confirmed_memory(item: InsightHypothesis | dict[str, object]) -> bool:
+    """Whether a legacy Soul hypothesis may enter chat core memory."""
+    return insight_memory_state(item) == "confirmed"
 
 
 @dataclass
@@ -174,9 +208,10 @@ class SoulProfile:
         if self.deep_needs:
             parts.append(f"## 深层需求\n{', '.join(self.deep_needs)}")
 
-        if self.active_insights:
+        context_insights = [] if newsclaw_mode_enabled() else self.active_insights
+        if context_insights:
             insights_text = "\n".join(
-                f"- {i.hypothesis} (置信度: {i.confidence:.0%})" for i in self.active_insights
+                f"- {i.hypothesis} (置信度: {i.confidence:.0%})" for i in context_insights
             )
             parts.append(f"## 当前洞察\n{insights_text}")
 
@@ -437,6 +472,7 @@ def insight_hypothesis_to_dict(item: InsightHypothesis) -> dict[str, object]:
         "validated": item.validated,
         "created_at": item.created_at,
         "user_verdict": item.user_verdict,
+        "verdict_source": item.verdict_source,
     }
 
 
@@ -448,6 +484,7 @@ def insight_hypothesis_from_dict(raw_data: dict[str, object]) -> InsightHypothes
         validated=bool(raw_data.get("validated", False)),
         created_at=str(raw_data.get("created_at", "")),
         user_verdict=_as_user_verdict(raw_data.get("user_verdict")),
+        verdict_source=_as_verdict_source(raw_data.get("verdict_source")),
     )
 
 
@@ -455,6 +492,12 @@ def _as_user_verdict(raw_value: object) -> str:
     """Whitelist the stored verdict; anything unexpected means 'never judged'."""
     verdict = str(raw_value or "").strip().lower()
     return verdict if verdict in {"confirmed", "rejected"} else ""
+
+
+def _as_verdict_source(raw_value: object) -> str:
+    """Whitelist explicit user-action provenance; legacy values stay pending."""
+    source = str(raw_value or "").strip().lower()
+    return source if source in EXPLICIT_USER_VERDICT_SOURCES else ""
 
 
 def _as_list(raw_value: object) -> list[object]:
@@ -892,9 +935,10 @@ class OnionProfile:
                 for s in speculations[:5]
             ]
             parts.append("## 猜测兴趣（待验证）\n" + "\n".join(spec_lines))
-        if self.active_insights:
+        context_insights = [] if newsclaw_mode_enabled() else self.active_insights
+        if context_insights:
             insights_text = "\n".join(
-                f"- {i.hypothesis} (置信度: {i.confidence:.0%})" for i in self.active_insights
+                f"- {i.hypothesis} (置信度: {i.confidence:.0%})" for i in context_insights
             )
             parts.append(f"## 当前洞察\n{insights_text}")
         if self.recent_awareness:

@@ -350,6 +350,31 @@ def test_degraded_mode_allows_llm_independent_repair_surfaces(
     assert repair_status_response.status_code != 503
 
 
+def test_degraded_newsclaw_keeps_local_personal_memory_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    _save_project_config(monkeypatch, tmp_path, _invalid_config(tmp_path))
+    client = TestClient(create_app())
+
+    dashboard = client.get("/api/personal-memory")
+    created = client.post(
+        "/api/personal-memory/items",
+        json={
+            "kind": "confirmed_fact",
+            "title": "离线边界",
+            "content": "模型配置损坏时仍能管理本机记忆",
+            "request_id": "degraded-personal-memory-create",
+        },
+    )
+
+    assert dashboard.status_code == 200
+    assert created.status_code == 200
+    assert created.json()["item"]["content"] == "模型配置损坏时仍能管理本机记忆"
+
+
 def test_degraded_mode_allows_draft_llm_recovery_probes_and_model_discovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

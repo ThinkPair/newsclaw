@@ -324,7 +324,7 @@ NewsClaw judgment workbench
                   ├─ corroboration → evidence upgrade, no duplicate unread
                   ├─ mutually exclusive outcome → contested ledger + frozen current state
                   └─ expectation / sentiment / analysis → secondary, not objective feed
-             Phase 4 desktop event workspace
+             Phase 3 desktop event dossier
                   ├─ event inbox + global summary → unread/conflict/topic truth
                   ├─ applied objective chain → current pulse; audit view → retained branches
                   ├─ evidence drawer + conflict pagination + idempotent read actions
@@ -333,6 +333,12 @@ NewsClaw judgment workbench
                   └─ analysis + unconfirmed + provisional; excluded from objective feed
              restart-safe origin/fact/identity repair → aliases + revalidated evidence depth
              (no automatic Tavily call; no profile-learning event)
+
+NewsClaw Phase 4 personal memory (local and user-controlled)
+        ├─ explicit user entry → confirmed fact / current research → active memory
+        ├─ system inference → sourced pending candidate → user accept / reject
+        ├─ edit / soft-delete / restore → immutable revision history
+        └─ stable request id + expected version → idempotent write / conflict response
 
 config recovery control plane (normal or degraded; business APIs stay gated)
                 ├─ draft → /api/config/probe-service → temporary registry → total gate
@@ -404,6 +410,23 @@ reshuffle HTTP → temporal review-hold / expiry retirement → PoolServeSnapsho
 pool maintenance → isolated maintenance DB worker → ≤50 mutations/transaction
                  → commit/release lock → unchanged skip / 10m safety sweep
 ```
+
+Phase 4 personal memory is deliberately separate from the five-layer Soul
+profile. Soul remains the system's evidence-backed inference about the user;
+personal memory contains only facts and research directions the user typed or
+explicitly accepted. Algorithmic `validated` state, model confidence, repeated
+behaviour, or a legacy source-less `confirmed` verdict can never promote an
+item into user-confirmed memory. Rejected candidates remain rejected, and all
+changes remain recoverable through the local revision ledger.
+
+Active memory has a strict consumer map: `confirmed_fact` is available only to
+explicit dialogue/tool-dialogue calls, while `research_direction` is available
+only to recommendation evaluation and copy generation. Generic evaluation,
+probes, profile generation, and Soul rebuilds receive neither. Page viewing and
+local CRUD do not call an external model; every relevant call reads the current
+active rows, so deletion takes effect without a restart. NewsClaw removes legacy
+Soul-insight injection paths, while ordinary OpenBiliClaw keeps its pre-P4
+behaviour.
 
 对话回复与其后的 11-kind learning/settlement 是相邻但独立的 lane：Web/API durable runtime
 先由 app-owned 单 worker 按 `chat_turns.rowid` 领取 pending，再在稳定

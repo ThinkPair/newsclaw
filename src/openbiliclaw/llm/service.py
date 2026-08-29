@@ -411,7 +411,12 @@ class LLMService:
             return normalized
         return f"{normalized}\n\njson" if normalized else "json"
 
-    def _core_memory_blocks(self, inject_core_memory: bool) -> tuple[str, str]:
+    def _core_memory_blocks(
+        self,
+        inject_core_memory: bool,
+        *,
+        inject_personal_memory: bool = False,
+    ) -> tuple[str, str]:
         """Return ``(stable_block, volatile_block)`` for core-memory injection.
 
         The stable block (portrait / identity / preference) goes into the system
@@ -431,12 +436,33 @@ class LLMService:
             return "", ""
         blocks_fn = getattr(self.memory, "render_core_memory_blocks", None)
         if callable(blocks_fn):
-            with suppress(Exception):
-                stable, volatile = blocks_fn()
+            try:
+                if inject_personal_memory:
+                    try:
+                        stable, volatile = blocks_fn(include_personal_memory=True)
+                    except TypeError:
+                        # Lightweight pre-P4 test doubles may expose the old
+                        # zero-argument renderer. Keep that compatibility seam;
+                        # the real MemoryManager supports the scoped flag.
+                        stable, volatile = blocks_fn()
+                else:
+                    stable, volatile = blocks_fn()
                 return str(stable), str(volatile)
-            return "", ""
-        with suppress(Exception):
-            return str(self.memory.render_core_memory_prompt()), ""
+            except Exception:
+                return "", ""
+        try:
+            if inject_personal_memory:
+                try:
+                    rendered = self.memory.render_core_memory_prompt(
+                        include_personal_memory=True
+                    )
+                except TypeError:
+                    rendered = self.memory.render_core_memory_prompt()
+            else:
+                rendered = self.memory.render_core_memory_prompt()
+            return str(rendered), ""
+        except Exception:
+            pass
         return "", ""
 
     @staticmethod
@@ -464,6 +490,7 @@ class LLMService:
         reasoning_effort: str | None = None,
         bypass_semaphore: bool = False,
         inject_core_memory: bool = True,
+        inject_personal_memory: bool = False,
     ) -> LLMResponse:
         """Execute a task with automatically injected core memory context.
 
@@ -485,7 +512,10 @@ class LLMService:
         ``user_input``. This keeps provider-side prompt-cache prefixes
         stable without changing the information available to the task.
         """
-        stable_block, volatile_block = self._core_memory_blocks(inject_core_memory)
+        stable_block, volatile_block = self._core_memory_blocks(
+            inject_core_memory,
+            inject_personal_memory=inject_personal_memory,
+        )
         parts = [system_instruction.strip()]
         if stable_block:
             parts.append("以下是当前用户的 core memory，请作为理解背景：")
@@ -777,6 +807,7 @@ class LLMService:
             json_mode=False,
             caller=caller,
             bypass_semaphore=bypass_semaphore,
+            inject_personal_memory=True,
         )
 
         # Try to parse tool calls from the response
@@ -819,6 +850,7 @@ class LLMService:
             user_input=user_message,
             history=history,
             caller=caller,
+            inject_personal_memory=True,
         )
 
     def _build_dialogue_tone_profile(self) -> ToneProfile:

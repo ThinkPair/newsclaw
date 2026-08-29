@@ -137,6 +137,20 @@ fresh servable pool predicate，并可按 embedding fingerprint、正维度和 s
 重排。`user_visual_clusters`、keyframe 状态和 danmaku 状态均保留 provenance；旧库初始化会
 增量补列，旧的无 provenance 行不会被当作当前 embedding namespace 的完成结果。
 
+### NewsClaw P4 个人记忆账本
+
+主 SQLite schema v8 新增四张表：`personal_memory_items` 保存活动/软删除的长期信息与
+研究方向，`personal_memory_candidates` 保存待确认及已裁决候选，
+`personal_memory_revisions` 保存不可变版本历史，`personal_memory_requests` 保存最小
+幂等收据。迁移只增表/索引，不改写旧事件、推荐、画像或内容行；重复初始化幂等。
+
+新增、编辑、软删除、恢复、接受和拒绝都在单一 `BEGIN IMMEDIATE` 事务中完成业务状态、
+revision 与 request receipt 写入，并校验稳定 `request_id`、对象 `expected_version` 和候选
+版本。接受候选若命中已有 claim，第一次只返回 merge-required 目标；第二次必须提交精确
+`target_memory_id + expected_memory_version`。证据字段按白名单清洗，本机路径、凭据名、
+带 token 的 URL query/fragment 不落库。所有 P4 表在普通 OpenBiliClaw 模式下保持惰性，
+不会改变旧读写路径。
+
 ## 公开 API
 
 ### NewsClaw event inbox and applied-state projection

@@ -138,7 +138,9 @@ def test_news_event_routes_are_only_registered_in_newsclaw_mode(
 
     app = create_app(database=database, memory_manager=object(), soul_engine=object())
 
-    assert "/api/news/changes" not in {route.path for route in app.routes}
+    route_paths = {route.path for route in app.routes}
+    assert "/api/news/changes" not in route_paths
+    assert "/api/personal-memory" not in route_paths
 
 
 def test_objective_feed_excludes_expectations_and_internal_interpretation(

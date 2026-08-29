@@ -12,6 +12,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
 from openbiliclaw.sources.event_format import default_signal_strength_for_event
 from openbiliclaw.storage.database import Database, EventInsertResult
 
@@ -708,7 +709,11 @@ class MemoryManager:
         effective = apply_overrides(OnionProfile.from_dict(soul_data), overrides)
         return effective.to_dict()
 
-    def get_core_memory(self) -> dict[str, Any]:
+    def get_core_memory(
+        self,
+        *,
+        include_personal_memory: bool = False,
+    ) -> dict[str, Any]:
         """Get core memory for LLM context injection.
 
         Core memory includes the Soul layer and a summary of the Preference layer.
@@ -722,6 +727,12 @@ class MemoryManager:
         preference = self._layers["preference"].data
         awareness = self._layers["awareness"].data.get("notes", [])
         insights = self._layers["insight"].data.get("hypotheses", [])
+        newsclaw_mode = newsclaw_mode_enabled()
+        confirmed_facts = (
+            self._personal_memory_prompt_items("confirmed_fact")
+            if newsclaw_mode and include_personal_memory
+            else []
+        )
 
         # Support both onion format (nested "core" key) and legacy flat format
         is_onion = "core" in soul and isinstance(soul.get("core"), dict)
@@ -789,14 +800,25 @@ class MemoryManager:
                 "favorite_up_users": self._as_str_list(preference.get("favorite_up_users", []))[:5],
             }
 
-        return {
+        core_memory = {
             "soul_summary": soul_summary,
             "preference_summary": preference_summary,
             "recent_awareness": self._recent_awareness(awareness),
-            "active_insights": self._active_insights(insights),
+            # NewsClaw P4 has one user-controlled memory surface. Legacy Soul
+            # insights remain system inference and are converted into pending
+            # candidates by SoulEngine; they must not form a hidden second
+            # long-term-memory channel in the NewsClaw chat prompt.
+            "active_insights": [] if newsclaw_mode else self._active_insights(insights),
         }
+        if newsclaw_mode and include_personal_memory:
+            core_memory["confirmed_facts"] = confirmed_facts
+        return core_memory
 
-    def render_core_memory_blocks(self) -> tuple[str, str]:
+    def render_core_memory_blocks(
+        self,
+        *,
+        include_personal_memory: bool = False,
+    ) -> tuple[str, str]:
         """Render core memory into a ``(stable_block, volatile_block)`` pair.
 
         ``stable_block`` (portrait / identity / preference) is prompt-cache-safe
@@ -807,10 +829,18 @@ class MemoryManager:
         """
         from openbiliclaw.soul.profile_views import chat_core_memory
 
-        blocks = chat_core_memory(self.get_core_memory())
+        newsclaw_mode = newsclaw_mode_enabled()
+        blocks = chat_core_memory(
+            self.get_core_memory(include_personal_memory=include_personal_memory),
+            newsclaw_mode=newsclaw_mode,
+        )
         return blocks.stable_block, blocks.volatile_block
 
-    def render_core_memory_prompt(self) -> str:
+    def render_core_memory_prompt(
+        self,
+        *,
+        include_personal_memory: bool = False,
+    ) -> str:
         """Render core memory into a single prompt string (stable + volatile).
 
         Retained for non-chat readers and backward compatibility: the LLM service
@@ -818,7 +848,9 @@ class MemoryManager:
         volatile → user), but callers that want the concatenated block still get
         the same section set as before.
         """
-        stable_block, volatile_block = self.render_core_memory_blocks()
+        stable_block, volatile_block = self.render_core_memory_blocks(
+            include_personal_memory=include_personal_memory
+        )
         parts = [part for part in (stable_block, volatile_block) if part]
         return "\n\n".join(parts) if parts else "（尚未建立完整画像）"
 
@@ -899,6 +931,43 @@ class MemoryManager:
             key=lambda item: self._to_float(item.get("weight", 0.0)),
             reverse=True,
         )[:5]
+
+    def _personal_memory_prompt_items(
+        self,
+        kind: str,
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, str]]:
+        """Return a bounded active P4 projection for model context.
+
+        Only user-created or explicitly accepted rows can exist in the active
+        item table. The projection omits evidence, source references and stable
+        identifiers; it is re-read for every context build so edits and deletes
+        take effect immediately.
+        """
+
+        list_items = getattr(self._database, "list_personal_memory_items", None)
+        if not callable(list_items):
+            return []
+        try:
+            rows = list_items(kind=kind, status="active", limit=max(1, min(limit, 12)))
+        except Exception:
+            logger.warning("personal memory prompt projection failed", exc_info=True)
+            return []
+        projected: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = " ".join(str(row.get("content") or "").split()).strip()[:600]
+            if not content:
+                continue
+            projected.append(
+                {
+                    "title": " ".join(str(row.get("title") or "").split()).strip()[:120],
+                    "content": content,
+                }
+            )
+        return projected
 
     @staticmethod
     def _recent_awareness(raw_value: object) -> list[dict[str, object]]:

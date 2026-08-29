@@ -151,7 +151,7 @@ remain `analysis / unconfirmed / provisional / partial_legacy` and stay out of
 the objective feed. This module adds no new collector, Tavily call or profile
 mutation.
 
-### Phase 4 event workspace projection
+### Phase 3 event dossier projection
 
 The event workspace is a read projection over the Phase 3 ledger, not another
 news ingestion pipeline. `GET /api/news/events` joins each event to its latest
@@ -169,11 +169,21 @@ tracked-observation mutations advance that revision. A stale continuation is a
 inconsistent page. `/api/news/events/summary` is deliberately separate so the
 global badge is not narrowed by a local inbox filter.
 
-Desktop Web is the implemented Phase 4 surface. Wide layouts show inbox and
+Desktop Web is the implemented Phase 3 dossier surface. Wide layouts show inbox and
 selected event together; narrow layouts switch between master and detail. The
 evidence drawer, audit toggle, pagination and idempotent read controls use the
 same API contracts. Mobile/PWA, the browser extension and DSH do not introduce
 a separate event workspace in this phase.
+
+### Phase 4 personal-memory boundary
+
+Personal memory is not a second news ledger and does not change event truth.
+News articles, tracking changes, expectations, sentiment, and AI analysis may
+only provide bounded provenance for a pending candidate. They cannot write an
+active `confirmed_fact` or `research_direction`, update Soul, mark a news change
+objective, or trigger Tavily. User acceptance is handled by the dedicated
+personal-memory API/storage module. The news module therefore exposes no public
+candidate-creation endpoint and does not duplicate personal-memory state.
 
 ### From-zero onboarding
 
@@ -221,7 +231,7 @@ NewsSourceAdapter -> SourceRunner -> Article[] -> SemanticDeduplicator
                     (SQLite)
 
 completed tracking change -> Phase 3 event projection -> applied objective chain
-                                                       -> Phase 4 desktop workspace
+                                                       -> Phase 3 desktop dossier
 ```
 
 From-zero initialization adds one explicit step before this flow:

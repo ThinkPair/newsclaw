@@ -4,6 +4,37 @@
 
 `src/openbiliclaw/api/` 暴露本地 FastAPI 契约，并把 UI 请求编排到 durable storage、Soul、Dialogue 与 runtime。本文记录配置、迁移、推荐和对话等公开端点；通用鉴权见 [api-auth.md](api-auth.md)，初始化端点见 [init.md](init.md)。
 
+## NewsClaw P4 个人记忆 API
+
+这些端点只在 `NEWSCLAW_MODE` 注册，响应固定声明
+`contract_version="personal-memory-v1"` 与 `local_only=true`。公开响应使用显式 DTO，
+不包含内部 `claim_key`、内容指纹或幂等收据。AI/后台没有公开的候选创建端点；候选
+只能由受控的本机内部 producer 提出。
+
+| 方法与路径 | 契约 |
+|---|---|
+| `GET /api/personal-memory` | 返回长期信息、当前研究、待确认候选、最近修改记录和四区计数 |
+| `GET /api/personal-memory/history?limit=&offset=` | 有界分页读取版本记录；当前仍处于对应删除版本时返回可恢复标记 |
+| `GET /api/personal-memory/candidates/{candidate_id}` | 读取单个候选的精确终态；供写请求超时后核账，不以“列表里消失”猜测成功 |
+| `POST /api/personal-memory/items` | 用户主动新增；只接受 `confirmed_fact` 或 `research_direction`，必须带 `request_id` |
+| `PATCH /api/personal-memory/items/{memory_id}` | 用 `expected_version + request_id` 修改标题或内容 |
+| `POST /api/personal-memory/items/{memory_id}/delete` | 软删除并追加 revision，不抹去历史 |
+| `POST /api/personal-memory/items/{memory_id}/restore` | 仅按当前删除版本恢复同一稳定身份 |
+| `POST /api/personal-memory/candidates/{candidate_id}/accept` | 接受原候选，或携带修改后的 kind/title/content 再确认 |
+| `POST /api/personal-memory/candidates/{candidate_id}/reject` | 持久否定候选；同一精确候选不会再次进入 pending |
+
+所有写操作把业务状态、revision 和最小 request receipt 放在同一 SQLite 事务中。
+相同请求 ID 与相同 payload 重试会返回原结果；请求 ID 被换目标或换 payload 复用时返回
+`409 personal_memory_request_conflict`；版本过期返回
+`409 personal_memory_version_conflict`；不存在返回
+`404 personal_memory_not_found`。客户端在超时后保留同一请求 ID 并重新读取后端真值，
+不先画出一个尚未持久化的成功状态。
+
+候选接受若返回 `409 personal_memory_merge_required`，响应会携带完整
+`target_memory` 预览。客户端必须先让用户核对现有内容与准备写入内容，再以同一候选
+版本提交 `target_memory_id + expected_memory_version`；目标或版本不一致继续返回 409，
+不得静默覆盖。
+
 ## 初始化期间的配置探测
 
 `POST /api/config/probe-service` 只在内存副本上应用设置页草稿并真实探测 LLM、默认链、embedding 或网络策略，不写 `config.toml`、不热重载 runtime。它因此不受 guided init 的 HTTP 写端 409 门控；初始化运行时仍可测试，LLM 请求继续经过进程级稳定 total gate。LLM 实例 / 链探测的 outer deadline 按草稿 `[llm].timeout` 取值并夹在 10–120 秒，超时以 `ok=false` 和稳定错误文案返回；图形客户端使用 125 秒预算，覆盖本地模型冷启动而不允许无界挂起。`PUT /api/config` 仍在初始化期间返回 `409 init_running`，避免替换本轮任务正在使用的组件。

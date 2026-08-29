@@ -124,6 +124,32 @@ class FakeSplitMemoryManager:
         return "\n\n".join(part for part in (self.stable, self.volatile) if part)
 
 
+class TrackingPersonalMemoryManager:
+    """Memory double that records whether a call requested P4 user memory."""
+
+    def __init__(self) -> None:
+        self.personal_memory_flags: list[bool] = []
+
+    def render_core_memory_blocks(
+        self,
+        *,
+        include_personal_memory: bool = False,
+    ) -> tuple[str, str]:
+        self.personal_memory_flags.append(include_personal_memory)
+        personal = (
+            "\n## 用户明确确认的个人记忆\n- 事实和推断必须分开"
+            if include_personal_memory
+            else ""
+        )
+        return f"## 用户画像\nportrait{personal}", ""
+
+    def get_layer(self, _name: str):
+        return type("Layer", (), {"data": {}})()
+
+    def get_core_memory(self) -> dict[str, object]:
+        return {}
+
+
 def _safe_llm_failure_message(exc: BaseException) -> str:
     helper = getattr(llm_base, "safe_llm_failure_message", None)
     assert helper is not None, "safe_llm_failure_message() is not implemented"
@@ -630,6 +656,45 @@ async def test_complete_with_core_memory_splits_stable_into_system_volatile_into
     assert "## 近期观察" in user_content
     assert user_content.endswith("请评估这个视频。")
     assert user_content.index("## 近期观察") < user_content.index("请评估这个视频。")
+
+
+@pytest.mark.asyncio
+async def test_generic_model_call_does_not_request_p4_personal_memory() -> None:
+    registry = FakeRegistry(LLMResponse(content="ok", provider="openai"))
+    memory = TrackingPersonalMemoryManager()
+    service = LLMService(registry=registry, memory=memory)  # type: ignore[arg-type]
+
+    await service.complete_with_core_memory(
+        system_instruction="你是内容评估助手。",
+        user_input="请评估这个视频。",
+        caller="discovery.evaluate_batch",
+    )
+
+    assert memory.personal_memory_flags == [False]
+    assert "事实和推断必须分开" not in str(registry.calls[0][0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_dialogue_model_calls_explicitly_request_p4_personal_memory() -> None:
+    memory = TrackingPersonalMemoryManager()
+    registry = FakeRegistry(LLMResponse(content="继续聊。", provider="openai"))
+    service = LLMService(registry=registry, memory=memory)  # type: ignore[arg-type]
+
+    await service.complete_socratic_dialogue(
+        user_message="最近有什么变化？",
+        history=[],
+    )
+    await service.complete_with_tools(
+        system_instruction="你是对话助手。",
+        user_input="帮我查一下。",
+        tools=[],
+    )
+
+    assert memory.personal_memory_flags == [True, True]
+    assert all(
+        "事实和推断必须分开" in str(call[0]["content"])
+        for call in registry.calls
+    )
 
 
 @pytest.mark.asyncio

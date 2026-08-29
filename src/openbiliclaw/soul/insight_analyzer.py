@@ -124,6 +124,9 @@ class InsightAnalyzer:
                 merged[key] = item
                 continue
             verdict = current.user_verdict or item.user_verdict
+            verdict_source = (
+                current.verdict_source if current.user_verdict else item.verdict_source
+            )
             merged[key] = InsightHypothesis(
                 hypothesis=current.hypothesis or item.hypothesis,
                 evidence=sorted({*current.evidence, *item.evidence}),
@@ -131,6 +134,7 @@ class InsightAnalyzer:
                 validated=current.validated or item.validated,
                 created_at=current.created_at or item.created_at,
                 user_verdict=verdict,
+                verdict_source=verdict_source,
             )
         return list(merged.values())
 

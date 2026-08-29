@@ -37,6 +37,7 @@ from openbiliclaw.llm.json_utils import (
     extract_llm_json_object,
     validated_text_field,
 )
+from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
 from openbiliclaw.llm.prompt_cache import PromptLayerRenderCache, profile_prompt_layers
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
 from openbiliclaw.saved_sync.identity import content_storage_key
@@ -578,6 +579,53 @@ class RecommendationEngine:
         return self._profile_prompt_caches[cache_key].render_json_layers(
             profile_prompt_layers(profile_summary)
         )
+
+    def _profile_summary_with_personal_memory(
+        self,
+        profile: SoulProfile,
+        *,
+        interests: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Add a bounded, live P4 research projection to recommendation input.
+
+        Current research is user-controlled active memory, not inferred taste.
+        It is loaded on every evaluation/copy call so edits and deletes take
+        effect immediately. Evidence and source references never enter this
+        high-volume prompt projection.
+        """
+
+        summary = _recommendation_profile_summary(profile, interests=interests)
+        if not newsclaw_mode_enabled():
+            return summary
+        # P4 is the only user-controlled long-term input to NewsClaw's
+        # recommendation prompts. Legacy Soul insights remain system inference
+        # and must not survive here as a hidden parallel memory channel.
+        summary = dict(summary)
+        summary.pop("active_insights", None)
+        list_items = getattr(self._database, "list_personal_memory_items", None)
+        if not callable(list_items):
+            return summary
+        try:
+            rows = list_items(kind="research_direction", status="active", limit=8)
+        except Exception:
+            logger.warning("personal research prompt projection failed", exc_info=True)
+            return summary
+        research: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = " ".join(str(row.get("content") or "").split()).strip()[:400]
+            if not content:
+                continue
+            research.append(
+                {
+                    "title": " ".join(str(row.get("title") or "").split()).strip()[:120],
+                    "content": content,
+                }
+            )
+        if research:
+            summary["user_research_directions"] = research
+        return summary
 
     def _xhs_self_nickname(self) -> str:
         """Return the persisted XHS self nickname for pool guards."""
@@ -2061,7 +2109,7 @@ class RecommendationEngine:
 
         evaluated_at, _evaluation_bucket = content_evaluation_clock()
 
-        profile_data = _recommendation_profile_summary(profile)
+        profile_data = self._profile_summary_with_personal_memory(profile)
         content_items: list[dict[str, object]] = [
             {
                 "bvid": c.bvid,
@@ -3989,7 +4037,7 @@ class RecommendationEngine:
             }
             for item in batch
         ]
-        profile_summary = _recommendation_profile_summary(profile)
+        profile_summary = self._profile_summary_with_personal_memory(profile)
         messages = build_batch_expression_prompt(
             profile_summary=profile_summary,
             profile_blocks=self._profile_blocks(profile_summary, cache_key="batch_expression"),
@@ -4334,7 +4382,7 @@ class RecommendationEngine:
         # Select most relevant interests for this content via embedding similarity
         interests_for_prompt = await self._select_relevant_interests(content, profile)
 
-        profile_summary = _recommendation_profile_summary(
+        profile_summary = self._profile_summary_with_personal_memory(
             profile,
             interests=interests_for_prompt,
         )

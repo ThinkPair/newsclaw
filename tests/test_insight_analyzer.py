@@ -343,6 +343,7 @@ class TestUserVerdictSurvivesLaterAnalysis:
             confidence=0.85,
             validated=True,
             user_verdict="confirmed",
+            verdict_source="insight_feedback",
         )
         merged = self._analyzer().merge_insights(
             [confirmed], [InsightHypothesis(hypothesis="用户在自学木工", confidence=0.40)]
@@ -350,6 +351,7 @@ class TestUserVerdictSurvivesLaterAnalysis:
 
         assert merged.validated is True
         assert merged.user_verdict == "confirmed"
+        assert merged.verdict_source == "insight_feedback"
         assert merged.confidence >= 0.75, "已确认的假设不该被一次弱分析打回"
 
     def test_legacy_hypotheses_without_verdict_still_load(self) -> None:
@@ -360,3 +362,4 @@ class TestUserVerdictSurvivesLaterAnalysis:
             {"hypothesis": "旧假设", "confidence": 0.7, "validated": False}
         )
         assert item.user_verdict == ""
+        assert item.verdict_source == ""

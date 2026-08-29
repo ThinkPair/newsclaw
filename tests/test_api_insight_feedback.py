@@ -100,6 +100,17 @@ def _stored_hypothesis(memory: MemoryManager) -> dict:
     return memory.get_layer("insight").data["hypotheses"][0]
 
 
+def test_profile_summary_marks_unsourced_legacy_insight_pending(tmp_path: Path) -> None:
+    client, _memory = _build_client(tmp_path)
+
+    surfaced = _summary_insight(client)
+
+    assert surfaced["user_verdict"] == ""
+    assert surfaced["verdict_source"] == ""
+    assert surfaced["memory_state"] == "pending"
+    assert surfaced["provenance"] == "legacy_soul_inference"
+
+
 def test_insight_feedback_reject_soft_invalidates(tmp_path: Path) -> None:
     client, memory = _build_client(tmp_path)
 
@@ -114,16 +125,23 @@ def test_insight_feedback_reject_soft_invalidates(tmp_path: Path) -> None:
     assert body["matched"] is True
     assert body["validated"] is False
     assert body["confidence"] <= 0.35
+    assert body["user_verdict"] == "rejected"
+    assert body["verdict_source"] == "insight_feedback"
+    assert body["memory_state"] == "rejected"
     # Persisted: the soft-invalidation actually landed in the insight layer.
     stored = _stored_hypothesis(memory)
     assert stored["validated"] is False
     assert stored["confidence"] <= 0.35
+    assert stored["user_verdict"] == "rejected"
+    assert stored["verdict_source"] == "insight_feedback"
     # And it propagated to the soul-layer snapshot that profile-summary /
     # delight read — not just the insight layer (regression guard for the
     # gap the real-browser E2E surfaced).
     surfaced = _summary_insight(client)
     assert surfaced["confidence"] <= 0.35
     assert surfaced["validated"] is False
+    assert surfaced["memory_state"] == "rejected"
+    assert surfaced["provenance"] == "legacy_soul_inference"
     # And a feedback event was logged.
     assert memory.query_events(event_types=["feedback"])
 
@@ -141,12 +159,21 @@ def test_insight_feedback_confirm_validates_and_raises_confidence(tmp_path: Path
     assert body["matched"] is True
     assert body["validated"] is True
     assert body["confidence"] >= 0.75
+    assert body["user_verdict"] == "confirmed"
+    assert body["verdict_source"] == "insight_feedback"
+    assert body["memory_state"] == "confirmed"
     stored = _stored_hypothesis(memory)
     assert stored["validated"] is True
     assert stored["confidence"] >= 0.75
+    assert stored["user_verdict"] == "confirmed"
+    assert stored["verdict_source"] == "insight_feedback"
     surfaced = _summary_insight(client)
     assert surfaced["confidence"] >= 0.75
     assert surfaced["validated"] is True
+    assert surfaced["user_verdict"] == "confirmed"
+    assert surfaced["verdict_source"] == "insight_feedback"
+    assert surfaced["memory_state"] == "confirmed"
+    assert surfaced["provenance"] == "legacy_soul_inference"
 
 
 def test_insight_feedback_unknown_hypothesis_reports_no_match(tmp_path: Path) -> None:

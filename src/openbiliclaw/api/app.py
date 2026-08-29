@@ -2628,6 +2628,11 @@ def create_app(
             or path == "/api/health"
             or path == "/api/runtime-status"
             or (path == "/api/content-history" and method == "GET")
+            # Personal memory is a local SQLite control surface. Reading,
+            # editing, accepting or rejecting it does not require an LLM
+            # registry, so a broken model configuration must not lock the user
+            # out of their own durable memory.
+            or (newsclaw_mode and path.startswith("/api/personal-memory"))
             or path == "/favicon.ico"
             or path == "/api/autostart-status"
             or path == "/api/autostart/apply"
@@ -7413,6 +7418,7 @@ def create_app(
             StylePreferenceOut,
         )
         from openbiliclaw.soul.avoidance_speculator import load_avoidance_state
+        from openbiliclaw.soul.profile import insight_memory_state
         from openbiliclaw.soul.speculator import load_speculative_state
 
         prefs = profile.preferences
@@ -7607,6 +7613,9 @@ def create_app(
                 confidence=float(getattr(ins, "confidence", 0.5)),
                 validated=bool(getattr(ins, "validated", False)),
                 created_at=str(getattr(ins, "created_at", "")),
+                user_verdict=str(getattr(ins, "user_verdict", "")),
+                verdict_source=str(getattr(ins, "verdict_source", "")),
+                memory_state=insight_memory_state(ins),
             )
             for ins in getattr(profile, "active_insights", [])[:6]
             if str(getattr(ins, "hypothesis", "")).strip()
@@ -13625,6 +13634,9 @@ def create_app(
             signal=str(result.get("signal", action)),
             validated=bool(result.get("validated", False)),
             confidence=float(result.get("confidence", 0.0)),
+            user_verdict=str(result.get("user_verdict", "")),
+            verdict_source=str(result.get("verdict_source", "")),
+            memory_state=str(result.get("memory_state", "pending")),
         )
 
     # ── Source recipe management endpoints ──────────────────────────

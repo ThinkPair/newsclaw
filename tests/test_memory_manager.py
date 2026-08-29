@@ -316,8 +316,18 @@ def test_get_core_memory_returns_trimmed_summary(tmp_path: Path) -> None:
     memory.get_layer("insight").data.update(
         {
             "hypotheses": [
-                {"hypothesis": "可能在寻找掌控感。", "confidence": 0.7},
-                {"hypothesis": "内容选择偏向结构清晰的表达。", "confidence": 0.62},
+                {
+                    "hypothesis": "可能在寻找掌控感。",
+                    "confidence": 0.7,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "insight_feedback",
+                },
+                {
+                    "hypothesis": "内容选择偏向结构清晰的表达。",
+                    "confidence": 0.62,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "dialogue_anchor",
+                },
             ]
         }
     )
@@ -341,7 +351,16 @@ def test_render_core_memory_prompt_uses_stable_section_order(tmp_path: Path) -> 
         {"notes": [{"date": "2026-03-08", "observation": "最近更专注。"}]}
     )
     memory.get_layer("insight").data.update(
-        {"hypotheses": [{"hypothesis": "可能在寻找掌控感。", "confidence": 0.7}]}
+        {
+            "hypotheses": [
+                {
+                    "hypothesis": "可能在寻找掌控感。",
+                    "confidence": 0.7,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "insight_feedback",
+                }
+            ]
+        }
     )
 
     prompt = memory.render_core_memory_prompt()
@@ -428,8 +447,18 @@ def _build_onion_core_memory_fixture(memory_dir: Path) -> MemoryManager:
     memory.get_layer("insight").data.update(
         {
             "hypotheses": [
-                {"hypothesis": "可能在寻找掌控感。", "confidence": 0.7},
-                {"hypothesis": "内容选择偏向结构清晰的表达。", "confidence": 0.62},
+                {
+                    "hypothesis": "可能在寻找掌控感。",
+                    "confidence": 0.7,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "insight_feedback",
+                },
+                {
+                    "hypothesis": "内容选择偏向结构清晰的表达。",
+                    "confidence": 0.62,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "dialogue_anchor",
+                },
             ]
         }
     )
@@ -501,9 +530,7 @@ def test_render_core_memory_blocks_keep_stable_prefix_across_awareness_churn(
 
 
 def test_chat_core_memory_split_preserves_prechange_sections(tmp_path: Path) -> None:
-    # (c) Section-parity golden: the split loses no content that the pre-change
-    # single-block render produced, and moves awareness/insights to the volatile
-    # (user-bound) block while identity/preference stay in the stable block.
+    # (c) Ordinary OpenBiliClaw preserves the pre-P4 prompt byte contract.
     from pathlib import Path as _Path
 
     memory = _build_onion_core_memory_fixture(tmp_path)
@@ -523,6 +550,97 @@ def test_chat_core_memory_split_preserves_prechange_sections(tmp_path: Path) -> 
     assert "## 当前洞察" in volatile and "## 当前洞察" not in stable
     assert "## 用户画像" in stable and "## 用户画像" not in volatile
     assert "## 偏好摘要" in stable
+
+
+def test_ordinary_core_memory_preserves_legacy_insight_behavior(tmp_path: Path) -> None:
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    memory.get_layer("insight").data.update(
+        {
+            "hypotheses": [
+                {
+                    "hypothesis": "用户可能追涨",
+                    "confidence": 0.9,
+                    "user_verdict": "rejected",
+                },
+                {
+                    "hypothesis": "用户偏好核验来源",
+                    "confidence": 0.8,
+                    "user_verdict": "confirmed",
+                },
+                {
+                    "hypothesis": "用户明确要求事实推断分离",
+                    "confidence": 0.8,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "insight_feedback",
+                },
+            ]
+        }
+    )
+
+    prompt = memory.render_core_memory_prompt()
+
+    assert "用户可能追涨" in prompt
+    assert "用户偏好核验来源" in prompt
+    assert "用户明确要求事实推断分离" in prompt
+
+
+def test_newsclaw_chat_uses_live_p4_memory_and_not_hidden_legacy_insights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    memory.get_layer("insight").data.update(
+        {
+            "hypotheses": [
+                {
+                    "hypothesis": "旧画像里隐藏的结论",
+                    "confidence": 0.9,
+                    "user_verdict": "confirmed",
+                    "verdict_source": "insight_feedback",
+                }
+            ]
+        }
+    )
+    fact = memory._database.create_personal_memory_item(
+        kind="confirmed_fact",
+        title="工作方式",
+        content="事实和推断必须分开",
+        request_id="prompt-fact",
+    )["item"]
+    research = memory._database.create_personal_memory_item(
+        kind="research_direction",
+        title="当前关注",
+        content="持续观察黄金政策传导",
+        request_id="prompt-research",
+    )["item"]
+
+    generic_stable, generic_volatile = memory.render_core_memory_blocks()
+    assert "事实和推断必须分开" not in generic_stable + generic_volatile
+    assert "持续观察黄金政策传导" not in generic_stable + generic_volatile
+
+    stable, volatile = memory.render_core_memory_blocks(include_personal_memory=True)
+
+    assert "## 用户明确确认的个人记忆" in stable
+    assert "工作方式：事实和推断必须分开" in stable
+    assert "持续观察黄金政策传导" not in stable + volatile
+    assert "旧画像里隐藏的结论" not in stable + volatile
+
+    memory._database.delete_personal_memory_item(
+        fact["memory_id"],
+        expected_version=1,
+        request_id="prompt-fact-delete",
+    )
+    memory._database.delete_personal_memory_item(
+        research["memory_id"],
+        expected_version=1,
+        request_id="prompt-research-delete",
+    )
+    refreshed = memory.render_core_memory_prompt(include_personal_memory=True)
+    assert "事实和推断必须分开" not in refreshed
+    assert "持续观察黄金政策传导" not in refreshed
 
 
 def test_feedback_state_defaults_when_missing(tmp_path: Path) -> None:

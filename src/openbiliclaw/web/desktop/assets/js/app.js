@@ -45,6 +45,8 @@
       newsEvents: "/news/events",
       newsChanges: "/news/changes",
       newsConflicts: "/news/conflicts",
+      personalMemory: "/personal-memory",
+      personalMemoryHistory: "/personal-memory/history",
       profileEdit: "/profile/edit",
       profileEditState: "/profile/edit-state"
     };
@@ -116,6 +118,7 @@
       delightLoadState: "loading",
       delightLoadError: "",
       degraded: false,
+      newsclawMode: null,
       config: null,
       llmDraft: null,
       llmProbeResults: new Map(),
@@ -146,7 +149,21 @@
       chat: [
         { role: "agent", text: "你可以直接告诉我最近想多看什么、少看什么，或者评价一条推荐为什么准/不准。" }
       ],
-      pendingConfirmations: { count: 0, items: [], expanded: false }
+      pendingConfirmations: { count: 0, items: [], expanded: false },
+      personalMemory: {
+        dashboard: null,
+        activeTab: "confirmed",
+        loadState: "idle",
+        error: "",
+        history: [],
+        historyHasMore: false,
+        historyLoading: false,
+        editingMemoryId: "",
+        editingCandidateId: "",
+        editingMemoryDraft: null,
+        editingCandidateDraft: null,
+        mutationBusy: false,
+      }
     };
     let recommendationDetailOpener = null;
     let recommendationSyncChannel = null;
@@ -3109,6 +3126,22 @@
       document.body.classList.toggle("profile-page-open", pageId === "profilePage");
       document.body.classList.toggle("chat-page-open", pageId === "chatPage");
       document.body.classList.toggle("content-page-open", pageId !== "homePage");
+      const navPageMap = {
+        contentLibraryBtn: "contentLibraryPage",
+        profileBtn: "profilePage",
+        chatBtn: "chatPage",
+        settingsBtn: "settingsPage",
+      };
+      Object.entries(navPageMap).forEach(([buttonId, targetPage]) => {
+        const button = document.getElementById(buttonId);
+        if (!button) return;
+        if (pageId === targetPage) button.setAttribute("aria-current", "page");
+        else button.removeAttribute("aria-current");
+      });
+      if (pageId !== "homePage") {
+        document.getElementById("homeBtn")?.removeAttribute("aria-current");
+        document.getElementById("newMaterialsBtn")?.removeAttribute("aria-current");
+      }
       if (pageId !== "homePage") {
         document.body.classList.remove("event-workspace-open", "new-materials-open");
         eventWorkspaceController?.deactivate();
@@ -3157,6 +3190,8 @@
     function openHomePage(mode = "events") {
       leaveDesktopContentLibrary();
       clearDesktopContentLibraryRoute();
+      leavePersonalMemory();
+      clearPersonalMemoryRoute();
       showMainPage("homePage");
       setHomeMode(mode);
       closeMobileMenu();
@@ -3167,9 +3202,48 @@
       openHomePage("materials");
     }
 
-    function openProfilePage() {
+    function setNewsClawProductMode(enabled) {
+      const newsclawMode = Boolean(enabled);
+      state.newsclawMode = newsclawMode;
+      document.body.classList.toggle("newsclaw-product", newsclawMode);
+      const personalMount = document.getElementById("personalMemoryMount");
+      const legacyMount = document.getElementById("legacyProfileMount");
+      if (personalMount) personalMount.hidden = !newsclawMode;
+      if (legacyMount) {
+        legacyMount.hidden = newsclawMode;
+        legacyMount.setAttribute("aria-hidden", String(newsclawMode));
+      }
+      const page = document.getElementById("profilePage");
+      if (page) {
+        if (newsclawMode) {
+          page.setAttribute("aria-labelledby", "memoryPageTitle");
+          page.removeAttribute("aria-label");
+        } else {
+          page.removeAttribute("aria-labelledby");
+          page.setAttribute("aria-label", "我的画像");
+        }
+      }
+      const navLabel = document.getElementById("profileNavLabel");
+      if (navLabel) navLabel.textContent = newsclawMode ? "个人记忆" : "我的画像";
+      const mobileNavLabel = document.getElementById("mobileProfileNavLabel");
+      if (mobileNavLabel) mobileNavLabel.textContent = newsclawMode ? "个人记忆" : "我的画像";
+      const mobileHint = document.getElementById("mobileProfileHint");
+      if (mobileHint) mobileHint.textContent = newsclawMode
+        ? "查看已确认信息、当前研究和待确认内容"
+        : "查看完整画像和近期记忆";
+      const mobileMemory = document.getElementById("mobilePersonalMemorySummary");
+      const mobileLegacy = document.getElementById("mobileLegacyProfileSummary");
+      if (mobileMemory) mobileMemory.hidden = !newsclawMode;
+      if (mobileLegacy) mobileLegacy.hidden = newsclawMode;
+      if (newsclawMode) renderPersonalMemory();
+      else renderProfileDetails();
+    }
+
+    function openLegacyProfilePage() {
       leaveDesktopContentLibrary();
       clearDesktopContentLibraryRoute();
+      leavePersonalMemory();
+      clearPersonalMemoryRoute();
       closeMobileMenu();
       document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((panel) => closePanel(panel.id));
       showMainPage("profilePage");
@@ -3178,9 +3252,29 @@
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
+    function openProfilePage(tab = state.personalMemory.activeTab) {
+      if (state.newsclawMode === null) {
+        void requestJson(ENDPOINTS.health).then((snapshot) => {
+          const service = String(snapshot?.service || "");
+          if (service) setNewsClawProductMode(service === "newsclaw-api");
+          if (state.newsclawMode === true) openPersonalMemoryPage(tab);
+          else openLegacyProfilePage();
+        }).catch(() => openLegacyProfilePage());
+        return;
+      }
+      if (state.newsclawMode === false) {
+        openLegacyProfilePage();
+        return;
+      }
+      leaveDesktopContentLibrary();
+      openPersonalMemoryPage(tab);
+    }
+
     function openChatPage() {
       leaveDesktopContentLibrary();
       clearDesktopContentLibraryRoute();
+      leavePersonalMemory();
+      clearPersonalMemoryRoute();
       closeMobileMenu();
       document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((panel) => closePanel(panel.id));
       const forceBottom = !hasOpenedDialogueChatPage;
@@ -3196,6 +3290,8 @@
     function openSettingsPage(panel = "models") {
       leaveDesktopContentLibrary();
       clearDesktopContentLibraryRoute();
+      leavePersonalMemory();
+      clearPersonalMemoryRoute();
       closeMobileMenu();
       document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((drawer) => closePanel(drawer.id));
       setActiveSettingsPanel(panel || "models");
@@ -4376,6 +4472,7 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     function openContentLibraryPage(tab = storedDesktopContentLibraryTab(), { updateHash = true, focus = false, forceLoad = false } = {}) {
       const entering = !desktopContentLibraryVisible;
+      leavePersonalMemory();
       closeMobileMenu();
       document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((panel) => closePanel(panel.id));
       showMainPage("contentLibraryPage");
@@ -4445,6 +4542,762 @@ ${savedCardFeedbackBarHtml(listKind)}
       }
     }
 
+    // ── P4 personal memory ───────────────────────────────────────
+    // This UI only displays user-confirmed memory and pending inference
+    // candidates. Legacy Soul/Profile inference stays mounted in a hidden
+    // compatibility node and must never overwrite this page.
+    const PERSONAL_MEMORY_TABS = ["confirmed", "research", "candidates", "history"];
+    const PERSONAL_MEMORY_TAB_IDS = {
+      confirmed: "memoryConfirmedTab",
+      research: "memoryResearchTab",
+      candidates: "memoryCandidatesTab",
+      history: "memoryHistoryTab",
+    };
+    const PERSONAL_MEMORY_PANEL_IDS = {
+      confirmed: "memoryConfirmedPanel",
+      research: "memoryResearchPanel",
+      candidates: "memoryCandidatesPanel",
+      history: "memoryHistoryPanel",
+    };
+    const PERSONAL_MEMORY_LIST_IDS = {
+      confirmed: "memoryConfirmedList",
+      research: "memoryResearchList",
+      candidates: "memoryCandidatesList",
+      history: "memoryHistoryList",
+    };
+    let personalMemoryVisible = false;
+    let personalMemoryRefreshPromise = null;
+
+    function normalizePersonalMemoryTab(value, fallback = "confirmed") {
+      const normalized = String(value || "").trim().toLowerCase();
+      return PERSONAL_MEMORY_TABS.includes(normalized) ? normalized : fallback;
+    }
+
+    function personalMemoryHashTab() {
+      const hash = window.location.hash.replace(/^#\/?/, "");
+      const [parent, child] = hash.split("/");
+      if (parent !== "memory") return "";
+      return normalizePersonalMemoryTab(child);
+    }
+
+    function clearPersonalMemoryRoute() {
+      if (!personalMemoryHashTab()) return;
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    }
+
+    function leavePersonalMemory() {
+      personalMemoryVisible = false;
+    }
+
+    function setPersonalMemoryStatus(message = "", tone = "neutral") {
+      const element = document.getElementById("memoryPageStatus");
+      if (!element) return;
+      element.textContent = String(message || "");
+      element.dataset.tone = tone;
+      element.setAttribute("role", tone === "error" ? "alert" : "status");
+    }
+
+    function personalMemoryErrorCode(error) {
+      const details = error?.details;
+      return String(details?.detail?.code || details?.code || "");
+    }
+
+    function personalMemorySourceLabel(sourceType) {
+      return {
+        user: "由你记录",
+        confirmed_inference: "由你确认的系统建议",
+        system_inference: "系统推断，待你确认",
+        chat: "来自对话，待你确认",
+        event: "来自事件，待你确认",
+        import: "来自导入，待你确认",
+      }[String(sourceType || "")] || "本机记录";
+    }
+
+    function personalMemoryKindLabel(kind) {
+      return kind === "research_direction" ? "研究方向" : "长期信息";
+    }
+
+    function personalMemoryDate(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return new Intl.DateTimeFormat("zh-CN", {
+        year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+      }).format(date);
+    }
+
+    function personalMemoryEvidenceHtml(evidence, { sourceRef = "" } = {}) {
+      const rows = asArray(evidence).filter((item) => item && typeof item === "object");
+      const cleanSourceRef = String(sourceRef || "").trim();
+      if (cleanSourceRef && !rows.some((item) => String(item.ref || "") === cleanSourceRef)) {
+        rows.unshift({ type: "来源记录", ref: cleanSourceRef, excerpt: "" });
+      }
+      if (!rows.length) return "";
+      return `<details class="memory-evidence"><summary>查看依据（${rows.length}）</summary><div class="memory-evidence-list">${rows.map((item) => {
+        const ref = String(item.ref || "");
+        const refHtml = /^https?:\/\//i.test(ref)
+          ? `<a href="${escapeHtml(ref)}" target="_blank" rel="noopener noreferrer">${escapeHtml(ref)}</a>`
+          : escapeHtml(ref || "本机记录");
+        return `<div class="memory-evidence-item"><strong>${escapeHtml(item.type || "记录")}</strong><span>${refHtml}</span>${item.excerpt ? `<p>${escapeHtml(item.excerpt)}</p>` : ""}</div>`;
+      }).join("")}</div></details>`;
+    }
+
+    function personalMemoryEditForm(item) {
+      const draft = state.personalMemory.editingMemoryDraft?.memoryId === String(item.memory_id)
+        ? state.personalMemory.editingMemoryDraft
+        : item;
+      return `<form class="memory-inline-editor" data-memory-edit-form="${escapeHtml(item.memory_id)}">
+        <label class="memory-field"><span>标题</span><input name="title" maxlength="120" value="${escapeHtml(draft.title || "")}"${item.title ? " required" : ""}></label>
+        <label class="memory-field"><span>内容</span><textarea name="content" maxlength="4000" required>${escapeHtml(draft.content || "")}</textarea></label>
+        <div class="memory-card-actions">
+          <button class="memory-action" type="button" data-memory-action="cancel-edit">取消</button>
+          <button class="memory-action is-primary" type="submit">保存修改</button>
+        </div>
+      </form>`;
+    }
+
+    function personalMemoryItemHtml(item) {
+      if (!item || typeof item !== "object") return "";
+      const editing = state.personalMemory.editingMemoryId === String(item.memory_id || "");
+      return `<article class="memory-card" data-memory-id="${escapeHtml(item.memory_id || "")}" data-memory-version="${escapeHtml(item.version || 1)}">
+        <header class="memory-card-head"><div>
+          <p class="memory-card-kicker">${escapeHtml(personalMemoryKindLabel(item.kind))} · ${escapeHtml(personalMemorySourceLabel(item.source_type))}</p>
+          ${editing ? "" : `<h4>${escapeHtml(item.title || item.content || "未命名记录")}</h4>`}
+        </div>${editing ? "" : `<time>${escapeHtml(personalMemoryDate(item.updated_at || item.created_at))}</time>`}</header>
+        ${editing ? personalMemoryEditForm(item) : `
+          ${item.title ? `<p class="memory-card-content">${escapeHtml(item.content || "")}</p>` : ""}
+          <p class="memory-record-meta">版本 ${escapeHtml(item.version || 1)}</p>
+          ${personalMemoryEvidenceHtml(item.evidence, { sourceRef: item.source_ref })}
+          <footer class="memory-card-actions">
+            <button class="memory-action" type="button" data-memory-action="edit">修改</button>
+            <button class="memory-action is-danger" type="button" data-memory-action="delete">删除</button>
+          </footer>`}
+      </article>`;
+    }
+
+    function personalMemoryCandidateEditForm(candidate) {
+      const draft = state.personalMemory.editingCandidateDraft?.candidateId === String(candidate.candidate_id)
+        ? state.personalMemory.editingCandidateDraft
+        : { kind: candidate.proposed_kind, title: candidate.title, content: candidate.content };
+      return `<form class="memory-inline-editor" data-memory-candidate-form="${escapeHtml(candidate.candidate_id || "")}">
+        <label class="memory-field"><span>保存到</span><select name="kind"><option value="confirmed_fact"${draft.kind === "confirmed_fact" ? " selected" : ""}>长期信息</option><option value="research_direction"${draft.kind === "research_direction" ? " selected" : ""}>研究方向</option></select></label>
+        <label class="memory-field"><span>标题</span><input name="title" maxlength="120" value="${escapeHtml(draft.title || "")}"></label>
+        <label class="memory-field"><span>内容</span><textarea name="content" maxlength="4000" required>${escapeHtml(draft.content || "")}</textarea></label>
+        <div class="memory-card-actions">
+          <button class="memory-action" type="button" data-memory-action="cancel-candidate-edit">取消</button>
+          <button class="memory-action is-primary" type="submit">确认并保存</button>
+        </div>
+      </form>`;
+    }
+
+    function personalMemoryCandidateHtml(candidate) {
+      if (!candidate || typeof candidate !== "object") return "";
+      const editing = state.personalMemory.editingCandidateId === String(candidate.candidate_id || "");
+      const confidence = Number(candidate.confidence);
+      return `<article class="memory-card memory-candidate-card" data-candidate-id="${escapeHtml(candidate.candidate_id || "")}" data-memory-version="${escapeHtml(candidate.version || 1)}">
+        <header class="memory-card-head"><div>
+          <p class="memory-card-kicker">系统推断 · 待确认 · 建议保存为${escapeHtml(personalMemoryKindLabel(candidate.proposed_kind))}</p>
+          ${editing ? "" : `<h4>${escapeHtml(candidate.title || candidate.content || "未命名建议")}</h4>`}
+        </div>${editing ? "" : `<time>${escapeHtml(personalMemoryDate(candidate.created_at))}</time>`}</header>
+        ${editing ? personalMemoryCandidateEditForm(candidate) : `
+          ${candidate.title ? `<p class="memory-card-content">${escapeHtml(candidate.content || "")}</p>` : ""}
+          ${candidate.proposal_reason ? `<p class="memory-candidate-reason">为什么建议：${escapeHtml(candidate.proposal_reason)}</p>` : ""}
+          <p class="memory-record-meta">${escapeHtml(personalMemorySourceLabel(candidate.source_type))}${Number.isFinite(confidence) ? ` · 系统置信度 ${escapeHtml(Math.round(confidence * 100))}%` : ""}</p>
+          ${personalMemoryEvidenceHtml(candidate.evidence, { sourceRef: candidate.source_ref })}
+          <footer class="memory-card-actions">
+            <button class="memory-action is-primary" type="button" data-memory-action="accept-candidate">确认并记住</button>
+            <button class="memory-action" type="button" data-memory-action="edit-candidate">先修改</button>
+            <button class="memory-action is-danger" type="button" data-memory-action="reject-candidate">不记住</button>
+          </footer>`}
+      </article>`;
+    }
+
+    function personalMemoryHistorySnapshot(value) {
+      if (!value || typeof value !== "object") return {};
+      return value.memory || value.candidate || value;
+    }
+
+    function personalMemoryHistoryHtml(revision) {
+      if (!revision || typeof revision !== "object") return "";
+      const before = personalMemoryHistorySnapshot(revision.before);
+      const after = personalMemoryHistorySnapshot(revision.after);
+      const title = revision.title || after.title || before.title || revision.content || after.content || before.content || "记忆变更";
+      const actionLabel = {
+        create: "新增", update: "修改", edit: "修改", delete: "删除", restore: "恢复",
+        create_from_candidate: "确认建议并新增",
+        update_from_candidate: "确认建议并更新",
+        restore_from_candidate: "确认建议并恢复",
+        accept_candidate: "确认建议",
+        reject_candidate: "否定建议",
+        accept: "确认建议", reject: "否定建议", propose: "产生待确认建议",
+      }[String(revision.action || "").toLowerCase()] || revision.action || "变更";
+      const beforeContent = before.content || "";
+      const afterContent = after.content || "";
+      const comparison = beforeContent && afterContent && beforeContent !== afterContent
+        ? `<details class="memory-history-compare"><summary>查看前后变化</summary><div class="memory-compare-grid"><div><span>修改前</span><p>${escapeHtml(beforeContent)}</p></div><div><span>修改后</span><p>${escapeHtml(afterContent)}</p></div></div></details>`
+        : "";
+      const canRestore = Boolean(revision.can_restore && revision.target_type === "memory" && Number(revision.restore_version) > 0);
+      return `<article class="memory-history-card" data-memory-id="${escapeHtml(revision.target_id || "")}" data-memory-version="${escapeHtml(revision.restore_version || revision.version || 1)}">
+        <header><div><span class="memory-history-action">${escapeHtml(actionLabel)}</span><h4>${escapeHtml(title)}</h4></div><time>${escapeHtml(personalMemoryDate(revision.created_at))}</time></header>
+        ${revision.reason ? `<p class="memory-history-reason">${escapeHtml(revision.reason)}</p>` : ""}
+        ${comparison}
+        ${canRestore ? `<footer class="memory-card-actions"><button class="memory-action" type="button" data-memory-action="restore">恢复这条记忆</button></footer>` : ""}
+      </article>`;
+    }
+
+    function renderPersonalMemory() {
+      const memoryState = state.personalMemory;
+      const dashboard = memoryState.dashboard || {};
+      const countsKnown = memoryState.dashboard !== null;
+      const lists = {
+        confirmed: asArray(dashboard.confirmed_facts),
+        research: asArray(dashboard.research_directions),
+        candidates: asArray(dashboard.pending_inferences),
+        history: asArray(memoryState.history),
+      };
+      const counts = dashboard.counts || {};
+      const countValues = {
+        confirmed: countsKnown ? Number(counts.confirmed_facts ?? lists.confirmed.length) : null,
+        research: countsKnown ? Number(counts.research_directions ?? lists.research.length) : null,
+        candidates: countsKnown ? Number(counts.pending_inferences ?? lists.candidates.length) : null,
+        history: countsKnown ? Number(counts.revisions ?? lists.history.length) : null,
+      };
+
+      PERSONAL_MEMORY_TABS.forEach((tab) => {
+        const selected = memoryState.activeTab === tab;
+        const tabElement = document.getElementById(PERSONAL_MEMORY_TAB_IDS[tab]);
+        const panel = document.getElementById(PERSONAL_MEMORY_PANEL_IDS[tab]);
+        if (tabElement) {
+          tabElement.classList.toggle("is-active", selected);
+          tabElement.setAttribute("aria-selected", String(selected));
+          tabElement.tabIndex = selected ? 0 : -1;
+        }
+        if (panel) panel.hidden = !selected;
+        const countElement = document.getElementById({ confirmed: "memoryConfirmedCount", research: "memoryResearchCount", candidates: "memoryCandidatesCount", history: "memoryHistoryCount" }[tab]);
+        if (countElement) {
+          const rawCount = countValues[tab];
+          if (rawCount === null || !Number.isFinite(rawCount)) {
+            countElement.textContent = "—";
+            countElement.setAttribute("aria-label", "尚未读取");
+          } else {
+            const count = Math.max(0, rawCount);
+            countElement.textContent = String(count);
+            countElement.setAttribute("aria-label", `${count} 条`);
+          }
+        }
+        const listElement = document.getElementById(PERSONAL_MEMORY_LIST_IDS[tab]);
+        if (listElement) {
+          listElement.innerHTML = tab === "candidates"
+            ? lists[tab].map(personalMemoryCandidateHtml).join("")
+            : tab === "history"
+              ? lists[tab].map(personalMemoryHistoryHtml).join("")
+              : lists[tab].map(personalMemoryItemHtml).join("");
+        }
+        const emptyElement = document.getElementById({ confirmed: "memoryConfirmedEmpty", research: "memoryResearchEmpty", candidates: "memoryCandidatesEmpty", history: "memoryHistoryEmpty" }[tab]);
+        if (emptyElement) emptyElement.hidden = memoryState.loadState !== "ready" || lists[tab].length > 0;
+      });
+
+      const loading = document.getElementById("memoryLoadingState");
+      if (loading) loading.hidden = memoryState.loadState !== "loading";
+      const error = document.getElementById("memoryErrorState");
+      if (error) {
+        error.hidden = memoryState.loadState !== "error";
+        const message = error.querySelector("[data-memory-field='error'], p");
+        if (message) message.textContent = memoryState.error || "个人记忆暂时无法读取，请重试。";
+      }
+      const historyMore = document.getElementById("memoryHistoryMoreBtn");
+      if (historyMore) {
+        historyMore.hidden = !memoryState.historyHasMore;
+        historyMore.disabled = memoryState.historyLoading;
+        historyMore.textContent = memoryState.historyLoading ? "正在加载…" : "加载更早记录";
+      }
+      document.getElementById("profilePage")?.setAttribute("aria-busy", memoryState.loadState === "loading" ? "true" : "false");
+      [
+        ["mobileMemoryConfirmedCount", countValues.confirmed],
+        ["mobileMemoryResearchCount", countValues.research],
+        ["mobileMemoryPendingCount", countValues.candidates],
+      ].forEach(([id, value]) => {
+        const element = document.getElementById(id);
+        if (!element) return;
+        if (value === null || !Number.isFinite(value)) {
+          element.textContent = "—";
+          element.setAttribute("aria-label", "尚未读取");
+        } else {
+          const count = Math.max(0, value);
+          element.textContent = String(count);
+          element.setAttribute("aria-label", `${count} 条`);
+        }
+      });
+      document.querySelectorAll("#profilePage button, #profilePage input, #profilePage textarea, #profilePage select").forEach((control) => {
+        if (control.id === "memoryRetryBtn") return;
+        control.disabled = Boolean(memoryState.mutationBusy);
+      });
+      bindPersonalMemoryRenderedActions();
+    }
+
+    async function refreshPersonalMemory({ announce = false } = {}) {
+      if (personalMemoryRefreshPromise) return personalMemoryRefreshPromise;
+      personalMemoryRefreshPromise = refreshPersonalMemoryNow({ announce });
+      try {
+        return await personalMemoryRefreshPromise;
+      } finally {
+        personalMemoryRefreshPromise = null;
+      }
+    }
+
+    async function refreshPersonalMemoryNow({ announce = false } = {}) {
+      state.personalMemory.loadState = "loading";
+      state.personalMemory.error = "";
+      renderPersonalMemory();
+      if (announce) setPersonalMemoryStatus("正在从本机读取个人记忆…");
+      try {
+        const dashboard = await requestJsonStrict(`${ENDPOINTS.personalMemory}?history_limit=30`, {
+          cache: "no-store", timeoutMs: 15000,
+        });
+        state.personalMemory.dashboard = dashboard;
+        state.personalMemory.history = asArray(dashboard?.history);
+        state.personalMemory.historyHasMore = state.personalMemory.history.length >= 30;
+        state.personalMemory.loadState = "ready";
+        renderPersonalMemory();
+        if (announce) setPersonalMemoryStatus("个人记忆已从本机刷新。", "success");
+        return dashboard;
+      } catch (error) {
+        state.personalMemory.loadState = "error";
+        state.personalMemory.error = configErrorMessage(error?.details) || error?.message || "个人记忆暂时无法读取。";
+        renderPersonalMemory();
+        setPersonalMemoryStatus(state.personalMemory.error, "error");
+        throw error;
+      }
+    }
+
+    async function loadMorePersonalMemoryHistory() {
+      if (state.personalMemory.historyLoading || !state.personalMemory.historyHasMore) return;
+      state.personalMemory.historyLoading = true;
+      renderPersonalMemory();
+      try {
+        const limit = 50;
+        const payload = await requestJsonStrict(`${ENDPOINTS.personalMemoryHistory}?limit=${limit}&offset=${state.personalMemory.history.length}`, {
+          cache: "no-store", timeoutMs: 15000,
+        });
+        const existing = new Set(state.personalMemory.history.map((row) => String(row.revision_id)));
+        const next = asArray(payload?.items).filter((row) => !existing.has(String(row?.revision_id)));
+        state.personalMemory.history.push(...next);
+        state.personalMemory.historyHasMore = asArray(payload?.items).length >= limit;
+        setPersonalMemoryStatus(next.length ? `已加载 ${next.length} 条更早记录。` : "没有更早的记录了。", "success");
+      } catch (error) {
+        setPersonalMemoryStatus(configErrorMessage(error?.details) || error?.message || "更早记录加载失败。", "error");
+      } finally {
+        state.personalMemory.historyLoading = false;
+        renderPersonalMemory();
+      }
+    }
+
+    function activatePersonalMemoryTab(value, { focus = false } = {}) {
+      state.personalMemory.activeTab = normalizePersonalMemoryTab(value, state.personalMemory.activeTab);
+      renderPersonalMemory();
+      if (focus) document.getElementById(PERSONAL_MEMORY_TAB_IDS[state.personalMemory.activeTab])?.focus();
+    }
+
+    function openPersonalMemoryPage(tab = "confirmed", { updateHash = true, focus = false, forceLoad = false } = {}) {
+      if (state.newsclawMode !== true) {
+        openProfilePage(tab);
+        return;
+      }
+      const enteringPage = !personalMemoryVisible;
+      leaveDesktopContentLibrary();
+      closeMobileMenu();
+      document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((panel) => closePanel(panel.id));
+      showMainPage("profilePage");
+      personalMemoryVisible = true;
+      activatePersonalMemoryTab(tab, { focus });
+      if (updateHash) {
+        const nextHash = `#memory/${state.personalMemory.activeTab}`;
+        if (window.location.hash !== nextHash) window.location.hash = nextHash;
+      }
+      if (forceLoad || enteringPage || state.personalMemory.loadState === "idle" || state.personalMemory.loadState === "error") {
+        void refreshPersonalMemory().catch(() => {});
+      }
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    async function runPersonalMemoryMutation({ path, method = "POST", namespace, identity, payload, reconciled }) {
+      if (state.personalMemory.mutationBusy) return null;
+      const pending = rememberPendingRequestId(`personal-memory-${namespace}`, identity);
+      state.personalMemory.mutationBusy = true;
+      renderPersonalMemory();
+      try {
+        const result = await requestJsonStrict(path, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...payload, request_id: pending.requestId }),
+          timeoutMs: 20000,
+        });
+        forgetPendingRequestId(pending);
+        try {
+          await refreshPersonalMemory();
+        } catch {
+          setPersonalMemoryStatus("操作已由本机确认成功，但最新列表暂时读取失败；请点击重新读取。", "error");
+        }
+        return result;
+      } catch (error) {
+        const uncertain = error?.code === "request_timeout" || error?.name === "TimeoutError" || error instanceof TypeError;
+        const code = personalMemoryErrorCode(error);
+        if (uncertain) {
+          setPersonalMemoryStatus("连接中断，正在核对本机记录，暂不显示假成功。", "pending");
+          try {
+            const dashboard = await refreshPersonalMemory();
+            const confirmed = typeof reconciled === "function"
+              ? await Promise.resolve(reconciled(dashboard))
+              : false;
+            if (confirmed) {
+              forgetPendingRequestId(pending);
+              setPersonalMemoryStatus("已从本机确认这次操作成功。", "success");
+              return { reconciled: true };
+            }
+          } catch {}
+          setPersonalMemoryStatus("结果暂时无法确认。页面已核账；请保留当前内容，稍后用同一操作重试。", "error");
+          return null;
+        }
+        forgetPendingRequestId(pending);
+        if (code === "personal_memory_merge_required") {
+          const detail = error?.details?.detail || error?.details || {};
+          return { merge_required: true, target_memory: detail.target_memory || null };
+        }
+        if (["personal_memory_version_conflict", "personal_memory_state_conflict"].includes(code)) {
+          await refreshPersonalMemory().catch(() => {});
+          setPersonalMemoryStatus("这条记忆已在别处变化，已刷新为本机最新版本，请重新确认。", "error");
+          return null;
+        }
+        if (code === "personal_memory_request_conflict") {
+          await refreshPersonalMemory().catch(() => {});
+          setPersonalMemoryStatus("这次操作与上次提交内容不一致，已刷新记录，请重新操作。", "error");
+          return null;
+        }
+        setPersonalMemoryStatus(configErrorMessage(error?.details) || error?.message || "操作失败，请重试。", "error");
+        return null;
+      } finally {
+        state.personalMemory.mutationBusy = false;
+        renderPersonalMemory();
+      }
+    }
+
+    function personalMemoryItemById(memoryId) {
+      const dashboard = state.personalMemory.dashboard || {};
+      return [...asArray(dashboard.confirmed_facts), ...asArray(dashboard.research_directions)]
+        .find((item) => String(item?.memory_id) === String(memoryId));
+    }
+
+    function personalMemoryCandidateById(candidateId) {
+      return asArray(state.personalMemory.dashboard?.pending_inferences)
+        .find((item) => String(item?.candidate_id) === String(candidateId));
+    }
+
+    function dashboardHasMemory(dashboard, memoryId, predicate = () => true) {
+      return [...asArray(dashboard?.confirmed_facts), ...asArray(dashboard?.research_directions)]
+        .some((item) => String(item?.memory_id) === String(memoryId) && predicate(item));
+    }
+
+    function dashboardHasCandidate(dashboard, candidateId) {
+      return asArray(dashboard?.pending_inferences).some((item) => String(item?.candidate_id) === String(candidateId));
+    }
+
+    async function personalMemoryCandidateResolution(candidateId) {
+      return requestJsonStrict(`${ENDPOINTS.personalMemory}/candidates/${encodeURIComponent(candidateId)}`, {
+        cache: "no-store", timeoutMs: 15000,
+      });
+    }
+
+    async function createPersonalMemory(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const kind = String(document.getElementById("memoryComposerKind")?.value || "confirmed_fact");
+      const title = String(document.getElementById("memoryComposerTitle")?.value || "").trim();
+      const content = String(document.getElementById("memoryComposerContent")?.value || "").trim();
+      const status = document.getElementById("memoryComposerStatus");
+      if (!content) {
+        if (status) status.textContent = "请先填写需要记住的内容。";
+        document.getElementById("memoryComposerContent")?.focus();
+        return;
+      }
+      const result = await runPersonalMemoryMutation({
+        path: `${ENDPOINTS.personalMemory}/items`, namespace: "create", identity: "composer",
+        payload: { kind, title, content },
+        reconciled: (dashboard) => [...asArray(dashboard?.confirmed_facts), ...asArray(dashboard?.research_directions)]
+          .some((item) => item.kind === kind && item.title === title && item.content === content),
+      });
+      if (!result) return;
+      form.reset();
+      form.hidden = true;
+      document.getElementById("memoryCreateBtn")?.setAttribute("aria-expanded", "false");
+      if (status) status.textContent = "";
+      setPersonalMemoryStatus("已保存到本机个人记忆。", "success");
+      openPersonalMemoryPage(kind === "research_direction" ? "research" : "confirmed");
+    }
+
+    async function editPersonalMemory(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const memoryId = String(form.dataset.memoryEditForm || "");
+      const item = personalMemoryItemById(memoryId);
+      if (!item) return;
+      const data = new FormData(form);
+      const title = String(data.get("title") || "").trim();
+      const content = String(data.get("content") || "").trim();
+      if (!content) return;
+      if (item.title && !title) {
+        setPersonalMemoryStatus("已有标题不能清空；可以改成新的标题。", "error");
+        return;
+      }
+      state.personalMemory.editingMemoryDraft = { memoryId, title, content };
+      const editPayload = { expected_version: item.version, content, reason: "用户在个人记忆页修改" };
+      if (title) editPayload.title = title;
+      const result = await runPersonalMemoryMutation({
+        path: `${ENDPOINTS.personalMemory}/items/${encodeURIComponent(memoryId)}`,
+        method: "PATCH", namespace: "edit", identity: `${memoryId}:v${item.version}`,
+        payload: editPayload,
+        reconciled: (dashboard) => dashboardHasMemory(dashboard, memoryId, (row) => row.title === (title || item.title || "") && row.content === content && Number(row.version) > Number(item.version)),
+      });
+      if (result) {
+        state.personalMemory.editingMemoryId = "";
+        state.personalMemory.editingMemoryDraft = null;
+        setPersonalMemoryStatus("修改已保存。", "success");
+      }
+    }
+
+    async function acceptPersonalMemoryCandidate(event) {
+      event?.preventDefault?.();
+      const form = event?.currentTarget?.matches?.("form[data-memory-candidate-form]") ? event.currentTarget : null;
+      const card = (form || event?.target)?.closest?.("[data-candidate-id]");
+      const candidateId = String(form?.dataset.memoryCandidateForm || card?.dataset.candidateId || "");
+      const candidate = personalMemoryCandidateById(candidateId);
+      if (!candidate) return;
+      let payload = { expected_version: candidate.version };
+      if (form) {
+        const data = new FormData(form);
+        payload = {
+          ...payload,
+          kind: String(data.get("kind") || candidate.proposed_kind),
+          title: String(data.get("title") || "").trim(),
+          content: String(data.get("content") || "").trim(),
+        };
+        if (!payload.content) return;
+        if (!payload.title) delete payload.title;
+        state.personalMemory.editingCandidateDraft = {
+          candidateId, kind: payload.kind, title: payload.title || "", content: payload.content,
+        };
+      }
+      let result = await runPersonalMemoryMutation({
+        path: `${ENDPOINTS.personalMemory}/candidates/${encodeURIComponent(candidateId)}/accept`,
+        namespace: "accept", identity: `${candidateId}:v${candidate.version}`, payload,
+        reconciled: async () => {
+          const resolved = await personalMemoryCandidateResolution(candidateId);
+          return resolved?.status === "accepted" && Boolean(resolved?.resolution_memory_id);
+        },
+      });
+      if (result?.merge_required) {
+        const target = result.target_memory;
+        if (!target?.memory_id || !Number(target?.version)) {
+          setPersonalMemoryStatus("已有记忆需要核对，但本机没有返回可确认的版本；请刷新后重试。", "error");
+          return;
+        }
+        const previewText = (value, limit = 240) => {
+          const normalized = String(value || "").replace(/\s+/g, " ").trim();
+          return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
+        };
+        const existingTitle = previewText(target.title || "已有记忆", 100);
+        const existingContent = previewText(target.content || "（无内容）");
+        const proposedTitle = previewText(payload.title || candidate.title || "这条建议", 100);
+        const proposedContent = previewText(payload.content || candidate.content || "（无内容）");
+        const mergeMessage = [
+          "这条建议会替换一条已有记忆，请核对前后内容：",
+          "",
+          `现有记忆｜${existingTitle}`,
+          existingContent,
+          "",
+          `准备写入｜${proposedTitle}`,
+          proposedContent,
+          "",
+          "确认替换吗？旧版本仍会保留在修改记录中。",
+        ].join("\n");
+        if (!window.confirm(mergeMessage)) {
+          setPersonalMemoryStatus("已取消更新，原有记忆没有变化。", "neutral");
+          return;
+        }
+        result = await runPersonalMemoryMutation({
+          path: `${ENDPOINTS.personalMemory}/candidates/${encodeURIComponent(candidateId)}/accept`,
+          namespace: "accept-merge",
+          identity: `${candidateId}:v${candidate.version}:${target.memory_id}:v${target.version}`,
+          payload: {
+            ...payload,
+            target_memory_id: target.memory_id,
+            expected_memory_version: target.version,
+          },
+          reconciled: async () => {
+            const resolved = await personalMemoryCandidateResolution(candidateId);
+            return resolved?.status === "accepted"
+              && String(resolved?.resolution_memory_id || "") === String(target.memory_id);
+          },
+        });
+      }
+      if (result) {
+        state.personalMemory.editingCandidateId = "";
+        state.personalMemory.editingCandidateDraft = null;
+        setPersonalMemoryStatus("这条建议已经由你确认并保存。", "success");
+      }
+    }
+
+    async function handlePersonalMemoryAction(button) {
+      const action = String(button.dataset.memoryAction || "");
+      const itemCard = button.closest("[data-memory-id]");
+      const candidateCard = button.closest("[data-candidate-id]");
+      if (action === "edit") {
+        const memoryId = String(itemCard?.dataset.memoryId || "");
+        const item = personalMemoryItemById(memoryId);
+        state.personalMemory.editingMemoryId = memoryId;
+        state.personalMemory.editingMemoryDraft = item
+          ? { memoryId, title: item.title || "", content: item.content || "" }
+          : null;
+        renderPersonalMemory();
+        return;
+      }
+      if (action === "cancel-edit") {
+        state.personalMemory.editingMemoryId = "";
+        state.personalMemory.editingMemoryDraft = null;
+        renderPersonalMemory();
+        return;
+      }
+      if (action === "edit-candidate") {
+        const candidateId = String(candidateCard?.dataset.candidateId || "");
+        const candidate = personalMemoryCandidateById(candidateId);
+        state.personalMemory.editingCandidateId = candidateId;
+        state.personalMemory.editingCandidateDraft = candidate
+          ? { candidateId, kind: candidate.proposed_kind, title: candidate.title || "", content: candidate.content || "" }
+          : null;
+        renderPersonalMemory();
+        return;
+      }
+      if (action === "cancel-candidate-edit") {
+        state.personalMemory.editingCandidateId = "";
+        state.personalMemory.editingCandidateDraft = null;
+        renderPersonalMemory();
+        return;
+      }
+      if (action === "accept-candidate") {
+        await acceptPersonalMemoryCandidate({ target: button, preventDefault() {} });
+        return;
+      }
+      if (action === "delete") {
+        const memoryId = String(itemCard?.dataset.memoryId || "");
+        const item = personalMemoryItemById(memoryId);
+        if (!item || !window.confirm("删除这条个人记忆吗？你仍可在变更记录中恢复。")) return;
+        const result = await runPersonalMemoryMutation({
+          path: `${ENDPOINTS.personalMemory}/items/${encodeURIComponent(memoryId)}/delete`,
+          namespace: "delete", identity: `${memoryId}:v${item.version}`,
+          payload: { expected_version: item.version, reason: "用户在个人记忆页删除" },
+          reconciled: (dashboard) => !dashboardHasMemory(dashboard, memoryId),
+        });
+        if (result) setPersonalMemoryStatus("已删除；需要时可在变更记录中恢复。", "success");
+        return;
+      }
+      if (action === "reject-candidate") {
+        const candidateId = String(candidateCard?.dataset.candidateId || "");
+        const candidate = personalMemoryCandidateById(candidateId);
+        if (!candidate || !window.confirm("确认这条系统推断不正确吗？否定后同一条建议不会反复出现。")) return;
+        const result = await runPersonalMemoryMutation({
+          path: `${ENDPOINTS.personalMemory}/candidates/${encodeURIComponent(candidateId)}/reject`,
+          namespace: "reject", identity: `${candidateId}:v${candidate.version}`,
+          payload: { expected_version: candidate.version, rejection_reason: "用户在个人记忆页否定" },
+          reconciled: async () => {
+            const resolved = await personalMemoryCandidateResolution(candidateId);
+            return resolved?.status === "rejected";
+          },
+        });
+        if (result) setPersonalMemoryStatus("已否定这条推断，不会把它写入个人记忆。", "success");
+        return;
+      }
+      if (action === "restore") {
+        const memoryId = String(itemCard?.dataset.memoryId || "");
+        const expectedVersion = Number(itemCard?.dataset.memoryVersion || 0);
+        if (!memoryId || expectedVersion < 1 || !window.confirm("恢复这条已删除的个人记忆吗？")) return;
+        const result = await runPersonalMemoryMutation({
+          path: `${ENDPOINTS.personalMemory}/items/${encodeURIComponent(memoryId)}/restore`,
+          namespace: "restore", identity: `${memoryId}:v${expectedVersion}`,
+          payload: { expected_version: expectedVersion, reason: "用户从变更记录恢复" },
+          reconciled: (dashboard) => dashboardHasMemory(dashboard, memoryId),
+        });
+        if (result) setPersonalMemoryStatus("个人记忆已恢复。", "success");
+      }
+    }
+
+    function bindPersonalMemoryRenderedActions() {
+      document.querySelectorAll("form[data-memory-edit-form]").forEach((form) => {
+        if (form.dataset.memoryBound === "1") return;
+        form.dataset.memoryBound = "1";
+        form.addEventListener("submit", editPersonalMemory);
+      });
+      document.querySelectorAll("form[data-memory-candidate-form]").forEach((form) => {
+        if (form.dataset.memoryBound === "1") return;
+        form.dataset.memoryBound = "1";
+        form.addEventListener("submit", acceptPersonalMemoryCandidate);
+      });
+      document.querySelectorAll("[data-memory-action]").forEach((button) => {
+        if (button.dataset.memoryBound === "1") return;
+        button.dataset.memoryBound = "1";
+        button.addEventListener("click", () => { void handlePersonalMemoryAction(button); });
+      });
+    }
+
+    function bindPersonalMemory() {
+      const buttons = PERSONAL_MEMORY_TABS.map((tab) => document.getElementById(PERSONAL_MEMORY_TAB_IDS[tab]))
+        .filter((button) => button instanceof HTMLButtonElement);
+      buttons.forEach((button, index) => {
+        button.addEventListener("click", () => openPersonalMemoryPage(PERSONAL_MEMORY_TABS[index], { forceLoad: false }));
+        button.addEventListener("keydown", (event) => {
+          let nextIndex = null;
+          if (event.key === "ArrowRight") nextIndex = (index + 1) % buttons.length;
+          else if (event.key === "ArrowLeft") nextIndex = (index - 1 + buttons.length) % buttons.length;
+          else if (event.key === "Home") nextIndex = 0;
+          else if (event.key === "End") nextIndex = buttons.length - 1;
+          if (nextIndex === null) return;
+          event.preventDefault();
+          openPersonalMemoryPage(PERSONAL_MEMORY_TABS[nextIndex], { focus: true });
+        });
+      });
+      document.getElementById("memoryRetryBtn")?.addEventListener("click", () => { void refreshPersonalMemory({ announce: true }).catch(() => {}); });
+      document.getElementById("memoryRefreshBtn")?.addEventListener("click", () => { void refreshPersonalMemory({ announce: true }).catch(() => {}); });
+      document.getElementById("memoryHistoryMoreBtn")?.addEventListener("click", () => { void loadMorePersonalMemoryHistory(); });
+      document.getElementById("memoryCreateBtn")?.addEventListener("click", () => {
+        const form = document.getElementById("memoryComposerForm");
+        if (!form) return;
+        form.hidden = false;
+        document.getElementById("memoryCreateBtn")?.setAttribute("aria-expanded", "true");
+        document.getElementById("memoryComposerContent")?.focus();
+      });
+      document.getElementById("memoryComposerCancel")?.addEventListener("click", () => {
+        const form = document.getElementById("memoryComposerForm");
+        if (form) form.hidden = true;
+        document.getElementById("memoryCreateBtn")?.setAttribute("aria-expanded", "false");
+        const status = document.getElementById("memoryComposerStatus");
+        if (status) status.textContent = "";
+      });
+      document.getElementById("memoryComposerForm")?.addEventListener("submit", createPersonalMemory);
+      window.addEventListener("hashchange", () => {
+        const tab = personalMemoryHashTab();
+        if (tab) openPersonalMemoryPage(tab, { updateHash: false });
+        else if (personalMemoryVisible) {
+          leavePersonalMemory();
+          if (!desktopContentLibraryHashTab()) {
+            showMainPage("homePage");
+            setHomeMode(state.homeMode, { persist: false });
+            window.scrollTo({ top: 0, behavior: "auto" });
+          }
+        }
+      });
+      const initialTab = personalMemoryHashTab();
+      if (initialTab) openPersonalMemoryPage(initialTab, { updateHash: false });
+      renderPersonalMemory();
+    }
+
     function setSideDrawerOpen(open, { persist = true } = {}) {
       const drawer = document.getElementById("sideDrawer");
       drawer?.classList.toggle("is-open", open);
@@ -4481,6 +5334,17 @@ ${savedCardFeedbackBarHtml(listKind)}
     function openMobileMenu() {
       syncMobileSearch();
       renderRail();
+      if (state.newsclawMode === true) {
+        void refreshPersonalMemory().catch(() => {});
+      } else if (state.newsclawMode === null) {
+        void requestJson(ENDPOINTS.health).then((snapshot) => {
+          const service = String(snapshot?.service || "");
+          if (!service) return;
+          const enabled = service === "newsclaw-api";
+          setNewsClawProductMode(enabled);
+          if (enabled) void refreshPersonalMemory().catch(() => {});
+        }).catch(() => {});
+      }
       document.body.classList.add("mobile-menu-open");
       document.getElementById("mobileMenu")?.classList.add("is-open");
     }
@@ -7124,30 +7988,6 @@ ${cardFeedbackBarHtml()}`;
     }
 
     function renderRail() {
-      const profile = state.profile;
-      const portraitText = profile?.personality_portrait ? valueList(profile.personality_portrait) : "偏好结构化解释、长新闻和跨学科桥接，对“为什么”比“是什么”更敏感。";
-      if ($("#profilePortrait")) $("#profilePortrait").textContent = portraitText;
-      if ($("#mobileProfilePortrait")) $("#mobileProfilePortrait").textContent = portraitText;
-      const chips = [
-        ...asArray(profile?.core_traits),
-        ...asArray(profile?.cognitive_style),
-        ...asArray(profile?.likes).map((item) => typeof item === "object" ? item.domain || item.name || item.title || valueList(item) : item)
-      ].map(valueList).filter((text) => text && text.length <= 10 && !/[，。；、,.]/.test(text)).slice(0, 8);
-      const chipTexts = chips.length ? chips : ["长解释", "机制控", "跨平台", "反信息茧房"];
-      ["#profileChips", "#mobileProfileChips"].forEach((selector) => {
-        const target = $(selector);
-        if (!target) return;
-        target.replaceChildren(...chipTexts.map((text) => {
-          const chip = document.createElement("span"); chip.className = "chip"; chip.textContent = text; return chip;
-        }));
-      });
-      const mbtiText = formatPersonalityType(profile?.mbti || profile?.personality_type) || "—";
-      const opennessText = formatPercent(profile?.exploration_openness ?? profile?.openness) || "—";
-      const depthText = formatPercent(profile?.style?.depth_preference ?? profile?.depth_preference ?? profile?.deep_preference ?? profile?.long_video_affinity) || "—";
-      [["#railMbti", mbtiText], ["#mobileRailMbti", mbtiText], ["#railOpenness", opennessText], ["#mobileRailOpenness", opennessText], ["#railDepth", depthText], ["#mobileRailDepth", depthText]].forEach(([selector, value]) => {
-        const target = $(selector);
-        if (target) target.textContent = value;
-      });
       const activityItems = state.activityItems.length ? state.activityItems : asArray(state.activity?.items);
       const activityMarkup = (limit) => activityItems.length
         ? activityItems.slice(0, limit).map((item) => `<div class="activity-item"><p>${escapeHtml(typeof item === "object" ? item.summary || item.detail || item.kind || valueList(item) : item)}</p></div>`).join("")
@@ -7452,6 +8292,8 @@ ${cardFeedbackBarHtml()}`;
     }
 
     function renderProfileDetails() {
+      const legacyMount = document.getElementById("legacyProfileMount");
+      if (state.newsclawMode !== false || !legacyMount) return;
       const profile = state.profile;
       if (!profile) {
         $("#profileDetails").innerHTML = profileItem("画像还没攒起来", paragraphsHtml("后端未连接或画像尚未初始化。连接 FastAPI 后会展示完整画像。"));
@@ -12264,6 +13106,8 @@ ${cardFeedbackBarHtml()}`;
 
       function applyHealthSnapshot(snapshot) {
         if (!snapshot) return;
+        const service = String(snapshot.service || "");
+        if (service) setNewsClawProductMode(service === "newsclaw-api");
         if (snapshot.degraded === true) {
           presentDegradedConfigRecovery({
             degraded: true,
@@ -12359,6 +13203,7 @@ ${cardFeedbackBarHtml()}`;
       const pingSnapshot = await requestJson(ENDPOINTS.ping);
       applyHealthSnapshot(pingSnapshot);
       if (pingSnapshot?.degraded === true) {
+        void requestJson(ENDPOINTS.health).then(applyHealthSnapshot).catch(() => {});
         const configSnapshot = await requestJson(ENDPOINTS.config);
         applyConfigSnapshot(configSnapshot);
         if (!configSnapshot) scheduleConfigSnapshotRetry();
@@ -12394,7 +13239,7 @@ ${cardFeedbackBarHtml()}`;
         syncWatchLaterButtons(),
         syncFavoriteButtons(),
         refreshTrackedObservations({ silent: true }),
-        requestJson(ENDPOINTS.health),
+        requestJson(ENDPOINTS.health).then(applyHealthSnapshot),
         requestJson(ENDPOINTS.initStatus).then(applyInitStatusSnapshot),
         requestJson(`${ENDPOINTS.activityFeed}?limit=5`).then(applyActivitySnapshot),
         requestJson(ENDPOINTS.profile).then(applyProfileSnapshot),
@@ -12870,11 +13715,12 @@ ${cardFeedbackBarHtml()}`;
         showToast("复制失败，请手动选中链接复制");
       }
     });
-    safeBind("#profileBtn", "click", openProfilePage);
+    safeBind("#profileBtn", "click", () => openProfilePage());
     safeBind("#homeBtn", "click", () => openHomePage("events"));
     safeBind("#newMaterialsBtn", "click", openNewMaterialsPage);
     safeBind("#contentLibraryBtn", "click", () => openContentLibraryPage());
     bindDesktopContentLibrary();
+    bindPersonalMemory();
     safeBind("#historyRefreshBtn", "click", () => refreshContentHistory(true));
     safeBind("#profileMemoryMoreBtn", "click", loadMoreProfileMemory);
     safeBind("#chatBtn", "click", openChatPage);

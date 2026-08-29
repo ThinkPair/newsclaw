@@ -1496,6 +1496,10 @@ class InsightHypothesisOut(BaseModel):
     confidence: float = 0.5
     validated: bool = False
     created_at: str = ""
+    user_verdict: str = ""
+    verdict_source: Literal["", "insight_feedback", "dialogue_anchor"] = ""
+    memory_state: Literal["pending", "confirmed", "rejected"] = "pending"
+    provenance: Literal["legacy_soul_inference"] = "legacy_soul_inference"
 
 
 class ProfileSummaryResponse(BaseModel):
@@ -1820,6 +1824,10 @@ class InsightFeedbackResponse(BaseModel):
     signal: str = ""
     validated: bool = False
     confidence: float = 0.0
+    user_verdict: str = ""
+    verdict_source: Literal["", "insight_feedback", "dialogue_anchor"] = ""
+    memory_state: Literal["pending", "confirmed", "rejected"] = "pending"
+    provenance: Literal["legacy_soul_inference"] = "legacy_soul_inference"
 
 
 class ProfileEditIn(BaseModel):

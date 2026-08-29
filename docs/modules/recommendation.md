@@ -16,6 +16,14 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 - **Recommendation** — 单条推荐结果
 - **PersonalTopic** — 后续个性化主题分组的占位结构
 
+### NewsClaw P4 当前研究投影
+
+仅在 `NEWSCLAW_MODE=1` 时，推荐评估与推荐表达会从本机个人记忆实时读取活动的
+`research_direction`，以 `user_research_directions` 的有界标题/内容列表加入规范画像
+摘要。`confirmed_fact` 不进入推荐；旧 Soul `active_insights` 在 NewsClaw 推荐投影中被
+移除，待确认或已拒绝候选也不会参与排序、评估或文案。删除研究方向后，下一次对应
+调用立即失效。普通 OpenBiliClaw 模式完全保留原画像摘要与推荐行为，也不会读取 P4 表。
+
 ## 已实现功能
 
 | 任务 | 状态 | 说明 |

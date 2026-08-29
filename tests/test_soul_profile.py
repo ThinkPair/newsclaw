@@ -1,5 +1,7 @@
 """Tests for the Soul profile models."""
 
+import pytest
+
 from openbiliclaw.soul.profile import (
     AwarenessNote,
     InsightHypothesis,
@@ -7,6 +9,7 @@ from openbiliclaw.soul.profile import (
     OnionProfile,
     PreferenceLayer,
     SoulProfile,
+    insight_memory_state,
     preference_layer_from_dict,
     preference_layer_to_dict,
 )
@@ -35,12 +38,50 @@ class TestSoulProfile:
                 InsightHypothesis(
                     hypothesis="他看游戏视频是为了放松",
                     confidence=0.8,
+                    validated=True,
+                    user_verdict="confirmed",
+                    verdict_source="insight_feedback",
                 ),
             ]
         )
         context = profile.to_llm_context()
         assert "放松" in context
         assert "80%" in context
+
+    def test_newsclaw_profile_context_hides_legacy_insights(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
+        insight = InsightHypothesis(
+            hypothesis="旧画像洞察不得绕过个人记忆确认",
+            confidence=0.9,
+            validated=True,
+            user_verdict="confirmed",
+            verdict_source="insight_feedback",
+        )
+
+        assert "旧画像洞察" not in SoulProfile(active_insights=[insight]).to_llm_context()
+        assert "旧画像洞察" not in OnionProfile(active_insights=[insight]).to_llm_context()
+
+    def test_legacy_validated_or_unsourced_confirmed_stays_pending(self) -> None:
+        assert insight_memory_state(InsightHypothesis(validated=True)) == "pending"
+        assert (
+            insight_memory_state(InsightHypothesis(user_verdict="confirmed"))
+            == "pending"
+        )
+
+    def test_explicit_verdict_source_controls_memory_state(self) -> None:
+        assert (
+            insight_memory_state(
+                InsightHypothesis(
+                    user_verdict="confirmed",
+                    verdict_source="insight_feedback",
+                )
+            )
+            == "confirmed"
+        )
+        assert insight_memory_state(InsightHypothesis(user_verdict="rejected")) == "rejected"
 
     def test_profile_with_awareness(self) -> None:
         profile = SoulProfile(

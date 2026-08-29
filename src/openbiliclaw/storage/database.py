@@ -250,6 +250,27 @@ class EventInsertResult:
         return not self.inserted
 
 
+class PersonalMemoryConflictError(RuntimeError):
+    """A personal-memory mutation lost its optimistic concurrency check."""
+
+
+class PersonalMemoryMergeRequiredError(PersonalMemoryConflictError):
+    """Accepting a candidate would replace or restore an existing memory.
+
+    The caller must show the target to the user and retry with the exact target
+    identity and version.  Keeping the preview on the exception lets the HTTP
+    layer expose a bounded public snapshot without performing a partial write.
+    """
+
+    def __init__(self, target_item: Mapping[str, Any]) -> None:
+        super().__init__("candidate acceptance requires explicit target confirmation")
+        self.target_item = dict(target_item)
+
+
+class PersonalMemoryRequestConflictError(RuntimeError):
+    """One idempotency key was reused for a different mutation."""
+
+
 # Cap the probe so a long legitimate blurb never costs a full parse. Real
 # copy is a sentence or two; a serialized batch payload is far longer than
 # this, but the prefix alone is enough to identify one.
@@ -1074,9 +1095,21 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-# Schema version for migrations.  V7 adds the additive NewsClaw event projection
-# while preserving the pre-existing ``events`` behavioral log unchanged.
-_SCHEMA_VERSION = 7
+# Schema version for migrations. V8 adds the user-controlled NewsClaw personal
+# memory ledger. It is intentionally separate from the behavioural ``events``
+# log and AI-generated soul/profile files: only explicit user actions can move a
+# candidate into the active memory table.
+_SCHEMA_VERSION = 8
+
+_PERSONAL_MEMORY_KINDS = frozenset({"confirmed_fact", "research_direction"})
+_PERSONAL_MEMORY_ITEM_STATUSES = frozenset({"active", "deleted"})
+_PERSONAL_MEMORY_CANDIDATE_STATUSES = frozenset({"pending", "accepted", "rejected"})
+_PERSONAL_MEMORY_CANDIDATE_SOURCE_TYPES = frozenset(
+    {"system_inference", "chat", "event", "import"}
+)
+_PERSONAL_MEMORY_EVIDENCE_FIELDS = frozenset(
+    {"type", "ref", "excerpt", "hash", "observed_at"}
+)
 
 _NEWS_EVENT_CONTRACT_VERSION = "news-event-v1"
 _NEWS_EVENT_FACT_GATE_MIGRATION_VERSION = "news-event-fact-gate-v4"
@@ -1476,6 +1509,108 @@ CREATE INDEX IF NOT EXISTS idx_profile_ledger_timestamp
     ON profile_update_ledger(timestamp);
 CREATE INDEX IF NOT EXISTS idx_profile_ledger_write_point
     ON profile_update_ledger(write_point, timestamp);
+
+-- NewsClaw P4: user-controlled personal memory. These tables deliberately do
+-- not reuse profile_update_ledger or the behavioural event log. AI/behavioural
+-- observations live as pending candidates until an explicit user decision.
+CREATE TABLE IF NOT EXISTS personal_memory_items (
+    memory_id           TEXT PRIMARY KEY,
+    kind                TEXT NOT NULL CHECK (kind IN ('confirmed_fact', 'research_direction')),
+    claim_key           TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'deleted')),
+    source_type         TEXT NOT NULL DEFAULT 'user'
+                        CHECK (source_type IN ('user', 'confirmed_inference')),
+    source_ref          TEXT NOT NULL DEFAULT '',
+    proposal_reason     TEXT NOT NULL DEFAULT '',
+    confidence          REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),
+    evidence_json       TEXT NOT NULL DEFAULT '[]',
+    origin_candidate_id TEXT NOT NULL DEFAULT '',
+    version             INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    deleted_at          TEXT NOT NULL DEFAULT '',
+    CHECK (
+        (source_type = 'user' AND origin_candidate_id = '') OR
+        (source_type = 'confirmed_inference' AND origin_candidate_id <> '')
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_personal_memory_claim
+    ON personal_memory_items(kind, claim_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_personal_memory_content
+    ON personal_memory_items(kind, content_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_personal_memory_items_list
+    ON personal_memory_items(status, kind, updated_at DESC, memory_id);
+
+CREATE TABLE IF NOT EXISTS personal_memory_candidates (
+    candidate_id         TEXT PRIMARY KEY,
+    fingerprint          TEXT NOT NULL UNIQUE,
+    proposed_kind        TEXT NOT NULL
+                         CHECK (proposed_kind IN ('confirmed_fact', 'research_direction')),
+    claim_key            TEXT NOT NULL,
+    content_fingerprint  TEXT NOT NULL,
+    title                TEXT NOT NULL,
+    content              TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending', 'accepted', 'rejected')),
+    source_type          TEXT NOT NULL DEFAULT 'system_inference'
+                         CHECK (source_type IN ('system_inference', 'chat', 'event', 'import')),
+    source_ref           TEXT NOT NULL DEFAULT '',
+    proposal_reason      TEXT NOT NULL,
+    confidence           REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+    evidence_json        TEXT NOT NULL DEFAULT '[]',
+    version              INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at           TEXT NOT NULL,
+    resolved_at          TEXT NOT NULL DEFAULT '',
+    resolution_memory_id TEXT NOT NULL DEFAULT '',
+    rejection_reason     TEXT NOT NULL DEFAULT '',
+    CHECK (
+        (status = 'pending' AND resolved_at = '' AND
+         resolution_memory_id = '' AND rejection_reason = '') OR
+        (status = 'accepted' AND resolved_at <> '' AND
+         resolution_memory_id <> '' AND rejection_reason = '') OR
+        (status = 'rejected' AND resolved_at <> '' AND
+         resolution_memory_id = '' AND rejection_reason <> '')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_personal_memory_candidates_list
+    ON personal_memory_candidates(status, created_at DESC, candidate_id);
+
+CREATE TABLE IF NOT EXISTS personal_memory_revisions (
+    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_type TEXT NOT NULL CHECK (target_type IN ('memory', 'candidate')),
+    target_id   TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    actor       TEXT NOT NULL DEFAULT 'user',
+    reason      TEXT NOT NULL DEFAULT '',
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json  TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    CHECK (actor IN ('user', 'system')),
+    CHECK (action IN (
+        'create', 'edit', 'delete', 'restore',
+        'create_from_candidate', 'update_from_candidate', 'restore_from_candidate',
+        'propose', 'accept_candidate', 'reject_candidate'
+    )),
+    UNIQUE (target_type, target_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_personal_memory_revisions_history
+    ON personal_memory_revisions(revision_id DESC);
+CREATE INDEX IF NOT EXISTS idx_personal_memory_revisions_target
+    ON personal_memory_revisions(target_type, target_id, revision_id DESC);
+
+CREATE TABLE IF NOT EXISTS personal_memory_requests (
+    request_id    TEXT PRIMARY KEY,
+    action        TEXT NOT NULL,
+    target_id     TEXT NOT NULL DEFAULT '',
+    request_fingerprint TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
 
 -- v0.3.175+ (cognitive profile pipeline Phase 2): "看不懂" (confusion) objects.
 -- A confusion is raised when a behaviour cannot be cleanly read (awareness
@@ -3865,6 +4000,1442 @@ class Database:
             record["source_refs"] = decoded if isinstance(decoded, list) else []
             rows.append(record)
         return rows
+
+    # ------------------------------------------------------------------
+    # NewsClaw P4 personal memory (user-controlled, versioned, local)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _personal_memory_now() -> str:
+        return datetime.now(UTC).isoformat()
+
+    @staticmethod
+    def _personal_memory_text(
+        value: object,
+        *,
+        field: str,
+        max_length: int,
+        required: bool = False,
+    ) -> str:
+        text = " ".join(str(value or "").split()).strip()
+        if required and not text:
+            raise ValueError(f"{field} is required")
+        if len(text) > max_length:
+            raise ValueError(f"{field} is too long")
+        return text
+
+    @staticmethod
+    def _personal_memory_kind(value: object) -> str:
+        kind = str(value or "").strip().lower()
+        if kind not in _PERSONAL_MEMORY_KINDS:
+            raise ValueError("unsupported personal memory kind")
+        return kind
+
+    @staticmethod
+    def _personal_memory_candidate_source_type(value: object) -> str:
+        source_type = str(value or "system_inference").strip().lower()
+        if source_type not in _PERSONAL_MEMORY_CANDIDATE_SOURCE_TYPES:
+            raise ValueError("unsupported personal memory candidate source type")
+        return source_type
+
+    @classmethod
+    def _personal_memory_evidence_json(cls, evidence: Sequence[object] | None) -> str:
+        if evidence is None:
+            items: list[object] = []
+        elif isinstance(evidence, str | bytes):
+            raise ValueError("personal memory evidence must be a list")
+        else:
+            items = list(evidence)
+        if len(items) > 20:
+            raise ValueError("too many personal memory evidence records")
+        normalized: list[dict[str, str]] = []
+        for raw in items:
+            if not isinstance(raw, Mapping):
+                raise ValueError("personal memory evidence must contain objects")
+            unknown = set(raw) - _PERSONAL_MEMORY_EVIDENCE_FIELDS
+            if unknown:
+                raise ValueError("personal memory evidence contains unsupported fields")
+            evidence_type = cls._personal_memory_text(
+                raw.get("type"), field="evidence type", max_length=40, required=True
+            ).lower()
+            evidence_ref = cls._personal_memory_source_ref(
+                raw.get("ref"), required=True
+            )
+            detached = {"type": evidence_type, "ref": evidence_ref}
+            excerpt = cls._personal_memory_text(
+                raw.get("excerpt"), field="evidence excerpt", max_length=500
+            )
+            if excerpt:
+                detached["excerpt"] = excerpt
+            evidence_hash = cls._personal_memory_text(
+                raw.get("hash"), field="evidence hash", max_length=128
+            ).lower()
+            if evidence_hash:
+                if not re.fullmatch(r"[a-f0-9]{16,128}", evidence_hash):
+                    raise ValueError("personal memory evidence hash is invalid")
+                detached["hash"] = evidence_hash
+            observed_at = cls._personal_memory_text(
+                raw.get("observed_at"), field="evidence observed_at", max_length=64
+            )
+            if observed_at:
+                detached["observed_at"] = observed_at
+            encoded = json.dumps(
+                detached,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(encoded) > 4000:
+                raise ValueError("personal memory evidence record is too large")
+            normalized.append(detached)
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def _personal_memory_source_ref(cls, value: object, *, required: bool) -> str:
+        source_ref = cls._personal_memory_text(
+            value,
+            field="source_ref",
+            max_length=500,
+            required=required,
+        )
+        if not source_ref:
+            return ""
+        if source_ref.startswith(("http://", "https://")):
+            parts = urlsplit(source_ref)
+            if parts.username or parts.password or not parts.hostname:
+                raise ValueError("personal memory source URL is unsafe")
+            return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
+        if source_ref.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", source_ref):
+            raise ValueError("personal memory source_ref must not expose a local path")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._~/-]{1,360}", source_ref):
+            raise ValueError("personal memory source_ref is invalid")
+        return source_ref
+
+    @staticmethod
+    def _personal_memory_decode_json(value: object, *, fallback: object) -> object:
+        try:
+            decoded = json.loads(str(value or ""))
+        except (TypeError, ValueError):
+            return fallback
+        return decoded
+
+    @staticmethod
+    def _personal_memory_confidence(value: object, *, default: float) -> float:
+        try:
+            confidence = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            confidence = default
+        if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
+            raise ValueError("personal memory confidence must be between 0 and 1")
+        return round(confidence, 4)
+
+    @staticmethod
+    def _personal_memory_claim_key(*, kind: str, title: str) -> str:
+        normalized = unicodedata.normalize("NFKC", " ".join(title.split())).strip().casefold()
+        return hashlib.sha256(f"{kind}\0{normalized}".encode()).hexdigest()
+
+    @staticmethod
+    def _personal_memory_content_fingerprint(*, kind: str, content: str) -> str:
+        normalized = unicodedata.normalize("NFKC", " ".join(content.split())).strip().casefold()
+        return hashlib.sha256(f"{kind}\0{normalized}".encode()).hexdigest()
+
+    @classmethod
+    def _personal_memory_candidate_fingerprint(
+        cls,
+        *,
+        kind: str,
+        claim_key: str,
+        content_fingerprint: str,
+    ) -> str:
+        return hashlib.sha256(
+            f"{kind}\0{claim_key}\0{content_fingerprint}".encode()
+        ).hexdigest()
+
+    @classmethod
+    def _personal_memory_item_dict(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        evidence = cls._personal_memory_decode_json(result.get("evidence_json"), fallback=[])
+        result["evidence"] = evidence if isinstance(evidence, list) else []
+        result.pop("evidence_json", None)
+        result["confidence"] = float(result.get("confidence") or 0.0)
+        result["version"] = int(result.get("version") or 1)
+        result["can_restore"] = str(result.get("status") or "") == "deleted"
+        return result
+
+    @classmethod
+    def _personal_memory_candidate_dict(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        evidence = cls._personal_memory_decode_json(result.get("evidence_json"), fallback=[])
+        result["evidence"] = evidence if isinstance(evidence, list) else []
+        result.pop("evidence_json", None)
+        result["confidence"] = float(result.get("confidence") or 0.0)
+        result["version"] = int(result.get("version") or 1)
+        return result
+
+    @classmethod
+    def _personal_memory_revision_dict(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        before = cls._personal_memory_decode_json(result.get("before_json"), fallback={})
+        after = cls._personal_memory_decode_json(result.get("after_json"), fallback={})
+        result["before"] = before if isinstance(before, dict) else {}
+        result["after"] = after if isinstance(after, dict) else {}
+        result.pop("before_json", None)
+        result.pop("after_json", None)
+        result["version"] = int(result.get("version") or 1)
+        current_status = str(result.pop("current_status", "") or "")
+        current_version = int(result.pop("current_version", 0) or 0)
+        result["can_restore"] = (
+            result.get("target_type") == "memory"
+            and result.get("action") == "delete"
+            and current_status == "deleted"
+            and current_version == result["version"]
+        )
+        result["restore_version"] = current_version if result["can_restore"] else 0
+        snapshot = result["after"] or result["before"]
+        if result.get("action") == "accept_candidate" and isinstance(result["after"], dict):
+            snapshot = result["after"].get("candidate") or result["after"]
+        result["title"] = str(snapshot.get("title") or "") if isinstance(snapshot, dict) else ""
+        result["content"] = (
+            str(snapshot.get("content") or "") if isinstance(snapshot, dict) else ""
+        )
+        return result
+
+    @classmethod
+    def _personal_memory_request_id(cls, value: object) -> str:
+        return cls._personal_memory_text(
+            value,
+            field="request_id",
+            max_length=128,
+            required=True,
+        )
+
+    @staticmethod
+    def _personal_memory_request_fingerprint(
+        *, action: str, target_id: str, payload: Mapping[str, Any]
+    ) -> str:
+        encoded = json.dumps(
+            {"action": action, "target_id": target_id, "payload": dict(payload)},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _personal_memory_replay_on(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        action: str,
+        target_id: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT action, target_id, request_fingerprint, response_json
+            FROM personal_memory_requests WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            str(row["action"]) != action
+            or str(row["target_id"]) != target_id
+            or str(row["request_fingerprint"]) != request_fingerprint
+        ):
+            raise PersonalMemoryRequestConflictError(
+                "personal memory request_id was reused for a different mutation"
+            )
+        decoded = cls._personal_memory_decode_json(row["response_json"], fallback={})
+        if not isinstance(decoded, dict):
+            raise RuntimeError("personal memory idempotency receipt is corrupt")
+        return {**decoded, "replayed": True}
+
+    @staticmethod
+    def _record_personal_memory_request_on(
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        action: str,
+        target_id: str,
+        request_fingerprint: str,
+        receipt: Mapping[str, Any],
+        created_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO personal_memory_requests (
+                request_id, action, target_id, request_fingerprint,
+                response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                action,
+                target_id,
+                request_fingerprint,
+                json.dumps(
+                    dict(receipt),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                created_at,
+            ),
+        )
+
+    @staticmethod
+    def _insert_personal_memory_revision_on(
+        conn: sqlite3.Connection,
+        *,
+        target_type: str,
+        target_id: str,
+        action: str,
+        version: int,
+        actor: str,
+        reason: str,
+        before: Mapping[str, Any] | None,
+        after: Mapping[str, Any] | None,
+        created_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO personal_memory_revisions (
+                target_type, target_id, action, version, actor, reason,
+                before_json, after_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                target_type,
+                target_id,
+                action,
+                int(version),
+                actor,
+                reason,
+                json.dumps(
+                    dict(before or {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    dict(after or {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                created_at,
+            ),
+        )
+
+    def create_personal_memory_item(
+        self,
+        *,
+        kind: str,
+        content: str,
+        request_id: str,
+        title: str = "",
+        source_type: str = "user",
+        origin_candidate_id: str = "",
+    ) -> dict[str, Any]:
+        """Create an active user memory with a durable idempotent receipt."""
+
+        normalized_kind = self._personal_memory_kind(kind)
+        normalized_content = self._personal_memory_text(
+            content, field="content", max_length=4000, required=True
+        )
+        normalized_title = self._personal_memory_text(
+            title, field="title", max_length=120
+        ) or normalized_content[:48]
+        if str(source_type or "user").strip().lower() != "user":
+            raise ValueError("only an explicit user action can create active personal memory")
+        if str(origin_candidate_id or "").strip():
+            raise ValueError("candidate memory must be accepted through the candidate workflow")
+        normalized_request_id = self._personal_memory_request_id(request_id)
+        claim_key = self._personal_memory_claim_key(
+            kind=normalized_kind, title=normalized_title
+        )
+        content_fingerprint = self._personal_memory_content_fingerprint(
+            kind=normalized_kind, content=normalized_content
+        )
+        request_fingerprint = self._personal_memory_request_fingerprint(
+            action="create",
+            target_id="",
+            payload={
+                "kind": normalized_kind,
+                "title": normalized_title,
+                "content": normalized_content,
+                "source_type": "user",
+            },
+        )
+        now = self._personal_memory_now()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            replay = self._personal_memory_replay_on(
+                conn,
+                request_id=normalized_request_id,
+                action="create",
+                target_id="",
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                replay_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (str(replay.get("target_id") or ""),),
+                ).fetchone()
+                if replay_row is None:
+                    raise RuntimeError("personal memory idempotency target is missing")
+                conn.rollback()
+                return {
+                    "item": self._personal_memory_item_dict(replay_row),
+                    "created": bool(replay.get("created")),
+                    "replayed": True,
+                }
+            existing_rows = conn.execute(
+                """
+                SELECT * FROM personal_memory_items
+                WHERE kind = ? AND (claim_key = ? OR content_fingerprint = ?)
+                ORDER BY created_at ASC, memory_id ASC
+                """,
+                (normalized_kind, claim_key, content_fingerprint),
+            ).fetchall()
+            if len(existing_rows) > 1:
+                raise PersonalMemoryConflictError(
+                    "personal memory identity collides with more than one existing item"
+                )
+            existing = existing_rows[0] if existing_rows else None
+            if existing is not None and str(existing["status"]) == "deleted":
+                raise PersonalMemoryConflictError(
+                    "this memory was deleted; restore its existing history instead of recreating it"
+                )
+            if existing is not None:
+                same_claim = str(existing["claim_key"]) == claim_key
+                same_content = str(existing["content_fingerprint"]) == content_fingerprint
+                if same_claim and not same_content:
+                    raise PersonalMemoryConflictError(
+                        "this memory already exists with different content; edit it instead"
+                    )
+                response: dict[str, Any] = {
+                    "item": self._personal_memory_item_dict(existing),
+                    "created": False,
+                    "replayed": False,
+                }
+                target_id = str(existing["memory_id"])
+            else:
+                target_id = str(uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO personal_memory_items (
+                        memory_id, kind, claim_key, content_fingerprint,
+                        title, content, status,
+                        source_type, source_ref, proposal_reason, confidence,
+                        evidence_json, origin_candidate_id, version,
+                        created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', 'user', '',
+                              '用户主动确认', 1.0, '[]', '', 1, ?, ?, '')
+                    """,
+                    (
+                        target_id,
+                        normalized_kind,
+                        claim_key,
+                        content_fingerprint,
+                        normalized_title,
+                        normalized_content,
+                        now,
+                        now,
+                    ),
+                )
+                created_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (target_id,),
+                ).fetchone()
+                if created_row is None:  # pragma: no cover
+                    raise RuntimeError("personal memory item disappeared during create")
+                item = self._personal_memory_item_dict(created_row)
+                self._insert_personal_memory_revision_on(
+                    conn,
+                    target_type="memory",
+                    target_id=target_id,
+                    action="create",
+                    version=1,
+                    actor="user",
+                    reason="用户主动确认",
+                    before=None,
+                    after=item,
+                    created_at=now,
+                )
+                response = {"item": item, "created": True, "replayed": False}
+            self._record_personal_memory_request_on(
+                conn,
+                request_id=normalized_request_id,
+                action="create",
+                target_id="",
+                request_fingerprint=request_fingerprint,
+                receipt={
+                    "target_id": target_id,
+                    "result_version": int(response["item"]["version"]),
+                    "result_status": str(response["item"]["status"]),
+                    "created": bool(response["created"]),
+                },
+                created_at=now,
+            )
+            conn.commit()
+            return response
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_personal_memory_item(self, memory_id: str) -> dict[str, Any] | None:
+        normalized_id = str(memory_id or "").strip()
+        if not normalized_id:
+            return None
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        return self._personal_memory_item_dict(row) if row is not None else None
+
+    def list_personal_memory_items(
+        self,
+        *,
+        kind: str = "",
+        status: str = "active",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {*_PERSONAL_MEMORY_ITEM_STATUSES, "all"}:
+            raise ValueError("unsupported personal memory status")
+        clauses: list[str] = []
+        params: list[object] = []
+        if normalized_status != "all":
+            clauses.append("status = ?")
+            params.append(normalized_status)
+        if str(kind or "").strip():
+            normalized_kind = self._personal_memory_kind(kind)
+            clauses.append("kind = ?")
+            params.append(normalized_kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend([max(1, min(int(limit), 200)), max(0, int(offset))])
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM personal_memory_items
+            {where}
+            ORDER BY updated_at DESC, memory_id ASC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [self._personal_memory_item_dict(row) for row in rows]
+
+    def update_personal_memory_item(
+        self,
+        memory_id: str,
+        *,
+        expected_version: int,
+        request_id: str,
+        title: str | None = None,
+        content: str | None = None,
+        reason: str = "用户修改",
+    ) -> dict[str, Any]:
+        normalized_id = self._personal_memory_text(
+            memory_id, field="memory_id", max_length=128, required=True
+        )
+        normalized_request_id = self._personal_memory_request_id(request_id)
+        normalized_reason = self._personal_memory_text(
+            reason, field="reason", max_length=1000
+        )
+        normalized_title = (
+            self._personal_memory_text(title, field="title", max_length=120, required=True)
+            if title is not None
+            else None
+        )
+        normalized_content = (
+            self._personal_memory_text(
+                content, field="content", max_length=4000, required=True
+            )
+            if content is not None
+            else None
+        )
+        request_fingerprint = self._personal_memory_request_fingerprint(
+            action="update",
+            target_id=normalized_id,
+            payload={
+                "expected_version": int(expected_version),
+                "title": normalized_title,
+                "content": normalized_content,
+                "reason": normalized_reason,
+            },
+        )
+        now = self._personal_memory_now()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            replay = self._personal_memory_replay_on(
+                conn,
+                request_id=normalized_request_id,
+                action="update",
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                replay_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if replay_row is None:
+                    raise RuntimeError("personal memory idempotency target is missing")
+                conn.rollback()
+                return {
+                    "item": self._personal_memory_item_dict(replay_row),
+                    "updated": bool(replay.get("updated")),
+                    "replayed": True,
+                }
+            row = conn.execute(
+                "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(normalized_id)
+            before = self._personal_memory_item_dict(row)
+            if str(row["status"]) != "active":
+                raise PersonalMemoryConflictError("deleted personal memory must be restored first")
+            if int(row["version"]) != int(expected_version):
+                raise PersonalMemoryConflictError("personal memory version changed")
+            next_title = normalized_title if normalized_title is not None else str(row["title"])
+            next_content = (
+                normalized_content if normalized_content is not None else str(row["content"])
+            )
+            if next_title == str(row["title"]) and next_content == str(row["content"]):
+                response: dict[str, Any] = {
+                    "item": before,
+                    "updated": False,
+                    "replayed": False,
+                }
+            else:
+                next_version = int(row["version"]) + 1
+                content_fingerprint = self._personal_memory_content_fingerprint(
+                    kind=str(row["kind"]), content=next_content
+                )
+                try:
+                    cursor = conn.execute(
+                        """
+                        UPDATE personal_memory_items
+                        SET content_fingerprint = ?, title = ?, content = ?,
+                            version = ?, updated_at = ?
+                        WHERE memory_id = ? AND version = ? AND status = 'active'
+                        """,
+                        (
+                            content_fingerprint,
+                            next_title,
+                            next_content,
+                            next_version,
+                            now,
+                            normalized_id,
+                            int(expected_version),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise PersonalMemoryConflictError(
+                        "another personal memory already has this content"
+                    ) from exc
+                if cursor.rowcount != 1:
+                    raise PersonalMemoryConflictError("personal memory version changed")
+                updated_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if updated_row is None:  # pragma: no cover
+                    raise RuntimeError("personal memory item disappeared during update")
+                item = self._personal_memory_item_dict(updated_row)
+                self._insert_personal_memory_revision_on(
+                    conn,
+                    target_type="memory",
+                    target_id=normalized_id,
+                    action="edit",
+                    version=next_version,
+                    actor="user",
+                    reason=normalized_reason,
+                    before=before,
+                    after=item,
+                    created_at=now,
+                )
+                response = {"item": item, "updated": True, "replayed": False}
+            self._record_personal_memory_request_on(
+                conn,
+                request_id=normalized_request_id,
+                action="update",
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+                receipt={
+                    "target_id": normalized_id,
+                    "result_version": int(response["item"]["version"]),
+                    "result_status": str(response["item"]["status"]),
+                    "updated": bool(response["updated"]),
+                },
+                created_at=now,
+            )
+            conn.commit()
+            return response
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _set_personal_memory_status(
+        self,
+        memory_id: str,
+        *,
+        status: str,
+        expected_version: int,
+        request_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in _PERSONAL_MEMORY_ITEM_STATUSES:
+            raise ValueError("unsupported personal memory status")
+        action = "delete" if normalized_status == "deleted" else "restore"
+        normalized_id = self._personal_memory_text(
+            memory_id, field="memory_id", max_length=128, required=True
+        )
+        normalized_request_id = self._personal_memory_request_id(request_id)
+        normalized_reason = self._personal_memory_text(reason, field="reason", max_length=1000)
+        request_fingerprint = self._personal_memory_request_fingerprint(
+            action=action,
+            target_id=normalized_id,
+            payload={
+                "expected_version": int(expected_version),
+                "status": normalized_status,
+                "reason": normalized_reason,
+            },
+        )
+        now = self._personal_memory_now()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            replay = self._personal_memory_replay_on(
+                conn,
+                request_id=normalized_request_id,
+                action=action,
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                replay_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if replay_row is None:
+                    raise RuntimeError("personal memory idempotency target is missing")
+                conn.rollback()
+                return {
+                    "item": self._personal_memory_item_dict(replay_row),
+                    "changed": bool(replay.get("changed")),
+                    "replayed": True,
+                }
+            row = conn.execute(
+                "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(normalized_id)
+            before = self._personal_memory_item_dict(row)
+            if int(row["version"]) != int(expected_version):
+                raise PersonalMemoryConflictError("personal memory version changed")
+            if str(row["status"]) == normalized_status:
+                response: dict[str, Any] = {
+                    "item": before,
+                    "changed": False,
+                    "replayed": False,
+                }
+            else:
+                next_version = int(row["version"]) + 1
+                deleted_at = now if normalized_status == "deleted" else ""
+                try:
+                    cursor = conn.execute(
+                        """
+                        UPDATE personal_memory_items
+                        SET status = ?, version = ?, updated_at = ?, deleted_at = ?
+                        WHERE memory_id = ? AND version = ?
+                        """,
+                        (
+                            normalized_status,
+                            next_version,
+                            now,
+                            deleted_at,
+                            normalized_id,
+                            int(expected_version),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise PersonalMemoryConflictError(
+                        "an identical active personal memory already exists"
+                    ) from exc
+                if cursor.rowcount != 1:
+                    raise PersonalMemoryConflictError("personal memory version changed")
+                updated_row = conn.execute(
+                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if updated_row is None:  # pragma: no cover
+                    raise RuntimeError("personal memory item disappeared during status change")
+                item = self._personal_memory_item_dict(updated_row)
+                self._insert_personal_memory_revision_on(
+                    conn,
+                    target_type="memory",
+                    target_id=normalized_id,
+                    action=action,
+                    version=next_version,
+                    actor="user",
+                    reason=normalized_reason,
+                    before=before,
+                    after=item,
+                    created_at=now,
+                )
+                response = {"item": item, "changed": True, "replayed": False}
+            self._record_personal_memory_request_on(
+                conn,
+                request_id=normalized_request_id,
+                action=action,
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+                receipt={
+                    "target_id": normalized_id,
+                    "result_version": int(response["item"]["version"]),
+                    "result_status": str(response["item"]["status"]),
+                    "changed": bool(response["changed"]),
+                },
+                created_at=now,
+            )
+            conn.commit()
+            return response
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def delete_personal_memory_item(
+        self,
+        memory_id: str,
+        *,
+        expected_version: int,
+        request_id: str,
+        reason: str = "用户删除",
+    ) -> dict[str, Any]:
+        return self._set_personal_memory_status(
+            memory_id,
+            status="deleted",
+            expected_version=expected_version,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def restore_personal_memory_item(
+        self,
+        memory_id: str,
+        *,
+        expected_version: int,
+        request_id: str,
+        reason: str = "用户恢复",
+    ) -> dict[str, Any]:
+        return self._set_personal_memory_status(
+            memory_id,
+            status="active",
+            expected_version=expected_version,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def propose_personal_memory_candidate(
+        self,
+        *,
+        proposed_kind: str,
+        content: str,
+        proposal_reason: str,
+        evidence: Sequence[object],
+        title: str = "",
+        source_type: str = "system_inference",
+        source_ref: str = "",
+        confidence: float = 0.5,
+        candidate_id: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one system inference as pending; never promote it automatically."""
+
+        kind = self._personal_memory_kind(proposed_kind)
+        normalized_content = self._personal_memory_text(
+            content, field="content", max_length=4000, required=True
+        )
+        normalized_title = self._personal_memory_text(
+            title, field="title", max_length=120
+        ) or normalized_content[:48]
+        normalized_reason = self._personal_memory_text(
+            proposal_reason, field="proposal_reason", max_length=1000, required=True
+        )
+        normalized_source_type = self._personal_memory_candidate_source_type(source_type)
+        normalized_source_ref = self._personal_memory_source_ref(source_ref, required=True)
+        normalized_confidence = self._personal_memory_confidence(confidence, default=0.5)
+        evidence_json = self._personal_memory_evidence_json(evidence)
+        decoded_evidence = self._personal_memory_decode_json(evidence_json, fallback=[])
+        if not decoded_evidence:
+            raise ValueError("a personal memory candidate requires evidence")
+        if not any(
+            isinstance(item, dict) and item.get("ref") == normalized_source_ref
+            for item in decoded_evidence
+        ):
+            raise ValueError("candidate evidence must reference its source_ref")
+        normalized_id = self._personal_memory_text(
+            candidate_id or str(uuid4()),
+            field="candidate_id",
+            max_length=128,
+            required=True,
+        )
+        claim_key = self._personal_memory_claim_key(kind=kind, title=normalized_title)
+        content_fingerprint = self._personal_memory_content_fingerprint(
+            kind=kind, content=normalized_content
+        )
+        fingerprint = self._personal_memory_candidate_fingerprint(
+            kind=kind,
+            claim_key=claim_key,
+            content_fingerprint=content_fingerprint,
+        )
+        now = self._personal_memory_now()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM personal_memory_candidates WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return self._personal_memory_candidate_dict(existing), False
+            conn.execute(
+                """
+                INSERT INTO personal_memory_candidates (
+                    candidate_id, fingerprint, proposed_kind, claim_key,
+                    content_fingerprint, title, content,
+                    status, source_type, source_ref, proposal_reason, confidence,
+                    evidence_json, version, created_at, resolved_at,
+                    resolution_memory_id, rejection_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 1, ?, '', '', '')
+                """,
+                (
+                    normalized_id,
+                    fingerprint,
+                    kind,
+                    claim_key,
+                    content_fingerprint,
+                    normalized_title,
+                    normalized_content,
+                    normalized_source_type,
+                    normalized_source_ref,
+                    normalized_reason,
+                    normalized_confidence,
+                    evidence_json,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise RuntimeError("personal memory candidate disappeared during create")
+            candidate = self._personal_memory_candidate_dict(row)
+            self._insert_personal_memory_revision_on(
+                conn,
+                target_type="candidate",
+                target_id=normalized_id,
+                action="propose",
+                version=1,
+                actor="system",
+                reason=normalized_reason,
+                before=None,
+                after=candidate,
+                created_at=now,
+            )
+            conn.commit()
+            return candidate, True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_personal_memory_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        normalized_id = str(candidate_id or "").strip()
+        if not normalized_id:
+            return None
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        return self._personal_memory_candidate_dict(row) if row is not None else None
+
+    def list_personal_memory_candidates(
+        self,
+        *,
+        status: str = "pending",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        normalized_status = str(status or "pending").strip().lower()
+        if normalized_status not in {*_PERSONAL_MEMORY_CANDIDATE_STATUSES, "all"}:
+            raise ValueError("unsupported personal memory candidate status")
+        where = "" if normalized_status == "all" else "WHERE status = ?"
+        params: list[object] = [] if normalized_status == "all" else [normalized_status]
+        params.extend([max(1, min(int(limit), 200)), max(0, int(offset))])
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM personal_memory_candidates
+            {where}
+            ORDER BY created_at DESC, candidate_id ASC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [self._personal_memory_candidate_dict(row) for row in rows]
+
+    def resolve_personal_memory_candidate(
+        self,
+        candidate_id: str,
+        *,
+        decision: str,
+        expected_version: int,
+        request_id: str,
+        title: str | None = None,
+        content: str | None = None,
+        kind: str | None = None,
+        rejection_reason: str = "",
+        target_memory_id: str | None = None,
+        expected_memory_version: int | None = None,
+    ) -> dict[str, Any]:
+        normalized_decision = str(decision or "").strip().lower()
+        if normalized_decision not in {"accept", "reject"}:
+            raise ValueError("unsupported personal memory candidate decision")
+        normalized_id = self._personal_memory_text(
+            candidate_id, field="candidate_id", max_length=128, required=True
+        )
+        normalized_request_id = self._personal_memory_request_id(request_id)
+        normalized_rejection = self._personal_memory_text(
+            rejection_reason, field="rejection_reason", max_length=1000
+        )
+        if normalized_decision == "reject" and not normalized_rejection:
+            normalized_rejection = "用户拒绝系统推断"
+        normalized_title = (
+            self._personal_memory_text(title, field="title", max_length=120, required=True)
+            if title is not None
+            else None
+        )
+        normalized_content = (
+            self._personal_memory_text(
+                content, field="content", max_length=4000, required=True
+            )
+            if content is not None
+            else None
+        )
+        normalized_kind = self._personal_memory_kind(kind) if kind is not None else None
+        normalized_target_memory_id = (
+            self._personal_memory_text(
+                target_memory_id,
+                field="target_memory_id",
+                max_length=128,
+                required=True,
+            )
+            if target_memory_id is not None
+            else None
+        )
+        if (normalized_target_memory_id is None) != (expected_memory_version is None):
+            raise ValueError(
+                "target_memory_id and expected_memory_version must be supplied together"
+            )
+        if expected_memory_version is not None and int(expected_memory_version) < 1:
+            raise ValueError("expected_memory_version must be positive")
+        if normalized_decision == "reject" and normalized_target_memory_id is not None:
+            raise ValueError("target memory confirmation is only valid when accepting")
+        action = f"{normalized_decision}_candidate"
+        desired_status = "accepted" if normalized_decision == "accept" else "rejected"
+        request_fingerprint = self._personal_memory_request_fingerprint(
+            action=action,
+            target_id=normalized_id,
+            payload={
+                "expected_version": int(expected_version),
+                "decision": normalized_decision,
+                "kind": normalized_kind,
+                "title": normalized_title,
+                "content": normalized_content,
+                "rejection_reason": normalized_rejection,
+                "target_memory_id": normalized_target_memory_id,
+                "expected_memory_version": expected_memory_version,
+            },
+        )
+        now = self._personal_memory_now()
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            replay = self._personal_memory_replay_on(
+                conn,
+                request_id=normalized_request_id,
+                action=action,
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                replay_candidate = conn.execute(
+                    "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if replay_candidate is None:
+                    raise RuntimeError("personal memory candidate idempotency target is missing")
+                linked_item = None
+                resolution_id = str(replay_candidate["resolution_memory_id"] or "")
+                if resolution_id:
+                    linked_row = conn.execute(
+                        "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                        (resolution_id,),
+                    ).fetchone()
+                    if linked_row is not None:
+                        linked_item = self._personal_memory_item_dict(linked_row)
+                conn.rollback()
+                return {
+                    "candidate": self._personal_memory_candidate_dict(replay_candidate),
+                    "item": linked_item,
+                    "decision": normalized_decision,
+                    "changed": bool(replay.get("changed")),
+                    "replayed": True,
+                }
+            row = conn.execute(
+                "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(normalized_id)
+            before = self._personal_memory_candidate_dict(row)
+            current_status = str(row["status"])
+            if int(row["version"]) != int(expected_version):
+                raise PersonalMemoryConflictError("personal memory candidate version changed")
+            if current_status == desired_status:
+                linked = None
+                resolution_id = str(row["resolution_memory_id"] or "")
+                if resolution_id:
+                    linked_row = conn.execute(
+                        "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                        (resolution_id,),
+                    ).fetchone()
+                    if linked_row is not None:
+                        linked = self._personal_memory_item_dict(linked_row)
+                response: dict[str, Any] = {
+                    "candidate": before,
+                    "item": linked,
+                    "decision": normalized_decision,
+                    "changed": False,
+                    "replayed": False,
+                }
+            elif current_status != "pending":
+                raise PersonalMemoryConflictError(
+                    f"personal memory candidate was already {current_status}"
+                )
+            else:
+                linked_item: dict[str, Any] | None = None
+                resolution_id = ""
+                if normalized_decision == "accept":
+                    accepted_kind = normalized_kind or str(row["proposed_kind"])
+                    accepted_title = normalized_title or str(row["title"])
+                    accepted_content = normalized_content or str(row["content"])
+                    claim_key = self._personal_memory_claim_key(
+                        kind=accepted_kind, title=accepted_title
+                    )
+                    content_fingerprint = self._personal_memory_content_fingerprint(
+                        kind=accepted_kind, content=accepted_content
+                    )
+                    existing_items = conn.execute(
+                        """
+                        SELECT * FROM personal_memory_items
+                        WHERE kind = ? AND (claim_key = ? OR content_fingerprint = ?)
+                        ORDER BY created_at ASC, memory_id ASC
+                        """,
+                        (accepted_kind, claim_key, content_fingerprint),
+                    ).fetchall()
+                    if len(existing_items) > 1:
+                        raise PersonalMemoryConflictError(
+                            "candidate collides with more than one personal memory"
+                        )
+                    existing_item = existing_items[0] if existing_items else None
+                    if existing_item is not None:
+                        resolution_id = str(existing_item["memory_id"])
+                        same_claim = str(existing_item["claim_key"]) == claim_key
+                        same_content = (
+                            str(existing_item["content_fingerprint"]) == content_fingerprint
+                        )
+                        should_mutate = str(existing_item["status"]) == "deleted" or (
+                            same_claim and not same_content
+                        )
+                        if should_mutate:
+                            item_before = self._personal_memory_item_dict(existing_item)
+                            if normalized_target_memory_id is None:
+                                raise PersonalMemoryMergeRequiredError(item_before)
+                            if normalized_target_memory_id != resolution_id:
+                                raise PersonalMemoryConflictError(
+                                    "personal memory target changed while accepting the candidate"
+                                )
+                            if int(expected_memory_version or 0) != int(existing_item["version"]):
+                                raise PersonalMemoryConflictError(
+                                    "personal memory target version changed"
+                                )
+                            item_version = int(existing_item["version"]) + 1
+                            item_action = (
+                                "restore_from_candidate"
+                                if str(existing_item["status"]) == "deleted"
+                                else "update_from_candidate"
+                            )
+                            cursor = conn.execute(
+                                """
+                                UPDATE personal_memory_items
+                                SET content_fingerprint = ?, title = ?, content = ?,
+                                    status = 'active', source_type = 'confirmed_inference',
+                                    source_ref = ?, proposal_reason = ?, confidence = ?,
+                                    evidence_json = ?, origin_candidate_id = ?,
+                                    version = ?, updated_at = ?, deleted_at = ''
+                                WHERE memory_id = ? AND version = ?
+                                """,
+                                (
+                                    content_fingerprint,
+                                    accepted_title,
+                                    accepted_content,
+                                    str(row["source_ref"]),
+                                    str(row["proposal_reason"]),
+                                    float(row["confidence"]),
+                                    str(row["evidence_json"]),
+                                    normalized_id,
+                                    item_version,
+                                    now,
+                                    resolution_id,
+                                    int(expected_memory_version),
+                                ),
+                            )
+                            if cursor.rowcount != 1:
+                                raise PersonalMemoryConflictError(
+                                    "personal memory changed while accepting the candidate"
+                                )
+                            item_row = conn.execute(
+                                "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                                (resolution_id,),
+                            ).fetchone()
+                            if item_row is None:  # pragma: no cover
+                                raise RuntimeError("accepted personal memory disappeared")
+                            linked_item = self._personal_memory_item_dict(item_row)
+                            self._insert_personal_memory_revision_on(
+                                conn,
+                                target_type="memory",
+                                target_id=resolution_id,
+                                action=item_action,
+                                version=item_version,
+                                actor="user",
+                                reason="用户确认系统推断",
+                                before=item_before,
+                                after=linked_item,
+                                created_at=now,
+                            )
+                        else:
+                            if normalized_target_memory_id is not None:
+                                raise PersonalMemoryConflictError(
+                                    "personal memory target no longer requires replacement"
+                                )
+                            linked_item = self._personal_memory_item_dict(existing_item)
+                    else:
+                        if normalized_target_memory_id is not None:
+                            raise PersonalMemoryConflictError(
+                                "personal memory target disappeared while accepting the candidate"
+                            )
+                        resolution_id = str(uuid4())
+                        conn.execute(
+                            """
+                            INSERT INTO personal_memory_items (
+                                memory_id, kind, claim_key, content_fingerprint,
+                                title, content, status,
+                                source_type, source_ref, proposal_reason, confidence,
+                                evidence_json, origin_candidate_id, version,
+                                created_at, updated_at, deleted_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, 'active',
+                                      'confirmed_inference', ?, ?, ?, ?, ?, 1, ?, ?, '')
+                            """,
+                            (
+                                resolution_id,
+                                accepted_kind,
+                                claim_key,
+                                content_fingerprint,
+                                accepted_title,
+                                accepted_content,
+                                str(row["source_ref"]),
+                                str(row["proposal_reason"]),
+                                float(row["confidence"]),
+                                str(row["evidence_json"]),
+                                normalized_id,
+                                now,
+                                now,
+                            ),
+                        )
+                        item_row = conn.execute(
+                            "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                            (resolution_id,),
+                        ).fetchone()
+                        if item_row is None:  # pragma: no cover
+                            raise RuntimeError("accepted personal memory disappeared")
+                        linked_item = self._personal_memory_item_dict(item_row)
+                        self._insert_personal_memory_revision_on(
+                            conn,
+                            target_type="memory",
+                            target_id=resolution_id,
+                            action="create_from_candidate",
+                            version=1,
+                            actor="user",
+                            reason="用户确认系统推断",
+                            before=None,
+                            after=linked_item,
+                            created_at=now,
+                        )
+                next_version = int(row["version"]) + 1
+                cursor = conn.execute(
+                    """
+                    UPDATE personal_memory_candidates
+                    SET status = ?, version = ?, resolved_at = ?,
+                        resolution_memory_id = ?, rejection_reason = ?
+                    WHERE candidate_id = ? AND version = ? AND status = 'pending'
+                    """,
+                    (
+                        desired_status,
+                        next_version,
+                        now,
+                        resolution_id,
+                        normalized_rejection if normalized_decision == "reject" else "",
+                        normalized_id,
+                        int(expected_version),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise PersonalMemoryConflictError(
+                        "personal memory candidate changed during resolution"
+                    )
+                candidate_row = conn.execute(
+                    "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+                    (normalized_id,),
+                ).fetchone()
+                if candidate_row is None:  # pragma: no cover
+                    raise RuntimeError("personal memory candidate disappeared during resolve")
+                candidate = self._personal_memory_candidate_dict(candidate_row)
+                revision_after: Mapping[str, Any]
+                if linked_item is None:
+                    revision_after = candidate
+                else:
+                    revision_after = {"candidate": candidate, "memory": linked_item}
+                self._insert_personal_memory_revision_on(
+                    conn,
+                    target_type="candidate",
+                    target_id=normalized_id,
+                    action=action,
+                    version=next_version,
+                    actor="user",
+                    reason=(
+                        "用户确认系统推断"
+                        if normalized_decision == "accept"
+                        else (normalized_rejection or "用户拒绝系统推断")
+                    ),
+                    before=before,
+                    after=revision_after,
+                    created_at=now,
+                )
+                response = {
+                    "candidate": candidate,
+                    "item": linked_item,
+                    "decision": normalized_decision,
+                    "changed": True,
+                    "replayed": False,
+                }
+            self._record_personal_memory_request_on(
+                conn,
+                request_id=normalized_request_id,
+                action=action,
+                target_id=normalized_id,
+                request_fingerprint=request_fingerprint,
+                receipt={
+                    "target_id": normalized_id,
+                    "result_version": int(response["candidate"]["version"]),
+                    "result_status": str(response["candidate"]["status"]),
+                    "resolution_memory_id": str(
+                        response["candidate"].get("resolution_memory_id") or ""
+                    ),
+                    "decision": normalized_decision,
+                    "changed": bool(response["changed"]),
+                },
+                created_at=now,
+            )
+            conn.commit()
+            return response
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_personal_memory_revisions(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        self._ensure_fresh_read()
+        rows = self.conn.execute(
+            """
+            SELECT r.*,
+                   CASE WHEN r.target_type = 'memory' THEN i.status ELSE c.status END
+                       AS current_status,
+                   CASE WHEN r.target_type = 'memory' THEN i.version ELSE c.version END
+                       AS current_version
+            FROM personal_memory_revisions r
+            LEFT JOIN personal_memory_items i
+                   ON r.target_type = 'memory' AND i.memory_id = r.target_id
+            LEFT JOIN personal_memory_candidates c
+                   ON r.target_type = 'candidate' AND c.candidate_id = r.target_id
+            ORDER BY r.revision_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, min(int(limit), 200)), max(0, int(offset))),
+        ).fetchall()
+        return [self._personal_memory_revision_dict(row) for row in rows]
+
+    def personal_memory_counts(self) -> dict[str, int]:
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM personal_memory_items
+               WHERE status = 'active' AND kind = 'confirmed_fact') AS confirmed_facts,
+              (SELECT COUNT(*) FROM personal_memory_items
+               WHERE status = 'active' AND kind = 'research_direction') AS research_directions,
+              (SELECT COUNT(*) FROM personal_memory_candidates
+               WHERE status = 'pending') AS pending_inferences,
+              (SELECT COUNT(*) FROM personal_memory_revisions) AS revisions
+            """
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            return {
+                "confirmed_facts": 0,
+                "research_directions": 0,
+                "pending_inferences": 0,
+                "revisions": 0,
+            }
+        return {key: int(value or 0) for key, value in dict(row).items()}
 
     def posture_gate_shadow_stats(self) -> dict[str, Any]:
         """Shadow-judgement statistics for the enforce save-time guard (Phase 3).

@@ -14,6 +14,33 @@
 | 洞察层 | Insight | 假设管理 *(P2)* | JSON |
 | 灵魂层 | Soul | 人格描述 + 核心特质 | JSON |
 
+### NewsClaw P4：个人记忆不是第六层 AI 画像
+
+NewsClaw 的 P4 个人记忆与上表五层分开。五层链路回答“系统现在怎样理解你”，
+个人记忆回答“哪些信息是你明确允许长期使用的”。两者不能互相冒充：
+
+| 数据 | 默认状态 | 怎样进入生效个人记忆 |
+|---|---|---|
+| 用户手工新增 | 已确认 | 直接写入 `personal_memory_items` |
+| 对话、事件或系统推断 | 待确认 | 先写 `personal_memory_candidates`，用户接受后才提升 |
+| 旧 Soul / `validated=True` / 无来源旧判词 | 来源未知、待确认 | 不迁移为已确认，必须由用户重新确认 |
+| 用户否定的推断 | 已拒绝 | 保留拒绝记录，不进入核心对话，也不反复提出同一候选 |
+
+个人记忆分为 `confirmed_fact`（长期信息）与 `research_direction`（当前研究）。
+编辑不更换稳定身份；删除是软删除；恢复、候选接受/拒绝和所有修改都会追加
+`personal_memory_revisions`。每次写入同时校验版本与幂等请求 ID，状态、历史和
+最小请求收据在同一个 SQLite 事务提交。候选证据只允许
+`type/ref/excerpt/hash/observed_at`，不会保存 Cookie、Token、原始 Prompt 或本机路径。
+
+生效记忆采用有界、按调用实时读取的分流合同：活动的 `confirmed_fact` 只进入显式的
+对话与带工具对话调用；活动的 `research_direction` 只进入推荐评估与表达上下文。
+通用 `complete_with_core_memory`、结构化评估、兴趣探测、画像构建和 Soul 重建不会收到
+个人记忆。页面浏览和记忆管理本身不会触发模型调用，也不会把内容发给外部提供方。
+删除后下一次对应调用立即失效。接受候选若会更新或恢复现有记忆，第一次请求只返回
+包含现有内容的目标预览；前端必须
+明确二次确认并提交 `target_memory_id + expected_memory_version`，版本变化则以 409 拒绝，
+不能静默覆盖人工内容。
+
 ## 现在画像相关到底有几层
 
 如果从“系统怎么一步步理解你”这个角度看，当前不是一层画像，而是 **5 层**：
@@ -111,10 +138,27 @@
 | 用户画像覆盖层 | ✅ | `profile_overrides.json` 存用户对画像的手动编辑（文本/标量固定 + 列表/兴趣树增删）；`load/save_profile_overrides` 读写，`sync_profile_files` 渲染人类可读镜像前叠加覆盖层，确保编辑在画像重建后仍反映在 `soul_profile.md/.json` |
 | 插件聊天回合 | ✅ | SQLite `chat_turns` 持久化 side panel 主聊天、惊喜推荐内聊、兴趣猜测内聊和避雷探针内聊的 pending/completed/failed 状态 |
 | JSON 状态原子读写 | ✅ | `memory/json_state.py` 提供共享同一进程内锁/跨进程文件锁的 `read_json_state()` 与 `update_json_state()`，写侧再以 `os.replace` 发布；`discovery_runtime.json` 的 probe 反馈历史、冷却 map、短期探索 buffer 等运行态通过 mutator 更新并合并旧快照，避免安装包常驻进程/后台任务并发保存时丢掉用户点击反馈。对话锚在 LLM 返回后的 ref+generation 二次校验使用锁内读，因此不会观察到写到一半的代次。 |
+| NewsClaw P4 个人记忆 | ✅ | 四张独立 SQLite 表保存已确认长期信息/研究方向、待确认候选、版本历史与最小幂等收据；AI 只能提出候选，用户确认才生效，旧画像不自动迁移。 |
 
 > `MemoryManager.propagate_event()` / `propagate_events()` 的职责边界是“落事实”：校验事件类型、补默认信号强度并写入 SQLite。storage 会在同一事务内把 `view` 的 canonical identity upsert 到 `seen_items`，这是推荐去重索引，不是画像推断。单条和批量版本都通过 `asyncio.to_thread` 进入 storage；前者每事件一条独立短连接事务，后者把整批初始化事件交给一条独立连接的单事务接口，二者都避免 SQLite busy wait 阻塞 API loop。生产 HTTP/source 入口统一由 `EventIngressService` 写 durable receipt 并 wake；初始化后的画像增量由 app-owned `EventProcessingScheduler` 的 generic/content-feedback consumers 按各自 cursor 扫描，在 `ProfileUpdatePipeline.checkpointed_enqueue_batch()` 中把 buffer+cursor 原子发布到同一份 `pipeline_state.json`，再调用 `tick_if_buffered()`。独立周期画像维护才调用完整 `tick()`；memory 层仍不会隐式触发偏好、觉察、洞察或 Soul 刷新。
 
 ## 公开 API
+
+### Database 个人记忆方法（NewsClaw 模式）
+
+`Database.create_personal_memory_item()` 只接受显式用户写入；系统来源必须调用
+`propose_personal_memory_candidate()`，再由
+`resolve_personal_memory_candidate(decision="accept"|"reject")` 处理用户决定。
+`update_personal_memory_item()`、`delete_personal_memory_item()` 和
+`restore_personal_memory_item()` 均要求 `expected_version + request_id`。
+`list_personal_memory_revisions()` 返回可审计历史，并且只在目标仍处于对应删除版本时
+标记 `can_restore=true`。HTTP DTO 会过滤内部 `claim_key`、内容指纹和请求收据字段。
+
+`MemoryManager.get_core_memory()` 默认只构建系统推断画像；只有显式传入
+`include_personal_memory=True` 的对话边界才实时读取活动 `confirmed_fact`。NewsClaw
+模式不把旧 Soul insight 放入聊天，也不让它参与 Soul 重建；带明确用户确认来源的旧
+insight 只迁成可见的待确认候选，`pending`、`rejected`、旧 `validated=True` 和来源未知
+verdict 都不能被写成“用户已确认”。普通 OpenBiliClaw 模式保留原画像与重建行为。
 
 ### MemoryManager
 

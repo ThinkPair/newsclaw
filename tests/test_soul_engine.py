@@ -4124,7 +4124,13 @@ def test_anchor_generation_cas_abandons_real_interleaving_before_first_side_effe
 
 
 def _seed_insight(
-    memory: MemoryManager, hypothesis: str, *, validated: bool, confidence: float
+    memory: MemoryManager,
+    hypothesis: str,
+    *,
+    validated: bool,
+    confidence: float,
+    user_verdict: str = "",
+    verdict_source: str = "",
 ) -> None:
     layer = memory.get_layer("insight")
     existing = layer.data.get("hypotheses", [])
@@ -4136,6 +4142,8 @@ def _seed_insight(
             "confidence": confidence,
             "validated": validated,
             "created_at": "",
+            "user_verdict": user_verdict,
+            "verdict_source": verdict_source,
         }
     )
     layer.data["hypotheses"] = existing
@@ -4200,6 +4208,85 @@ async def test_confirm_and_reject_both_mark_rebuild_pending(tmp_path: Path) -> N
     state2 = engine._load_rebuild_state()
     assert isinstance(state2["pending"], dict)
     assert len(state2["pending"]["trigger_refs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_reject_verdict_persists_even_when_confidence_and_validation_do_not_change(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+    _seed_insight(memory, "用户可能追涨", validated=False, confidence=0.3)
+
+    result = await engine.apply_feedback_object(
+        {"hypothesis": "用户可能追涨", "signal": "reject"}
+    )
+
+    assert result["matched"] is True
+    assert result["memory_state"] == "rejected"
+    persisted = engine._load_insights()
+    assert persisted[0].user_verdict == "rejected"
+    assert persisted[0].verdict_source == "insight_feedback"
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_insight_confirmation_only_proposes_visible_p4_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+    _seed_insight(memory, "用户重视可核验来源", validated=False, confidence=0.6)
+
+    result = await engine.apply_feedback_object(
+        {"hypothesis": "用户重视可核验来源", "signal": "confirm"}
+    )
+
+    assert result["memory_state"] == "confirmed"
+    assert memory._database.list_personal_memory_items(status="active") == []
+    pending = memory._database.list_personal_memory_candidates(status="pending")
+    assert len(pending) == 1
+    assert pending[0]["content"] == "用户重视可核验来源"
+    assert pending[0]["source_type"] == "system_inference"
+    assert engine._rebuild_active_insights() == []
+    await engine.mark_feedback_rebuild(
+        {"hypothesis": "用户重视可核验来源", "signal": "confirm"},
+        result,
+    )
+    assert not engine._load_rebuild_state().get("pending")
+
+
+def test_newsclaw_legacy_candidate_sync_ignores_unsourced_confirmed_insights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    memory = MemoryManager(tmp_path)
+    memory.initialize()
+    engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+    _seed_insight(
+        memory,
+        "明确确认的旧洞察",
+        validated=True,
+        confidence=0.9,
+        user_verdict="confirmed",
+        verdict_source="insight_feedback",
+    )
+    _seed_insight(
+        memory,
+        "无来源的旧确认",
+        validated=True,
+        confidence=0.95,
+        user_verdict="confirmed",
+    )
+
+    assert engine.sync_personal_memory_insight_candidates() == 1
+    assert engine.sync_personal_memory_insight_candidates() == 0
+    pending = memory._database.list_personal_memory_candidates(status="pending")
+    assert [row["content"] for row in pending] == ["明确确认的旧洞察"]
 
 
 @pytest.mark.asyncio
@@ -4358,6 +4445,8 @@ async def test_revise_retry_after_derived_checkpoint_keeps_one_object_and_ledger
     assert len(matching) == 1
     assert matching[0].validated is True
     assert matching[0].confidence == 0.82
+    assert matching[0].user_verdict == "confirmed"
+    assert matching[0].verdict_source == "dialogue_anchor"
     assert all(item.hypothesis != "竞争请求不应落库" for item in insights)
     rows = _ledger_rows(memory, "anchor_revise_derived")
     assert len(rows) == 1
@@ -4842,13 +4931,28 @@ async def test_rebuild_input_filters_unvalidated_and_low_confidence(tmp_path: Pa
     memory = MemoryManager(tmp_path)
     memory.initialize()
     engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
-    _seed_insight(memory, "已确认高置信", validated=True, confidence=0.9)
-    _seed_insight(memory, "已确认但低置信", validated=True, confidence=0.6)
+    _seed_insight(
+        memory,
+        "已确认高置信",
+        validated=True,
+        confidence=0.9,
+        user_verdict="confirmed",
+        verdict_source="insight_feedback",
+    )
+    _seed_insight(
+        memory,
+        "已确认但低置信",
+        validated=True,
+        confidence=0.6,
+        user_verdict="confirmed",
+        verdict_source="insight_feedback",
+    )
+    _seed_insight(memory, "旧 validated 高置信", validated=True, confidence=0.95)
     _seed_insight(memory, "未验证高置信", validated=False, confidence=0.95)
 
     active = engine._rebuild_active_insights()
     texts = {str(a["hypothesis"]) for a in active}
-    assert texts == {"已确认高置信"}
+    assert texts == {"已确认高置信", "旧 validated 高置信"}
 
 
 @pytest.mark.asyncio
@@ -5133,11 +5237,11 @@ class TestInitCognitionDraftsArePersisted:
 
 
 class TestBehaviourEarnedDeepInfluence:
-    """深层自主更新：行为佐证足够久的假设，无需用户确认也可参与门控重建。
+    """Behaviour maturity remains metadata, not P4 personal memory.
 
-    用户决策（2026-07-27）：「给模型一些自由度，不能所有的都让用户来确认」。
-    约束：门槛全面高于用户确认路径（0.8 vs 0.75 / 7 天 / 3 条证据），
-    用户拒绝过的永久排除，且仍要过态势门控。
+    The historical maturity predicate is retained for diagnostics, but P4 no
+    longer lets it inject chat core memory or trigger a Soul rebuild without an
+    explicit user verdict source.
     """
 
     @staticmethod
@@ -5220,9 +5324,14 @@ class TestBehaviourEarnedDeepInfluence:
         confirmed = self._hypothesis(validated=True, user_verdict="confirmed")
         assert not SoulEngine._hypothesis_auto_validated(confirmed), "已确认的走 validated 路径"
 
-    def test_rebuild_inputs_include_behaviour_earned_hypotheses(self, tmp_path: Path) -> None:
+    def test_newsclaw_rebuild_inputs_keep_behaviour_earned_hypotheses_pending(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         from openbiliclaw.soul.profile import insight_hypothesis_to_dict
 
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
         memory = MemoryManager(tmp_path)
         memory.initialize()
         engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
@@ -5237,15 +5346,17 @@ class TestBehaviourEarnedDeepInfluence:
 
         visible = [item["hypothesis"] for item in engine._rebuild_active_insights()]
 
-        assert "用户可能是系统编程从业者" in visible
+        assert "用户可能是系统编程从业者" not in visible
         assert "用户可能不爱看长视频" not in visible
 
-    async def test_pending_rebuild_scan_marks_earned_hypotheses(self, tmp_path: Path) -> None:
-        """消费检查点先扫自主达标的假设，进同一台去抖/门控状态机。"""
-        import json as json_module
-
+    async def test_pending_rebuild_scan_does_not_mark_earned_hypotheses(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         from openbiliclaw.soul.profile import insight_hypothesis_to_dict
 
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
         memory = MemoryManager(tmp_path)
         memory.initialize()
         engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
@@ -5255,18 +5366,18 @@ class TestBehaviourEarnedDeepInfluence:
 
         result = await engine.run_pending_rebuild_if_due()
 
-        assert result["reason"] == "debounced", "刚标记的 pending 要吃满去抖，不立刻重建"
+        assert result == {"ran": False, "reason": "not_pending"}
         state_path = tmp_path / "memory" / "rebuild_pending_state.json"
-        state = json_module.loads(state_path.read_text(encoding="utf-8"))
-        refs = state["pending"]["trigger_refs"]
-        assert refs and all(ref.startswith("auto_hypothesis:") for ref in refs)
+        assert not state_path.exists()
 
-    async def test_consumed_auto_hypothesis_is_not_requeued(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    async def test_earned_hypothesis_never_enters_newsclaw_rebuild_queue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """同一条自主假设成功消费后，后续扫描不能每 6 小时重建一次。"""
         from openbiliclaw.soul.profile import insight_hypothesis_to_dict
 
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
         memory = MemoryManager(tmp_path)
         memory.initialize()
         engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
@@ -5274,30 +5385,18 @@ class TestBehaviourEarnedDeepInfluence:
             insight_hypothesis_to_dict(self._hypothesis())
         ]
 
-        async def _accept(_trigger_refs: list[str]) -> str:
-            return "accept"
-
-        monkeypatch.setattr(engine, "_execute_pending_rebuild", _accept)
         current = datetime.now()
         first = await engine.run_pending_rebuild_if_due(now=current)
-        assert first["reason"] == "debounced"
+        assert first == {"ran": False, "reason": "not_pending"}
 
-        state = engine._load_rebuild_state()
-        state["pending"]["set_at"] = (current - timedelta(hours=7)).isoformat()
-        engine._save_rebuild_state(state)
-        accepted = await engine.run_pending_rebuild_if_due(now=current)
-        assert accepted["outcome"] == "accept"
-
-        repeated = await engine.run_pending_rebuild_if_due(now=current)
-        assert repeated == {"ran": False, "reason": "not_pending"}
-
-    async def test_gate_context_includes_behaviour_earned_hypotheses(
+    async def test_newsclaw_pending_rebuild_is_cleared_without_legacy_build(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """门控必须看见将要影响深层画像的自动假设，而不只是它的哈希 ref。"""
+        """A marker left by an old runtime cannot smuggle inference into Soul."""
         from openbiliclaw.soul.posture_gate import REJECT, GateDecision
         from openbiliclaw.soul.profile import insight_hypothesis_to_dict
 
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
         memory = MemoryManager(tmp_path)
         memory.initialize()
         engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
@@ -5314,22 +5413,37 @@ class TestBehaviourEarnedDeepInfluence:
 
         outcome = await engine._execute_pending_rebuild(["auto_hypothesis:test"])
 
-        assert outcome == "refusal"
-        context = captured["context"]
-        assert isinstance(context, dict)
-        assert context["auto_validated_hypotheses"] == ["用户可能是系统编程从业者"]
+        assert outcome == "accept"
+        assert captured == {}
+
+    async def test_ordinary_mode_keeps_behaviour_earned_rebuild_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from openbiliclaw.soul.profile import insight_hypothesis_to_dict
+
+        monkeypatch.delenv("NEWSCLAW_MODE", raising=False)
+        memory = MemoryManager(tmp_path)
+        memory.initialize()
+        engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
+        memory.get_layer("insight").data["hypotheses"] = [
+            insight_hypothesis_to_dict(self._hypothesis())
+        ]
+
+        assert [item["hypothesis"] for item in engine._rebuild_active_insights()] == [
+            "用户可能是系统编程从业者"
+        ]
+        result = await engine.run_pending_rebuild_if_due()
+        assert result["reason"] == "debounced"
 
 
 class TestDialogueDeepFastLane:
-    """对话是用户亲口说的：过门的深层自述当轮落 validated 假设 + 当轮重建。
-
-    用户决策（2026-07-27）：对话不论兴趣还是深层都走快速通道——它是用户直接
-    反馈，甚至是对画像的直接命令。此前过门的 goal/value/state 候选只喂一次
-    偏好 prompt 就消失，且纯深层自述不动兴趣权重时根本触发不了重建。
-    """
+    """P4 boundary: ordinary deep dialogue becomes pending personal memory."""
 
     @staticmethod
     def _engine(tmp_path, monkeypatch, *, kind: str = "state"):
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
         memory = MemoryManager(tmp_path)
         memory.initialize()
         engine = SoulEngine(llm=FakeRegistry("{}"), memory=memory)
@@ -5352,7 +5466,7 @@ class TestDialogueDeepFastLane:
         monkeypatch.setattr(engine._preference_analyzer, "analyze_events", fake_analyze_events)
         return engine, memory
 
-    async def test_accepted_deep_statement_becomes_a_validated_hypothesis(
+    async def test_deep_statement_becomes_a_pending_personal_memory_candidate(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         engine, memory = self._engine(tmp_path, monkeypatch)
@@ -5361,15 +5475,21 @@ class TestDialogueDeepFastLane:
             user_message="跟你说，我最近其实处于职业转型期。",
             assistant_reply="明白，这解释了你最近看的内容。",
             session="popup",
+            turn_id="私密 turn / invalid?",
         )
 
-        hyps = memory.get_layer("insight").data.get("hypotheses", [])
-        mine = [h for h in hyps if "职业转型期" in h.get("hypothesis", "")]
-        assert mine, "过门的深层自述必须落成假设，不能喂一次 prompt 就消失"
-        assert mine[0]["validated"] is True, "用户亲口说的就是确认"
-        assert mine[0]["user_verdict"] == "confirmed"
+        assert memory.get_layer("insight").data.get("hypotheses", []) == []
+        pending = memory._database.list_personal_memory_candidates(status="pending")
+        assert len(pending) == 1
+        assert "职业转型期" in pending[0]["content"]
+        assert pending[0]["source_type"] == "chat"
+        source_ref = str(pending[0]["source_ref"])
+        assert source_ref.startswith("chat:")
+        assert len(source_ref.removeprefix("chat:")) == 24
+        assert all(char in "0123456789abcdef" for char in source_ref.removeprefix("chat:"))
+        assert "私密" not in source_ref
 
-    async def test_pure_deep_statement_triggers_a_same_turn_rebuild(
+    async def test_pending_deep_statement_does_not_trigger_same_turn_rebuild(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         engine, memory = self._engine(tmp_path, monkeypatch)
@@ -5396,8 +5516,8 @@ class TestDialogueDeepFastLane:
             session="popup",
         )
 
-        assert rebuilt, "纯深层自述不动兴趣权重，也必须当轮重建"
-        assert result["profile_rebuilt"] is True
+        assert rebuilt == []
+        assert result["profile_rebuilt"] is False
 
     async def test_interest_only_turns_do_not_take_the_deep_lane(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5415,6 +5535,32 @@ class TestDialogueDeepFastLane:
             "interest 走快线，不该被落成深层假设"
         )
         assert result["profile_rebuilt"] is False, "偏好没显著变化、又无深层自述，不重建"
+
+    async def test_ordinary_mode_preserves_deep_fast_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        engine, memory = self._engine(tmp_path, monkeypatch)
+        monkeypatch.delenv("NEWSCLAW_MODE", raising=False)
+        rebuilt: list[bool] = []
+
+        async def fake_build(**_kwargs):
+            rebuilt.append(True)
+            return SoulProfile(personality_portrait="普通版重建后的画像。")
+
+        monkeypatch.setattr(engine._profile_builder, "build", fake_build)
+        result = await engine.learn_from_dialogue(
+            user_message="我最近其实处于职业转型期。",
+            assistant_reply="记下了。",
+            session="popup",
+        )
+
+        hypotheses = memory.get_layer("insight").data.get("hypotheses", [])
+        assert any(item.get("validated") is True for item in hypotheses)
+        assert rebuilt == [True]
+        assert result["profile_rebuilt"] is True
+        assert memory._database.list_personal_memory_candidates(status="pending") == []
 
 
 # ===========================================================================

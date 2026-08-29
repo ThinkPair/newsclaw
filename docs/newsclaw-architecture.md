@@ -254,8 +254,9 @@ truth rather than introduce a parallel ledger.
 Phase 3 adds a source-independent truth layer. An article becomes an immutable
 evidence membership, a tracker remains the user's monitoring instruction, and
 a completed check remains an execution receipt. The durable product unit is one
-real-world event and its verified state transitions; Phase 4 consumes this
-contract without changing its ownership.
+real-world event and its verified state transitions. The desktop event dossier
+consumes this contract without changing its ownership; it is the presentation
+surface of this same Phase 3 contract, not a separate roadmap phase.
 
 ```text
 Phase 2 changed check + evidence
@@ -335,9 +336,9 @@ auditable membership but cannot create the durable conflict state by itself.
 These reads do not refresh sources, call Tavily, publish a recommendation,
 enqueue work or mutate the profile.
 
-### Phase 4 event workspace (implemented desktop contract)
+### Phase 3 event dossier (implemented desktop contract)
 
-Phase 4 makes the Phase 3 truth usable without creating a second client-side
+The event dossier makes the Phase 3 truth usable without creating a second client-side
 ledger. The desktop home adds an event workspace with three progressive layers:
 
 ```text
@@ -382,6 +383,64 @@ unresolved conflicting outcomes or objective rows that are no longer reachable
 from the event's accepted state chain. Those records remain available only in
 their explicit audit/conflict surfaces.
 
+### Phase 4 personal memory (implemented user-control contract)
+
+Phase 4 does not replace the five-layer Soul pipeline. It adds a separate,
+local-only layer for claims the user has explicitly chosen to keep:
+
+```text
+behaviour / chat / legacy Soul
+        └→ system inference ─→ sourced pending candidate
+                                      ├→ user rejects ─→ durable rejected record
+                                      └→ user accepts or edits+accepts
+                                                        └→ active personal memory
+
+manual user entry ─────────────────────────────────────→ active personal memory
+active personal memory ─→ edit / soft delete / restore ─→ append-only revision history
+```
+
+The authoritative stores are `personal_memory_items`,
+`personal_memory_candidates`, `personal_memory_revisions`, and the minimal
+`personal_memory_requests` idempotency receipt table. Active items have one
+stable identity, a monotonic version, a `confirmed_fact` or
+`research_direction` kind, and an explicit provenance. Deletion is soft; a
+deleted identity must be restored instead of silently recreated. Candidate
+accept/reject and item create/edit/delete/restore write the state change,
+revision, and request receipt in one SQLite transaction. Every new mutation
+checks `expected_version`; reusing a request ID for a different target or
+payload returns a conflict instead of replaying the wrong result.
+
+Inference producers can call the internal candidate method but there is no
+public candidate-creation endpoint. Evidence accepts only the bounded
+`type/ref/excerpt/hash/observed_at` structure; unsafe local paths, credential
+fields, and token-bearing URL query/fragment data are refused or removed.
+Public DTOs omit internal claim/content fingerprints and request data. The
+personal-memory bodies stay local and are not sent to an external model merely
+because the management page is opened.
+
+Consumption is explicitly split by purpose. Active `confirmed_fact` rows are
+loaded only by dialogue and tool-enabled dialogue calls. Active
+`research_direction` rows are loaded only by recommendation evaluation and copy
+generation. Generic structured/multimodal tasks, probes, profile work, and Soul
+rebuilds receive neither. The rows are read at call time, so an edit or deletion
+applies to the next relevant model call without restarting the service.
+
+Legacy Soul `validated` values are algorithmic state, not user confirmation.
+An old verdict without a provable explicit-user source remains pending/unknown;
+it is never migrated into `confirmed_facts`. Rejected and pending insights are
+excluded from the user-confirmed prompt projection. The old Soul profile may
+remain as a labelled system-inference compatibility surface, but it cannot
+write or relabel Phase 4 memory.
+
+Desktop Web exposes one panel at a time through
+`#memory/confirmed`, `#memory/research`, `#memory/candidates`, and
+`#memory/history`. Long-term facts and research directions can be manually
+created, edited, or deleted; pending candidates can be accepted, edited before
+acceptance, or rejected; a currently deleted item exposes a version-checked
+restore action from history. Empty, loading, conflict, timeout, and retry states
+all reconcile from the backend truth rather than optimistic client-only state.
+P5 webpage/PDF monitoring and reliable notifications remain out of scope.
+
 ## Client contract
 
 - Desktop Web retains the licensed interaction geometry for its top bar, left
@@ -394,8 +453,9 @@ their explicit audit/conflict surfaces.
   redaction-safe `key_usage`, `key_limit`, `account_plan`, `plan_usage` and
   `plan_limit` fields.
   Phase 1 does not add a desktop research-question, result-list or history UI.
-  Phase 4 adds the event workspace described above and reads only the shared
-  Phase 3 event truth; it does not infer event state in JavaScript.
+  The event dossier reads only the shared Phase 3 event truth; it does not infer
+  event state in JavaScript. Phase 4 adds the four-section personal-memory
+  manager and uses only the versioned local personal-memory API.
 - Mobile Web/PWA uses the same API and adds pull-to-refresh and explicit
   online/degraded/offline state. Phase 1 adds no Research controls and never
   sends a Tavily credential to this client.

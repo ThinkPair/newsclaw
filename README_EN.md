@@ -24,8 +24,11 @@ and configuration, and does not require another product at runtime.
 - On an explicit request submitted through a DSH Agent tool or the backend
   REST API, use Tavily Search or extract evidence from 1–3 explicitly supplied
   public URLs. Research never updates the profile or recommendation pool automatically.
-- Preserve the five-layer Event → Preference → Awareness → Insight →
-  Soul memory loop, evidence, confidence, probes, and manual overrides.
+- Preserve the five-layer Event → Preference → Awareness → Insight → Soul
+  pipeline as a **system-inferred profile**, never as user-confirmed facts.
+- Keep personal memory in a separate user-controlled layer: only an explicit
+  manual entry or acceptance of a sourced candidate can become active memory;
+  every edit, delete, and restore remains locally versioned.
 - Learn from opening recommendations, likes, dislikes, ignores, comments, and chat. Saved and read-later items remain local library actions and do not automatically alter the profile.
 - Use a priority queue → single structured judgment → action/memory workbench;
   rank by user fit, evidence, timeliness, and event impact instead of repeating article text across the screen.
@@ -63,7 +66,7 @@ and configuration, and does not require another product at runtime.
   facts. Restart-safe repair revalidates legacy evidence depth, origin lineage,
   and pre-release change identities. This truth layer never calls Tavily
   automatically and never updates the profile.
-- **Phase 4 event workspace is implemented.** Desktop Web now presents an event
+- **The Phase 3 event-dossier desktop surface is implemented.** Desktop Web now presents an event
   inbox → current change pulse → evidence/tracking master-detail workspace.
   Unread, conflict, and topic filters consume one backend truth. The default
   timeline exposes the safe `is_state_applied` objective A→B set; the scalar
@@ -76,6 +79,21 @@ and configuration, and does not require another product at runtime.
   fixed-length digest: a mutation during continuation
   returns HTTP 409 and requires a first-page refresh rather than risking skips
   or duplicates.
+- **Phase 4 personal memory is implemented.** Desktop Web has four focused
+  sections: confirmed facts, current research, pending confirmations, and
+  revision history. Behavioural/AI inference may only propose a sourced pending
+  candidate; it cannot write active memory. Manual create or explicit acceptance
+  is required, while version checks, idempotent mutation receipts, and revisions
+  make edit/delete/restore and accept/reject durable. Legacy profile data,
+  `validated` flags, and source-less legacy verdicts are never migrated as
+  user-confirmed facts.
+  Active confirmed facts enter only explicitly scoped dialogue-model calls;
+  current research enters only the next recommendation evaluation/copy context.
+  Generic evaluation, probes, profile work, and Soul rebuilds receive neither.
+  Merely viewing or managing memory makes no external model call, and a
+  deletion takes effect on the next applicable call. If acceptance would update or restore
+  an existing manual memory, the target is previewed first and an exact target ID
+  plus version must be explicitly confirmed; concurrent changes return 409.
 
 ## Sources
 
@@ -105,13 +123,17 @@ Tushare / RSS → news evidence → normalized, deduplicated local batch → eva
                                                                          │                         ├→ corroboration → stronger evidence, no duplicate unread
                                                                          │                         ├→ conflicting outcome → contested, freeze state, await resolution
                                                                          │                         ├→ expectation/sentiment/analysis → secondary only
-                                                                         │                         └→ [Phase 4] event inbox → safe current changes → evidence drawer
+                                                                         │                         └→ [Phase 3 dossier] event inbox → safe current changes → evidence drawer
                                                                          │                                        ├→ backend unread/conflict/topic truth
                                                                          │                                        ├→ frozen conflict + explicit audit branches
                                                                          │                                        └→ narrow-screen master/detail; no parallel ledger
                                                                          └→ no change → check history only
 
-Workbench → explicit feedback → profile
+Behaviour/chat → system-inferred profile → sourced pending candidate → user accepts → [Phase 4] personal memory
+Manual user entry ─────────────────────────────────────────────────────────────→ [Phase 4] personal memory
+                                                                                  └→ versioned edit/delete/restore/history
+
+Workbench → explicit feedback → system-inferred profile
           └→ save/click/feedback → immutable judgment snapshot → local history
 
 DSH Agent / REST research request → fresh local cache or Tavily Search/Extract
@@ -124,7 +146,7 @@ DSH Agent / REST research request → fresh local cache or Tavily Search/Extract
 Desktop Web (including the event workspace), mobile Web/PWA, a display-only
 browser side panel, and a DeepSeek Harness trailing grid column all share one
 backend, primary SQLite database,
-profile, recommendation pool, saved items, and chat history. On-demand research
+system-inferred profile, personal-memory ledger, recommendation pool, saved items, and chat history. On-demand research
 evidence stays in a separate SQLite ledger under the same private data
 directory, so it is not mixed with profile or pool state. The extension never
 reads news pages or cookies. The DSH panel defaults to 380px, supports 280–560px,
@@ -136,9 +158,11 @@ not expose a tracking center, change timeline, or manual check-now action. A
 future client must consume the same backend truth rather than create a second
 tracking state.
 
-Phase 4 consumes the Phase 3 event truth in Desktop Web. Mobile/PWA, the browser
+The Phase 3 event dossier consumes the event truth in Desktop Web. Mobile/PWA, the browser
 extension, and DSH still expose no independent event workspace and must not
-create another event ledger. No client may promote a forecast, sentiment signal,
+create another event ledger. The full Phase 4 personal-memory manager is also
+desktop-only for now; other clients may not promote a legacy profile or AI
+inference into confirmed memory. No client may promote a forecast, sentiment signal,
 or AI inference into an objective change, or silently choose a winner when
 evidence conflicts.
 
