@@ -300,6 +300,46 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     research_extract_parser.add_argument("--chunks-per-source", type=int, default=2)
     research_extract_parser.add_argument("--refresh", action="store_true")
+
+    subparsers.add_parser(
+        "web-monitor-list",
+        help="List durable NewsClaw webpage/PDF monitors.",
+    )
+    web_monitor_add_parser = subparsers.add_parser(
+        "web-monitor-add",
+        help="Add a public webpage/PDF monitor and establish its first baseline.",
+    )
+    web_monitor_add_parser.add_argument("--url", required=True)
+    web_monitor_add_parser.add_argument("--kind", choices=["auto", "html", "pdf"], default="auto")
+    web_monitor_add_parser.add_argument("--label", default="")
+    web_monitor_add_parser.add_argument("--focus", default="")
+    web_monitor_add_parser.add_argument("--interval-minutes", type=int, default=1440)
+    web_monitor_add_parser.add_argument("--request-id", required=True)
+
+    web_monitor_check_parser = subparsers.add_parser("web-monitor-check")
+    web_monitor_check_parser.add_argument("--monitor-id", required=True)
+    web_monitor_check_parser.add_argument("--request-id", required=True)
+
+    web_monitor_state_parser = subparsers.add_parser("web-monitor-set-state")
+    web_monitor_state_parser.add_argument("--monitor-id", required=True)
+    web_monitor_state_parser.add_argument(
+        "--action", choices=["pause", "resume", "remove"], required=True
+    )
+
+    web_monitor_history_parser = subparsers.add_parser("web-monitor-history")
+    web_monitor_history_parser.add_argument("--monitor-id", required=True)
+    web_monitor_history_parser.add_argument("--limit", type=int, default=20)
+
+    web_monitor_notifications_parser = subparsers.add_parser("web-monitor-notifications")
+    web_monitor_notifications_parser.add_argument("--include-read", action="store_true")
+    web_monitor_notifications_parser.add_argument("--limit", type=int, default=50)
+
+    web_monitor_notice_action_parser = subparsers.add_parser("web-monitor-notification-action")
+    web_monitor_notice_action_parser.add_argument("--delivery-id", required=True)
+    web_monitor_notice_action_parser.add_argument(
+        "--action", choices=["delivered", "read", "dismiss"], required=True
+    )
+    web_monitor_notice_action_parser.add_argument("--request-id", required=True)
     return parser
 
 
@@ -311,6 +351,8 @@ def _uses_news_contract(args: argparse.Namespace) -> bool:
     """Return whether one invocation uses the additive NewsClaw vocabulary."""
 
     if os.environ.get("NEWSCLAW_MODE", "").strip() == "1":
+        return True
+    if str(getattr(args, "command", "")).startswith("web-monitor-"):
         return True
     if args.command in {
         "get-spotlight",
@@ -354,6 +396,26 @@ def _serialize_result(result: object) -> dict[str, Any]:
     if is_dataclass(result) and not isinstance(result, type):
         return asdict(result)
     raise AdapterOperationError("Agent bridge returned an unsupported result payload.")
+
+
+def _public_web_monitor(value: object) -> dict[str, Any]:
+    """Remove conditional-request and worker-lease internals from bridge output."""
+
+    item = dict(value) if isinstance(value, dict) else {}
+    for private in ("canonical_url", "lease_owner", "lease_token", "etag", "last_modified"):
+        item.pop(private, None)
+    return item
+
+
+def _public_web_monitor_result(value: object) -> dict[str, Any]:
+    item = dict(value) if isinstance(value, dict) else {}
+    if isinstance(item.get("monitor"), dict):
+        item["monitor"] = _public_web_monitor(item["monitor"])
+    if isinstance(item.get("check"), dict):
+        check = dict(item["check"])
+        check.pop("lease_token", None)
+        item["check"] = check
+    return item
 
 
 def _with_news_aliases(
@@ -443,6 +505,21 @@ async def _run_command(
                 if name not in skill_names:
                     skill_names.append(name)
             data["skill_names"] = skill_names
+        web_monitor_service = getattr(news_runtime, "web_monitor_service", None)
+        if web_monitor_service is not None:
+            skill_names = list(data.get("skill_names", []))
+            for name in (
+                "newsclaw_list_web_monitors",
+                "newsclaw_add_web_monitor",
+                "newsclaw_check_web_monitor",
+                "newsclaw_set_web_monitor_state",
+                "newsclaw_get_web_monitor_history",
+                "newsclaw_list_monitor_notifications",
+                "newsclaw_act_on_monitor_notification",
+            ):
+                if name not in skill_names:
+                    skill_names.append(name)
+            data["skill_names"] = skill_names
         return {
             "ok": True,
             "data": data,
@@ -504,6 +581,109 @@ async def _run_command(
                 raise AdapterValidationError(str(error)) from error
             except (ResearchConfigurationError, ResearchProviderError) as error:
                 raise AdapterOperationError(str(error)) from error
+        elif args.command.startswith("web-monitor-"):
+            service = getattr(news_runtime, "web_monitor_service", None)
+            if service is None:
+                raise AdapterOperationError(
+                    "Web monitoring is available only while the NewsClaw runtime is running."
+                )
+            if args.command == "web-monitor-list":
+                rows = await asyncio.to_thread(service.store.list_monitors)
+                result = {
+                    "items": [_public_web_monitor(row) for row in rows],
+                    "runtime": await asyncio.to_thread(service.runtime_state),
+                }
+            elif args.command == "web-monitor-add":
+                from openbiliclaw.news.web_monitoring import validate_public_url
+
+                if not 5 <= int(args.interval_minutes) <= 10_080:
+                    raise AdapterValidationError("interval_minutes must be between 5 and 10080.")
+                try:
+                    canonical_url = await validate_public_url(args.url)
+                except Exception as error:
+                    safe_message = getattr(error, "safe_message", "")
+                    if safe_message:
+                        raise AdapterValidationError(str(safe_message)) from error
+                    raise
+                monitor, created = await asyncio.to_thread(
+                    service.store.create_monitor,
+                    canonical_url=canonical_url,
+                    kind=args.kind,
+                    label=" ".join(str(args.label).split()).strip(),
+                    focus=" ".join(str(args.focus).split()).strip(),
+                    interval_minutes=int(args.interval_minutes),
+                    request_id=str(args.request_id).strip(),
+                )
+                check: dict[str, Any] | None = None
+                if created or not bool(monitor.get("has_baseline")):
+                    check = await service.check_monitor(
+                        str(monitor["monitor_id"]),
+                        request_id=f"{args.request_id}:baseline",
+                        manual=True,
+                    )
+                    monitor = service.store.get_monitor(str(monitor["monitor_id"])) or monitor
+                result = {
+                    "item": _public_web_monitor(monitor),
+                    "created": created,
+                    "check": _public_web_monitor_result(check) if check is not None else None,
+                }
+            elif args.command == "web-monitor-check":
+                if service.store.get_monitor(args.monitor_id) is None:
+                    raise AdapterValidationError("web monitor does not exist")
+                try:
+                    checked = await service.schedule_check(
+                        args.monitor_id,
+                        request_id=str(args.request_id).strip(),
+                        manual=True,
+                    )
+                except KeyError as error:
+                    raise AdapterValidationError("web monitor is paused or removed") from error
+                result = _public_web_monitor_result(checked)
+            elif args.command == "web-monitor-set-state":
+                status = {
+                    "pause": "paused",
+                    "resume": "active",
+                    "remove": "deleted",
+                }[args.action]
+                monitor = await asyncio.to_thread(service.store.set_status, args.monitor_id, status)
+                if monitor is None:
+                    raise AdapterValidationError("web monitor does not exist")
+                result = {
+                    "item": _public_web_monitor(monitor),
+                    "action": args.action,
+                }
+            elif args.command == "web-monitor-history":
+                history = await asyncio.to_thread(
+                    service.store.history,
+                    args.monitor_id,
+                    limit=max(1, min(200, int(args.limit))),
+                )
+                if history is None:
+                    raise AdapterValidationError("web monitor does not exist")
+                history["monitor"] = _public_web_monitor(history.get("monitor"))
+                for check in history.get("checks", []):
+                    if isinstance(check, dict):
+                        check.pop("lease_token", None)
+                result = history
+            elif args.command == "web-monitor-notifications":
+                result = await asyncio.to_thread(
+                    service.store.notifications,
+                    include_read=bool(args.include_read),
+                    limit=max(1, min(200, int(args.limit))),
+                )
+            else:
+                try:
+                    notice = await asyncio.to_thread(
+                        service.store.mark_notification,
+                        args.delivery_id,
+                        action=args.action,
+                        request_id=str(args.request_id).strip(),
+                    )
+                except ValueError as error:
+                    raise AdapterValidationError(str(error)) from error
+                if notice is None:
+                    raise AdapterValidationError("monitor notification does not exist")
+                result = {"item": notice, "updated": True}
         elif args.command == "recommend":
             news_contract = _uses_news_contract(args)
             media = str(getattr(args, "media", "") or "")

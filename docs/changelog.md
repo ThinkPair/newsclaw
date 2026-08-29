@@ -2,6 +2,8 @@
 
 ## v0.1.0：NewsClaw 独立新闻领域改编（2026-08-17）
 
+- **网页/PDF 变化监控 Phase 5（2026-08-29）**：新增只面向用户主动添加的公开 HTTP(S) 文档监控。首轮只建立规范化正文基线；后续检查以原始哈希与正文哈希分层判断，过滤导航、页脚、广告、Cookie/分享提示和窄范围动态时间噪声，只有确定正文变化才原子写入不可变快照、精确增删差异、既有 `document_monitor` 事件和持久站内消息。HTML 10MB、PDF 50MB、最多 1000 页，抓取/解析都有超时；每次跳转都重新解析 DNS、拒绝本机/私网/保留地址、凭据 URL、非 80/443 端口和 HTTPS 降级，不继承代理、Cookie 或认证。独立 SQLite 租约实现跨进程 single-flight、过期 owner fencing 和 1m/5m/30m/2h/6h 有界重试；失败、恢复、delivered/read/dismiss 均持久化，通知写操作以稳定 request ID 防止模糊重试串动作。新增 NewsClaw-only REST、CLI、桌面/窄屏监控页、扩展未读入口，以及 DSH 内容库和 7 个新增 Agent Bridge 工具；普通产品模式不注册或启动本能力。整个判断不调用 LLM/Tavily、不修改五层画像或 P4 个人记忆。
+
 - 2026-08-21 私有 GitHub 托管前统一后端与扩展的机械版本字段为 0.1.0，并明确 NewsClaw 不把上游聚合 Release 当作自身更新或下载渠道。
 - 修正安全扫描豁免注释造成的测试代码行宽超限，恢复 CI 静态检查。
 - 从 OpenBiliClaw v0.3.207 建立独立 worktree，保留 MIT/NOTICE 来源声明，内部兼容命名不形成运行时依赖。

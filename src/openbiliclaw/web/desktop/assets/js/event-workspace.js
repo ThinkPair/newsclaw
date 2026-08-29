@@ -982,11 +982,19 @@
       renderEvidence();
     }
 
+    async function openEvent(eventId, changeId = "") {
+      state.active = true;
+      bind();
+      await selectEvent(eventId, { openMobileDetail: true });
+      if (changeId) await selectChange(changeId);
+    }
+
     return {
       activate,
       applySearch,
       bind,
       deactivate,
+      openEvent,
       refresh: () => loadInbox(),
       refreshSummary: () => loadGlobalSummary(),
       snapshot: () => ({ ...state }),

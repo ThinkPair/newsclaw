@@ -6,8 +6,8 @@ import html
 import json
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Mapping
-from difflib import SequenceMatcher
 
 _SCOPES = frozenset({"unknown", "title_only", "summary", "full_text"})
 _HTML_RE = re.compile(r"<[^>]+>")
@@ -50,11 +50,15 @@ def _substantive(value: object, *, title: object, minimum: int) -> bool:
         without_title_repetitions = compact.replace(compact_title, "")
         if len(without_title_repetitions) < minimum:
             return False
-    similarity = SequenceMatcher(None, compact, compact_title, autojunk=False).ratio()
-    return not (
-        compact == compact_title
-        or (similarity >= 0.90 and len(compact) <= len(compact_title) + 6)
-    )
+    if compact == compact_title:
+        return False
+    if len(compact) > len(compact_title) + 6:
+        return True
+    # Conservative linear similarity is enough here: this gate only prevents a
+    # headline (or tiny spelling variant) from being upgraded to body evidence.
+    overlap = sum((Counter(compact) & Counter(compact_title)).values())
+    similarity = (2 * overlap) / (len(compact) + len(compact_title))
+    return similarity < 0.90
 
 
 def verified_content_scope(

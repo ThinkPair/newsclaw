@@ -323,12 +323,13 @@
         <div class="content-library-page-head">
           <p class="eyebrow">Your library</p>
           <h2 id="desktopContentLibraryTitle">内容库</h2>
-          <p class="video-meta">稍后读、收藏、持续跟踪和近 30 天历史，都只保存在这台电脑上。</p>
+          <p class="video-meta">稍后读、收藏、事件跟踪和网页监控，都只保存在这台电脑上。</p>
         </div>
         <div class="content-library-tabs" role="tablist" aria-label="内容库分类">
           <button id="contentLibraryWatchLaterTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="watchLaterPage" tabindex="-1"><span>稍后读</span><span class="nav-count-badge" id="watchLaterCountBadge" hidden></span></button>
           <button id="contentLibraryFavoritesTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="favoritesPage" tabindex="-1"><span>收藏</span><span class="nav-count-badge" id="favoritesCountBadge" hidden></span></button>
           <button id="contentLibraryTrackingTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="trackingPage" tabindex="-1"><span>持续跟踪</span><span class="nav-count-badge" id="trackedObservationsUnreadBadge" aria-label="未读跟踪更新" hidden></span></button>
+          <button id="contentLibraryMonitoringTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="monitoringPage" tabindex="-1" hidden><span>网页监控</span><span class="nav-count-badge" id="webMonitorUnreadBadge" aria-label="未读网页变化" hidden></span></button>
           <button id="contentLibraryHistoryTab" class="content-library-tab" type="button" role="tab" aria-selected="false" aria-controls="historyPage" tabindex="-1">历史记录</button>
         </div>
 
@@ -377,6 +378,31 @@
         <p class="tracking-page-status" id="trackingPageStatus" aria-live="polite"></p>
         <div class="tracking-list" id="trackingList" aria-live="polite" aria-busy="false"></div>
         <div class="saved-empty tracking-empty" id="trackingEmpty" hidden>还没有持续跟踪的观察点。去推荐详情里的“后续观察点”开始跟踪吧。</div>
+      </section>
+
+      <section class="monitoring-page content-library-panel" id="monitoringPage" role="tabpanel" aria-labelledby="contentLibraryMonitoringTab" hidden>
+        <div class="content-page-head monitoring-page-head">
+          <div>
+            <p class="eyebrow">Web &amp; PDF monitoring</p>
+            <h2 id="monitoringPageTitle" tabindex="-1">网页监控</h2>
+            <p class="video-meta">添加你明确关心的公开网页或 PDF。首次只建立基线，以后只提醒正文的真实变化。</p>
+          </div>
+          <button class="pill-btn" id="monitoringRefreshBtn" type="button">刷新</button>
+        </div>
+        <form class="monitoring-composer" id="monitoringComposer">
+          <label class="monitoring-url-field"><span class="sr-only">网页或 PDF 地址</span><input id="monitoringUrlInput" type="url" maxlength="4096" required autocomplete="off" placeholder="粘贴公开网页或 PDF 地址"></label>
+          <label><span class="sr-only">名称（可选）</span><input id="monitoringLabelInput" type="text" maxlength="500" autocomplete="off" placeholder="名称（可选）"></label>
+          <label><span class="sr-only">检查频率</span><select id="monitoringIntervalSelect"><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440" selected>每天</option><option value="10080">每周</option></select></label>
+          <button class="pill-btn primary" id="monitoringAddBtn" type="submit">开始监控</button>
+        </form>
+        <div class="monitoring-summary" aria-label="网页监控摘要">
+          <div><span>正在监控</span><strong id="monitoringActiveCount">—</strong></div>
+          <div><span>未读变化</span><strong id="monitoringUnreadCount">—</strong></div>
+          <div><span>需要处理</span><strong id="monitoringFailedCount">—</strong></div>
+        </div>
+        <p class="monitoring-status" id="monitoringStatus" aria-live="polite"></p>
+        <div class="monitoring-list" id="monitoringList" aria-live="polite" aria-busy="false"></div>
+        <div class="saved-empty monitoring-empty" id="monitoringEmpty" hidden>还没有网页监控。先添加一个你希望长期跟进的政策页、公告页或 PDF。</div>
       </section>
 
       <section class="history-page content-library-panel" id="historyPage" role="tabpanel" aria-labelledby="contentLibraryHistoryTab" hidden>

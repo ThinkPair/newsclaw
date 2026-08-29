@@ -271,6 +271,16 @@ cookie 补 `Secure`，并把已验证的 Web Origin 做最小 `https→http` 适
 - NewsClaw 模式移除旧 Soul 洞察的聊天/推荐/重建隐藏通道；普通 OpenBiliClaw 保留原行为。页面查看和本地管理不触发外部模型，删除后下一次对应调用失效
 - P5 网页/PDF 监控与可靠通知不属于本模块
 
+### NewsClaw webpage/PDF monitoring (`news/web_monitoring.py`, `api/web_monitor_routes.py`)
+
+- 这是 NewsClaw-only 的独立文档监控账本，不注册成新闻源、不复用 P2 模型跟踪、不写 P4 记忆；普通产品模式不注册路由、不启动调度器
+- 用户添加公开 URL 后，同一事务创建 `web_monitor_targets` 与确定性的 `document_monitor` 事件；首次成功抓取只建立正文基线，不产生变化或消息
+- Fetcher 每次跳转都把连接固定到本轮 DNS 验证所得公网 IP，并再次核对实际对端；拒绝凭据、本机/私网/保留地址、异常端口和 HTTPS 降级，不使用环境代理、Cookie 或认证，且条件请求头不跨域；仅请求 identity 编码并拒绝压缩响应，HTML/PDF 具有原始字节、解析、页数和超时上限，PDF 在可终止的独立子进程中解析
+- 规范化器剥离脚本、表单、导航、页脚、广告、Cookie/分享/窄动态时间噪声，同时保留数字、否定词和状态词；raw 变化而 semantic 不变只留 `noise_only` 审计快照
+- 真变化在一个 SQLite 事务写入新快照、精确 diff、Phase-3 事件变化、检查终态、目标游标和持久消息；失败则按 1m/5m/30m/2h/6h 有界退避
+- 租约、partial unique running index、join 和 fencing 保证并发手动/后台检查 single-flight；调度器同时限制全局 3 路、同一监控入口域名 1 路，单次抓取总墙钟不超过 30 秒；通知 delivered/read/dismiss 使用稳定 request receipt，模糊重试不会串动作
+- 桌面/窄屏 Web、DSH 内容库、Agent Bridge、CLI 和扩展未读入口只消费同一数据库真值；扩展本身不抓目标文档
+
 ### Saved Sync (`saved_sync/`)
 - `NativeSaveRouter` 根据 adapter capability 确定 favorite / watch-later 路由；watch-later 仅在平台不支持原生动作且支持 favorite 时回退
 - `SavedSyncService` 在任何平台 I/O 前提交本地 membership；每次自动 / 手动触发都在独立 `native_save_tasks` / `native_save_task_items` ledger 留下 durable UUID 快照，再对其中 live 项执行同步

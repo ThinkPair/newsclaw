@@ -50,6 +50,7 @@ from openbiliclaw.news.reliability import RetryPolicy, SourceRunner, SourceTaskS
 from openbiliclaw.news.rss import RSSAdapter
 from openbiliclaw.news.tracking import NewsTrackingService
 from openbiliclaw.news.tushare import TushareNewsAdapter
+from openbiliclaw.news.web_monitoring import WebMonitorService
 from openbiliclaw.research.routes import register_research_routes
 from openbiliclaw.research.service import ResearchService
 from openbiliclaw.research.store import ResearchStore
@@ -799,6 +800,10 @@ class NewsRuntime:
             llm_concurrency_provider=llm_concurrency_provider,
             background_analysis_allowed=lambda: bool(self.settings().get("background_llm", True)),
         )
+        # P5 is an independent durable lane: monitored webpages/PDFs are not
+        # recommendation articles and must keep running even when the browser,
+        # profile, LLM or news-source refresh lane is unavailable.
+        self.web_monitor_service = WebMonitorService(database=database)
         self.bootstrap_state_path = data_path / "newsclaw_bootstrap.json"
         self.runtime_state_path = data_path / "newsclaw_runtime.json"
         self._refresh_lock = asyncio.Lock()
@@ -1891,7 +1896,20 @@ class NewsRuntime:
 
     async def start(self) -> None:
         self._stop_event.clear()
-        await self.apply_settings()
+        await self.web_monitor_service.start()
+        try:
+            await self.apply_settings()
+        except asyncio.CancelledError:
+            await self.web_monitor_service.stop()
+            raise
+        except Exception as error:
+            # Document monitoring is a separate evidence lane. A broken LLM,
+            # source controller or settings callback must not stop its scheduler.
+            self._effective_settings = dict(self.settings())
+            logger.warning(
+                "NewsClaw runtime settings apply failed; document monitoring remains active: %s",
+                safe_error_message(error) or type(error).__name__,
+            )
         if self._event_backfill_task is None or self._event_backfill_task.done():
             self._event_backfill_task = asyncio.create_task(self._backfill_event_projection())
             self._background_tasks.add(self._event_backfill_task)
@@ -1901,6 +1919,7 @@ class NewsRuntime:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        await self.web_monitor_service.stop()
         for lifecycle_task in (self._bootstrap_task, self._scheduler_task):
             if lifecycle_task is not None and not lifecycle_task.done():
                 lifecycle_task.cancel()
@@ -1969,6 +1988,7 @@ def register_newsclaw_routes(
     app.state.newsclaw_runtime = runtime
     register_research_routes(app, runtime=runtime)
     from openbiliclaw.api.personal_memory_routes import register_personal_memory_routes
+    from openbiliclaw.api.web_monitor_routes import register_web_monitor_routes
 
     sync_legacy_candidates = getattr(soul_engine, "sync_personal_memory_insight_candidates", None)
     if callable(sync_legacy_candidates):
@@ -1977,6 +1997,7 @@ def register_newsclaw_routes(
         except Exception:
             logger.warning("personal memory legacy candidate sync failed", exc_info=True)
     register_personal_memory_routes(app, database=database)
+    register_web_monitor_routes(app, service=runtime.web_monitor_service)
 
     def _resolved_news_event(event_id: str) -> tuple[dict[str, Any], str]:
         try:

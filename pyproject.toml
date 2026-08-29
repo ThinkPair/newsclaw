@@ -24,6 +24,9 @@ classifiers = [
 
 dependencies = [
     "httpx[socks]>=0.27",
+    # P5 extracts text from user-added public PDFs without executing embedded
+    # attachments, JavaScript or browser plugins.
+    "pypdf>=5.0",
     # NewsClaw's three contracted news endpoints are provided by Tushare Pro.
     "tushare>=1.4.24",
     "scrapetube>=2.1",

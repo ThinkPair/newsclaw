@@ -45,6 +45,8 @@
       newsEvents: "/news/events",
       newsChanges: "/news/changes",
       newsConflicts: "/news/conflicts",
+      webMonitors: "/news/monitors",
+      webMonitorNotifications: "/news/monitor-notifications",
       personalMemory: "/personal-memory",
       personalMemoryHistory: "/personal-memory/history",
       profileEdit: "/profile/edit",
@@ -136,6 +138,21 @@
       workbenchView: "recommendations",
       homeMode: "events",
       messages: [],
+      newsclawModeGeneration: 0,
+      webMonitorNotificationGeneration: 0,
+      webMonitorNotificationActions: new Set(),
+      webMonitors: {
+        items: null,
+        runtime: null,
+        loading: false,
+        refreshRequested: false,
+        refreshPromise: null,
+        refreshGeneration: 0,
+        error: "",
+        histories: new Map(),
+        historyGenerations: new Map(),
+        busyIds: new Set(),
+      },
       messageListSnapshot: null,
       messageListDomLocked: false,
       resolvingMessageKeys: new Set(),
@@ -168,6 +185,14 @@
     let recommendationDetailOpener = null;
     let recommendationSyncChannel = null;
     let eventWorkspaceController = null;
+
+    window.setInterval(() => {
+      if (state.newsclawMode !== true || document.hidden) return;
+      void refreshWebMonitorNotifications();
+      if (desktopContentLibraryVisible && desktopContentLibraryTab === "monitoring") {
+        void refreshWebMonitors({ silent: true });
+      }
+    }, 60000);
 
     const $ = (selector) => document.querySelector(selector);
 
@@ -3204,7 +3229,9 @@
 
     function setNewsClawProductMode(enabled) {
       const newsclawMode = Boolean(enabled);
+      const previousMode = state.newsclawMode;
       state.newsclawMode = newsclawMode;
+      if (previousMode !== newsclawMode) state.newsclawModeGeneration += 1;
       document.body.classList.toggle("newsclaw-product", newsclawMode);
       const personalMount = document.getElementById("personalMemoryMount");
       const legacyMount = document.getElementById("legacyProfileMount");
@@ -3237,6 +3264,45 @@
       if (mobileLegacy) mobileLegacy.hidden = newsclawMode;
       if (newsclawMode) renderPersonalMemory();
       else renderProfileDetails();
+      if (!newsclawMode) {
+        state.webMonitorNotificationGeneration += 1;
+        state.webMonitors.refreshGeneration += 1;
+        state.webMonitors.items = null;
+        state.webMonitors.runtime = null;
+        state.webMonitors.loading = false;
+        state.webMonitors.error = "";
+        state.webMonitors.refreshRequested = false;
+        state.webMonitors.refreshPromise = null;
+        state.webMonitors.histories.clear();
+        for (const [monitorId, generation] of state.webMonitors.historyGenerations) {
+          state.webMonitors.historyGenerations.set(monitorId, generation + 1);
+        }
+        state.webMonitors.busyIds.clear();
+        state.webMonitorNotificationActions.clear();
+        state.messages = state.messages.filter(
+          (item) => messageType(item) !== "web-monitor-notification"
+        );
+        if (state.messageListSnapshot) {
+          state.messageListSnapshot = state.messageListSnapshot.filter(
+            (item) => messageType(item) !== "web-monitor-notification"
+          );
+        }
+        syncMessageCount();
+        if (isMessagesDrawerOpen()) renderMessages();
+        renderWebMonitors();
+      }
+      const monitoringTab = document.getElementById("contentLibraryMonitoringTab");
+      if (monitoringTab) monitoringTab.hidden = !newsclawMode;
+      if (!newsclawMode && desktopContentLibraryTab === "monitoring") {
+        desktopContentLibraryTab = "watchLater";
+        if (desktopContentLibraryVisible) {
+          activateDesktopContentLibraryTab("watchLater", { forceLoad: true });
+        }
+      }
+      if (newsclawMode && previousMode !== true) {
+        void refreshWebMonitors();
+        void refreshWebMonitorNotifications();
+      }
     }
 
     function openLegacyProfilePage() {
@@ -4387,15 +4453,289 @@ ${savedCardFeedbackBarHtml(listKind)}
       if (trackingId) void loadTrackedObservationTimeline(trackingId);
     }
 
+    function webMonitorRequestId(prefix = "monitor") {
+      const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      return `${prefix}:${id}`;
+    }
+
+    function webMonitorStatusLabel(item) {
+      return {
+        active: item?.has_baseline ? "运行正常" : "等待基线",
+        paused: "已暂停",
+        retry_wait: "稍后重试",
+        needs_attention: "需要处理",
+      }[String(item?.status || "")] || "状态未知";
+    }
+
+    function webMonitorTime(value, fallback = "—") {
+      if (!value) return fallback;
+      const formatted = formatLocalTime(String(value));
+      return formatted || fallback;
+    }
+
+    function webMonitorHistoryHtml(item) {
+      const monitorId = String(item?.monitor_id || "");
+      const record = state.webMonitors.histories.get(monitorId);
+      if (!record) return "";
+      if (record.loading) return '<div class="monitor-history is-loading">正在读取版本记录…</div>';
+      if (record.error) return `<div class="monitor-history is-error">${escapeHtml(record.error)}</div>`;
+      const checks = asArray(record.data?.checks).slice(0, 6);
+      const diffs = asArray(record.data?.diffs).slice(0, 4);
+      return `<div class="monitor-history">
+        <div class="monitor-history-head"><strong>最近版本</strong><span>${asArray(record.data?.versions).length} 个本地版本</span></div>
+        ${diffs.length ? `<div class="monitor-diff-list">${diffs.map((diff) => `<div><span class="monitor-history-dot is-change"></span><strong>${escapeHtml(diff.summary || "正文变化")}</strong><time>${escapeHtml(webMonitorTime(diff.created_at))}</time></div>`).join("")}</div>` : '<p>还没有正文变化；首次成功检查只会建立基线。</p>'}
+        <div class="monitor-check-strip">${checks.map((check) => `<span class="monitor-check-pill is-${escapeHtml(String(check.status || "unknown"))}" title="${escapeHtml(check.error_message || "")}">${escapeHtml({ baseline: "基线", unchanged: "无变化", noise_only: "已降噪", changed: "有变化", retry_wait: "待重试", failed: "失败", cancelled: "已取消", running: "检查中" }[check.status] || check.status || "未知")}</span>`).join("")}</div>
+      </div>`;
+    }
+
+    function renderWebMonitors() {
+      const webState = state.webMonitors;
+      const list = document.getElementById("monitoringList");
+      const empty = document.getElementById("monitoringEmpty");
+      const statusLine = document.getElementById("monitoringStatus");
+      if (!list) return;
+      const items = Array.isArray(webState.items) ? webState.items : null;
+      const runtime = webState.runtime || {};
+      const activeCount = document.getElementById("monitoringActiveCount");
+      const unreadCount = document.getElementById("monitoringUnreadCount");
+      const failedCount = document.getElementById("monitoringFailedCount");
+      const unread = items ? items.reduce((total, item) => total + Number(item.unread_count || 0), 0) : null;
+      if (activeCount) activeCount.textContent = items ? String(items.filter((item) => ["active", "retry_wait"].includes(item.status)).length) : "—";
+      if (unreadCount) unreadCount.textContent = unread === null ? "—" : String(unread);
+      if (failedCount) failedCount.textContent = items ? String(items.filter((item) => item.status === "needs_attention").length) : "—";
+      const badge = document.getElementById("webMonitorUnreadBadge");
+      if (badge) {
+        badge.textContent = unread === null ? "" : String(unread);
+        badge.hidden = !unread;
+      }
+      list.setAttribute("aria-busy", String(Boolean(webState.loading)));
+      if (webState.loading && items === null) {
+        list.innerHTML = '<div class="monitoring-loading"><span></span><span></span><span></span></div>';
+        if (empty) empty.hidden = true;
+        if (statusLine) statusLine.textContent = "正在读取这台电脑上的监控记录…";
+        return;
+      }
+      if (webState.error && items === null) {
+        list.innerHTML = `<div class="monitoring-error"><strong>暂时没读取到监控记录</strong><p>${escapeHtml(webState.error)}</p><button class="pill-btn" data-monitor-retry type="button">重新读取</button></div>`;
+        list.querySelector("[data-monitor-retry]")?.addEventListener("click", () => void refreshWebMonitors());
+        if (empty) empty.hidden = true;
+        if (statusLine) statusLine.textContent = "";
+        return;
+      }
+      if (statusLine) {
+        statusLine.textContent = webState.error
+          ? `刷新失败，仍显示上次记录：${webState.error}`
+          : runtime.running
+            ? `正在检查 ${runtime.running} 项`
+            : "";
+      }
+      const rows = items || [];
+      if (empty) empty.hidden = rows.length > 0;
+      list.replaceChildren(...rows.map((item) => {
+        const card = document.createElement("article");
+        const monitorId = String(item.monitor_id || "");
+        const busy = webState.busyIds.has(monitorId) || Boolean(item.is_running);
+        const label = item.label || item.snapshot_title || (() => {
+          try { return new URL(item.display_url || item.canonical_url).hostname; } catch { return "网页监控"; }
+        })();
+        const status = String(item.status || "");
+        const statusClass = status === "needs_attention" ? "is-error" : status === "retry_wait" ? "is-waiting" : status === "paused" ? "is-paused" : "is-healthy";
+        card.className = `monitor-card ${statusClass}`;
+        card.dataset.monitorId = monitorId;
+        card.innerHTML = `
+          <div class="monitor-card-main">
+            <div class="monitor-card-title-row"><span class="monitor-status-dot" aria-hidden="true"></span><h3>${escapeHtml(label)}</h3><span class="monitor-status-label">${escapeHtml(busy ? "正在检查" : webMonitorStatusLabel(item))}</span></div>
+            <a class="monitor-url" href="${escapeHtml(item.canonical_url || item.display_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.display_url || item.canonical_url || "")}</a>
+            <div class="monitor-facts">
+              <span>版本 <strong>${item.current_version || "—"}</strong></span>
+              <span>变化 <strong>${Number(item.change_count || 0)}</strong></span>
+              <span>上次成功 <strong>${escapeHtml(webMonitorTime(item.last_success_at))}</strong></span>
+              <span>下次 <strong>${escapeHtml(status === "paused" ? "暂停中" : webMonitorTime(item.next_check_at))}</strong></span>
+            </div>
+            ${item.last_error ? `<p class="monitor-card-error">${escapeHtml(item.last_error)}</p>` : ""}
+          </div>
+          <div class="monitor-card-actions">
+            <button class="small-btn" data-monitor-action="event" type="button">事件档案</button>
+            <button class="small-btn" data-monitor-action="history" type="button">版本</button>
+            <button class="small-btn" data-monitor-action="check" type="button" ${busy || status === "paused" ? "disabled" : ""}>立即检查</button>
+            <button class="small-btn" data-monitor-action="${status === "paused" ? "resume" : "pause"}" type="button">${status === "paused" ? "恢复" : "暂停"}</button>
+            <button class="small-btn is-danger" data-monitor-action="delete" type="button">移除</button>
+          </div>
+          ${webMonitorHistoryHtml(item)}`;
+        return card;
+      }));
+    }
+
+    async function refreshWebMonitors({ silent = false } = {}) {
+      if (state.newsclawMode !== true) return;
+      const generation = ++state.webMonitors.refreshGeneration;
+      state.webMonitors.refreshRequested = false;
+      state.webMonitors.loading = true;
+      state.webMonitors.error = "";
+      if (!silent) renderWebMonitors();
+      const request = (async () => {
+        try {
+          const payload = await requestJsonStrict(ENDPOINTS.webMonitors, { timeoutMs: 15000, cache: "no-store" });
+          if (
+            state.newsclawMode !== true
+            || generation !== state.webMonitors.refreshGeneration
+          ) return;
+          state.webMonitors.items = asArray(payload?.items);
+          state.webMonitors.runtime = payload?.runtime || {};
+        } catch (error) {
+          if (
+            state.newsclawMode === true
+            && generation === state.webMonitors.refreshGeneration
+          ) {
+            state.webMonitors.error = configErrorMessage(error?.details) || error?.message || "本地后端暂时不可用";
+          }
+        }
+      })();
+      state.webMonitors.refreshPromise = request;
+      try {
+        await request;
+      } finally {
+        if (generation === state.webMonitors.refreshGeneration) {
+          state.webMonitors.loading = false;
+          if (state.webMonitors.refreshPromise === request) {
+            state.webMonitors.refreshPromise = null;
+          }
+          renderWebMonitors();
+        }
+      }
+    }
+
+    async function createWebMonitor() {
+      if (state.newsclawMode !== true) return;
+      const urlInput = document.getElementById("monitoringUrlInput");
+      const labelInput = document.getElementById("monitoringLabelInput");
+      const intervalInput = document.getElementById("monitoringIntervalSelect");
+      const submit = document.getElementById("monitoringAddBtn");
+      const url = String(urlInput?.value || "").trim();
+      if (!url) return;
+      if (submit) submit.disabled = true;
+      if (document.getElementById("monitoringStatus")) document.getElementById("monitoringStatus").textContent = "正在安全读取并建立首个正文基线…";
+      try {
+        const payload = await requestJsonStrict(ENDPOINTS.webMonitors, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url,
+            label: String(labelInput?.value || "").trim(),
+            kind: "auto",
+            interval_minutes: Number(intervalInput?.value || 1440),
+            request_id: webMonitorRequestId("create"),
+          }),
+          timeoutMs: 120000,
+        });
+        if (urlInput) urlInput.value = "";
+        if (labelInput) labelInput.value = "";
+        state.webMonitors.items = null;
+        showToast(payload?.check?.status === "baseline" ? "已建立基线，以后只提醒真实变化" : "网页监控已保存");
+        await refreshWebMonitors({ silent: true });
+      } catch (error) {
+        const message = configErrorMessage(error?.details) || error?.message || "添加失败";
+        state.webMonitors.error = message;
+        showToast(message);
+        renderWebMonitors();
+      } finally {
+        if (submit) submit.disabled = false;
+      }
+    }
+
+    async function runWebMonitorAction(action, monitorId) {
+      if (!action || !monitorId || state.webMonitors.busyIds.has(monitorId)) return;
+      const item = asArray(state.webMonitors.items).find((row) => String(row.monitor_id) === monitorId);
+      if (!item) return;
+      if (action === "event") {
+        openHomePage("events");
+        await eventWorkspaceController?.openEvent?.(String(item.event_id || ""));
+        return;
+      }
+      if (action === "history") {
+        const generation = (state.webMonitors.historyGenerations.get(monitorId) || 0) + 1;
+        state.webMonitors.historyGenerations.set(monitorId, generation);
+        if (state.webMonitors.histories.has(monitorId)) {
+          state.webMonitors.histories.delete(monitorId);
+          renderWebMonitors();
+          return;
+        }
+        state.webMonitors.histories.set(monitorId, { loading: true, data: null, error: "" });
+        renderWebMonitors();
+        try {
+          const data = await requestJsonStrict(`${ENDPOINTS.webMonitors}/${encodeURIComponent(monitorId)}/history`, { timeoutMs: 15000, cache: "no-store" });
+          if (state.webMonitors.historyGenerations.get(monitorId) !== generation) return;
+          state.webMonitors.histories.set(monitorId, { loading: false, data, error: "" });
+        } catch (error) {
+          if (state.webMonitors.historyGenerations.get(monitorId) !== generation) return;
+          state.webMonitors.histories.set(monitorId, { loading: false, data: null, error: configErrorMessage(error?.details) || error?.message || "读取失败" });
+        }
+        renderWebMonitors();
+        return;
+      }
+      if (action === "delete" && !window.confirm("移除这个监控？已有版本和事件档案会保留在本机。")) return;
+      const historyWasOpen = action === "check" && state.webMonitors.histories.has(monitorId);
+      let historyGeneration = 0;
+      state.webMonitors.busyIds.add(monitorId);
+      renderWebMonitors();
+      try {
+        if (action === "check") {
+          const result = await requestJsonStrict(`${ENDPOINTS.webMonitors}/${encodeURIComponent(monitorId)}/check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: webMonitorRequestId("check") }),
+            timeoutMs: 120000,
+          });
+          const checkStatus = String(result?.status || result?.check?.status || "");
+          if (historyWasOpen && checkStatus) {
+            historyGeneration = (state.webMonitors.historyGenerations.get(monitorId) || 0) + 1;
+            state.webMonitors.historyGenerations.set(monitorId, historyGeneration);
+            state.webMonitors.histories.set(monitorId, { loading: true, data: null, error: "" });
+          }
+          if (checkStatus === "changed") showToast("发现正文变化，已写入事件档案和消息");
+          else if (checkStatus === "baseline") showToast("已建立正文基线");
+          else if (["unchanged", "noise_only"].includes(checkStatus)) showToast("检查完成，正文没有确认变化");
+          else if (checkStatus === "retry_wait") showToast(result?.error || "本次读取失败，系统会自动重试");
+          else if (checkStatus === "failed") showToast(result?.error || "本次检查失败，需要处理");
+          else if (checkStatus === "cancelled") showToast("本次检查已取消");
+          else showToast("检查结果状态未知，请刷新后查看");
+        } else if (action === "delete") {
+          await requestJsonStrict(`${ENDPOINTS.webMonitors}/${encodeURIComponent(monitorId)}`, { method: "DELETE", timeoutMs: 15000 });
+          showToast("已移除监控，历史档案仍保留在本机");
+        } else if (["pause", "resume"].includes(action)) {
+          await requestJsonStrict(`${ENDPOINTS.webMonitors}/${encodeURIComponent(monitorId)}/${action}`, { method: "POST", timeoutMs: 15000 });
+          showToast(action === "pause" ? "已暂停" : "已恢复监控");
+        }
+        await Promise.all([refreshWebMonitors({ silent: true }), refreshWebMonitorNotifications()]);
+        if (historyWasOpen && historyGeneration) {
+          try {
+            const history = await requestJsonStrict(`${ENDPOINTS.webMonitors}/${encodeURIComponent(monitorId)}/history`, { timeoutMs: 15000, cache: "no-store" });
+            if (state.webMonitors.historyGenerations.get(monitorId) !== historyGeneration) return;
+            state.webMonitors.histories.set(monitorId, { loading: false, data: history, error: "" });
+          } catch (historyError) {
+            if (state.webMonitors.historyGenerations.get(monitorId) !== historyGeneration) return;
+            const historyMessage = configErrorMessage(historyError?.details) || historyError?.message || "版本列表刷新失败";
+            state.webMonitors.histories.set(monitorId, { loading: false, data: null, error: historyMessage });
+            showToast(`检查已完成，但${historyMessage}`);
+          }
+        }
+      } catch (error) {
+        showToast(configErrorMessage(error?.details) || error?.message || "操作失败");
+      } finally {
+        state.webMonitors.busyIds.delete(monitorId);
+        renderWebMonitors();
+      }
+    }
+
     const DESKTOP_CONTENT_LIBRARY_STORAGE_KEY = "openbiliclaw.webui.contentLibraryTab";
-    const DESKTOP_CONTENT_LIBRARY_TABS = ["watchLater", "favorites", "tracking", "history"];
+    const DESKTOP_CONTENT_LIBRARY_TABS = ["watchLater", "favorites", "tracking", "monitoring", "history"];
     const desktopContentLibraryScroll = new Map();
     let desktopContentLibraryTab = "watchLater";
     let desktopContentLibraryVisible = false;
 
     function normalizeDesktopContentLibraryTab(value, fallback = "watchLater") {
       const normalized = String(value || "").trim().toLowerCase();
-      return {
+      const mapped = {
         watchlater: "watchLater",
         "watch-later": "watchLater",
         watch_later: "watchLater",
@@ -4404,8 +4744,13 @@ ${savedCardFeedbackBarHtml(listKind)}
         tracking: "tracking",
         tracked: "tracking",
         following: "tracking",
+        monitoring: "monitoring",
+        monitor: "monitoring",
+        monitors: "monitoring",
         history: "history"
       }[normalized] || fallback;
+      if (mapped !== "monitoring" || state.newsclawMode !== false) return mapped;
+      return fallback === "monitoring" ? "watchLater" : fallback;
     }
 
     function storedDesktopContentLibraryTab() {
@@ -4420,7 +4765,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       const hash = window.location.hash.replace(/^#\/?/, "");
       const [parent, child] = hash.split("/");
       if (parent === "library") return normalizeDesktopContentLibraryTab(child, storedDesktopContentLibraryTab());
-      if (["watchLater", "watch-later", "watch_later", "favorites", "favorite", "tracking", "tracked", "following", "history"].includes(parent)) {
+      if (["watchLater", "watch-later", "watch_later", "favorites", "favorite", "tracking", "tracked", "following", "monitoring", "monitor", "monitors", "history"].includes(parent)) {
         return normalizeDesktopContentLibraryTab(parent);
       }
       return "";
@@ -4441,6 +4786,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       if (tab === "watchLater") void refreshWatchLater();
       else if (tab === "favorites") void refreshFavorites();
       else if (tab === "tracking") void refreshTrackedObservations();
+      else if (tab === "monitoring") void refreshWebMonitors();
       else void refreshContentHistory();
     }
 
@@ -4453,9 +4799,9 @@ ${savedCardFeedbackBarHtml(listKind)}
       desktopContentLibraryTab = tab;
       storageSet(DESKTOP_CONTENT_LIBRARY_STORAGE_KEY, tab);
       DESKTOP_CONTENT_LIBRARY_TABS.forEach((name) => {
-        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", history: "History" }[name];
+        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", monitoring: "Monitoring", history: "History" }[name];
         const button = document.getElementById(`contentLibrary${suffix}Tab`);
-        const panel = document.getElementById({ watchLater: "watchLaterPage", favorites: "favoritesPage", tracking: "trackingPage", history: "historyPage" }[name]);
+        const panel = document.getElementById({ watchLater: "watchLaterPage", favorites: "favoritesPage", tracking: "trackingPage", monitoring: "monitoringPage", history: "historyPage" }[name]);
         const selected = name === tab;
         button?.classList.toggle("is-active", selected);
         button?.setAttribute("aria-selected", String(selected));
@@ -4500,7 +4846,7 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     function bindDesktopContentLibrary() {
       const buttons = DESKTOP_CONTENT_LIBRARY_TABS.map((name) => {
-        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", history: "History" }[name];
+        const suffix = { watchLater: "WatchLater", favorites: "Favorites", tracking: "Tracking", monitoring: "Monitoring", history: "History" }[name];
         return document.getElementById(`contentLibrary${suffix}Tab`);
       }).filter((button) => button instanceof HTMLButtonElement);
       buttons.forEach((button, index) => {
@@ -4509,18 +4855,38 @@ ${savedCardFeedbackBarHtml(listKind)}
           { forceLoad: true }
         ));
         button.addEventListener("keydown", (event) => {
+          const currentTab = DESKTOP_CONTENT_LIBRARY_TABS[index];
+          const availableTabs = DESKTOP_CONTENT_LIBRARY_TABS.filter(
+            (name) => name !== "monitoring" || state.newsclawMode === true
+          );
+          const currentIndex = Math.max(0, availableTabs.indexOf(currentTab));
           let nextIndex = null;
-          if (event.key === "ArrowRight") nextIndex = (index + 1) % buttons.length;
-          else if (event.key === "ArrowLeft") nextIndex = (index - 1 + buttons.length) % buttons.length;
+          if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % availableTabs.length;
+          else if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + availableTabs.length) % availableTabs.length;
           else if (event.key === "Home") nextIndex = 0;
-          else if (event.key === "End") nextIndex = buttons.length - 1;
+          else if (event.key === "End") nextIndex = availableTabs.length - 1;
           if (nextIndex === null) return;
           event.preventDefault();
-          openContentLibraryPage(DESKTOP_CONTENT_LIBRARY_TABS[nextIndex], { focus: true });
+          openContentLibraryPage(availableTabs[nextIndex], { focus: true });
         });
       });
       document.getElementById("trackingRefreshBtn")?.addEventListener("click", () => {
         void refreshTrackedObservations();
+      });
+      document.getElementById("monitoringRefreshBtn")?.addEventListener("click", () => {
+        void refreshWebMonitors();
+      });
+      document.getElementById("monitoringComposer")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void createWebMonitor();
+      });
+      document.getElementById("monitoringList")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-monitor-action]");
+        if (!button) return;
+        void runWebMonitorAction(
+          String(button.dataset.monitorAction || ""),
+          String(button.closest("[data-monitor-id]")?.dataset.monitorId || "")
+        );
       });
       window.addEventListener("hashchange", () => {
         const tab = desktopContentLibraryHashTab();
@@ -8726,6 +9092,9 @@ ${cardFeedbackBarHtml()}`;
 
     function messageKey(msg) {
       const type = messageType(msg);
+      if (type === "web-monitor-notification") {
+        return `${type}:${msg?.delivery_id || ""}`;
+      }
       if (type === "interest.probe" || type === "avoidance.probe") {
         return probeKey(type, msg?.domain || msg?.title);
       }
@@ -8747,6 +9116,20 @@ ${cardFeedbackBarHtml()}`;
           title: item.title || "有一条值得通知你的推荐",
           reason: item.reason || item.expression || "这条推荐达到了通知阈值。",
           content_url: item.content_url || item.canonical_url || ""
+        };
+      }
+      if (type === "web-monitor-notification") {
+        if (!item.delivery_id) return null;
+        return {
+          type,
+          delivery_id: String(item.delivery_id),
+          monitor_id: String(item.monitor_id || ""),
+          event_id: String(item.event_id || ""),
+          change_id: String(item.change_id || ""),
+          kind: String(item.kind || "change"),
+          title: item.title || "监控网页有新变化",
+          reason: item.body || "网页正文出现了可核验的变化。",
+          created_at: item.created_at || "",
         };
       }
       const domain = item.domain || item.name || item.title;
@@ -8853,7 +9236,15 @@ ${cardFeedbackBarHtml()}`;
         const resolvedResult = state.resolvedMessageResults.get(key);
         el.className = "message-item";
         el.dataset.messageKey = key;
-        if (messageType(msg) === "notification") {
+        if (messageType(msg) === "web-monitor-notification") {
+          el.classList.add("is-notification", "is-monitor-notification");
+          const eyebrow = msg.kind === "failure" ? "监控需要处理" : msg.kind === "recovered" ? "监控已恢复" : "网页正文变化";
+          const primaryLabel = msg.kind === "change" ? "查看事件" : "打开监控";
+          el.innerHTML = `<p class="eyebrow">${escapeHtml(eyebrow)}</p><h3>${escapeHtml(msg.title)}</h3><p class="video-meta">${escapeHtml(msg.reason)}</p><div class="message-note">${escapeHtml(webMonitorTime(msg.created_at, "刚刚"))} · 来自本机持久监控</div><div class="message-card-actions"><button class="small-btn" data-monitor-message="dismiss" type="button">忽略</button><div class="message-primary-actions"><button class="small-btn" data-monitor-message="open" type="button">${primaryLabel}</button></div></div>`;
+          el.querySelectorAll("[data-monitor-message]").forEach((button) => {
+            button.addEventListener("click", () => void respondWebMonitorNotification(msg, button.dataset.monitorMessage, el));
+          });
+        } else if (messageType(msg) === "notification") {
           el.classList.add("is-notification");
           const viewAction = msg.content_url
             ? `<a class="small-btn" data-notification-msg="view" href="${escapeHtml(msg.content_url)}" target="_blank" rel="noopener noreferrer">阅读原文</a>`
@@ -8903,6 +9294,97 @@ ${cardFeedbackBarHtml()}`;
       renderMessages();
       if (el) el.remove();
       showToast(response === "view" ? "已打开并标记这条通知" : "已标记这条通知");
+    }
+
+    async function refreshWebMonitorNotifications() {
+      if (state.newsclawMode !== true) return;
+      const generation = ++state.webMonitorNotificationGeneration;
+      try {
+        const payload = await requestJsonStrict(ENDPOINTS.webMonitorNotifications, {
+          timeoutMs: 15000,
+          cache: "no-store",
+        });
+        if (
+          state.newsclawMode !== true
+          || generation !== state.webMonitorNotificationGeneration
+        ) return;
+        const incoming = asArray(payload?.items).map((item) => ({
+          ...item,
+          type: "web-monitor-notification",
+        }));
+        state.messages = state.messages.filter(
+          (item) => messageType(item) !== "web-monitor-notification"
+        );
+        mergeMessages(incoming);
+        await Promise.allSettled(incoming
+          .filter((item) => item.delivery_state === "pending")
+          .map((item) => requestJsonStrict(
+            `${ENDPOINTS.webMonitorNotifications}/${encodeURIComponent(item.delivery_id)}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                action: "delivered",
+                request_id: `web-monitor:delivery:${String(item.delivery_id || "")}`,
+              }),
+              timeoutMs: 15000,
+            }
+          )));
+      } catch {
+        // Keep already rendered durable rows; the next foreground refresh will
+        // pull the same delivery ids again instead of inventing an empty inbox.
+      }
+    }
+
+    async function respondWebMonitorNotification(msg, response, el) {
+      const deliveryId = String(msg.delivery_id || "");
+      if (!deliveryId || state.webMonitorNotificationActions.has(deliveryId)) return;
+      state.webMonitorNotificationActions.add(deliveryId);
+      const modeGeneration = state.newsclawModeGeneration;
+      const action = response === "dismiss" ? "dismiss" : "read";
+      try {
+        await requestJsonStrict(
+          `${ENDPOINTS.webMonitorNotifications}/${encodeURIComponent(msg.delivery_id)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action,
+              request_id: `web-monitor:${action}:${String(msg.delivery_id || "")}`,
+            }),
+            timeoutMs: 15000,
+          }
+        );
+        state.webMonitorNotificationGeneration += 1;
+        state.messages = state.messages.filter(
+          (item) => messageKey(item) !== messageKey(msg)
+        );
+        if (state.messageListSnapshot) {
+          state.messageListSnapshot = state.messageListSnapshot.filter(
+            (item) => messageKey(item) !== messageKey(msg)
+          );
+        }
+        syncMessageCount();
+        renderMessages();
+        el?.remove();
+        if (
+          state.newsclawMode !== true
+          || modeGeneration !== state.newsclawModeGeneration
+        ) return;
+        if (response === "open") {
+          if (msg.kind === "change" && msg.event_id) {
+            openHomePage("events");
+            await eventWorkspaceController?.openEvent?.(msg.event_id, msg.change_id);
+          } else {
+            openContentLibraryPage("monitoring", { forceLoad: true });
+          }
+        }
+        void refreshWebMonitors({ silent: true });
+      } catch (error) {
+        showToast(configErrorMessage(error?.details) || error?.message || "通知状态保存失败");
+      } finally {
+        state.webMonitorNotificationActions.delete(deliveryId);
+      }
     }
 
     function collapseMessageItem(key, fallbackEl, onDone) {

@@ -336,12 +336,14 @@ browser_app = typer.Typer(help="agent-browser 浏览器命令")
 autostart_app = typer.Typer(help="开机自启动命令")
 ext_key_app = typer.Typer(help="浏览器扩展密钥管理命令")
 tls_proxy_app = typer.Typer(help="TLS 反代管理命令（远程设备 HTTPS 访问）")
+monitor_app = typer.Typer(help="NewsClaw 网页与 PDF 持续监控")
 app.add_typer(auth_app, name="auth")
 app.add_typer(login_app, name="login")
 app.add_typer(browser_app, name="browser")
 app.add_typer(autostart_app, name="autostart")
 app.add_typer(ext_key_app, name="ext-key")
 app.add_typer(tls_proxy_app, name="tls-proxy")
+app.add_typer(monitor_app, name="monitor")
 console = Console()
 _APP_CONTEXT: dict[str, Any] = {}
 _DISCOVER_STRATEGIES_OPTION = typer.Option(
@@ -1198,6 +1200,174 @@ def _get_runtime_database() -> Any:
     database.initialize()
     _RUNTIME_COMPONENTS["database"] = database
     return database
+
+
+def _monitor_service() -> Any:
+    from openbiliclaw.news.web_monitoring import WebMonitorService
+
+    return WebMonitorService(database=_get_runtime_database())
+
+
+@monitor_app.command("list")
+def monitor_list() -> None:
+    """列出这台电脑上的网页/PDF监控。"""
+
+    service = _monitor_service()
+    rows = service.store.list_monitors()
+    table = Table(title="NewsClaw 网页监控")
+    table.add_column("名称")
+    table.add_column("状态")
+    table.add_column("版本", justify="right")
+    table.add_column("变化", justify="right")
+    table.add_column("监控 ID")
+    for item in rows:
+        table.add_row(
+            str(
+                item.get("label") or item.get("snapshot_title") or item.get("display_url") or "网页"
+            ),
+            str(item.get("status") or "unknown"),
+            str(item.get("current_version") or "—"),
+            str(item.get("change_count") or 0),
+            str(item.get("monitor_id") or ""),
+        )
+    console.print(table)
+    if not rows:
+        console.print("还没有监控。使用 `newsclaw monitor add <网址>` 添加。")
+
+
+@monitor_app.command("add")
+def monitor_add(
+    url: str = typer.Argument(..., help="公开网页或 PDF 地址"),
+    label: str = typer.Option("", "--label", "-n", help="便于识别的名称"),
+    interval_minutes: int = typer.Option(
+        1440,
+        "--interval",
+        min=5,
+        max=10080,
+        help="检查间隔（分钟）",
+    ),
+    kind: str = typer.Option("auto", "--kind", help="auto / html / pdf"),
+) -> None:
+    """安全读取一次并建立首个本地正文基线。"""
+
+    from openbiliclaw.news.web_monitoring import validate_public_url
+
+    normalized_kind = kind.strip().lower()
+    if normalized_kind not in {"auto", "html", "pdf"}:
+        raise typer.BadParameter("kind 仅支持 auto / html / pdf")
+    try:
+        canonical_url = asyncio.run(validate_public_url(url))
+        service = _monitor_service()
+        request_id = f"cli-create:{uuid.uuid4()}"
+        item, created = service.store.create_monitor(
+            canonical_url=canonical_url,
+            kind=cast("Any", normalized_kind),
+            label=" ".join(label.split()).strip(),
+            focus="",
+            interval_minutes=interval_minutes,
+            request_id=request_id,
+        )
+        result = asyncio.run(
+            service.check_monitor(
+                str(item["monitor_id"]),
+                request_id=f"{request_id}:baseline",
+                manual=True,
+            )
+        )
+    except (RuntimeError, ValueError) as error:
+        _print_status_panel("error", "网页监控添加失败", str(error))
+        raise typer.Exit(code=1) from error
+    status_text = str(result.get("status") or result.get("check", {}).get("status") or "")
+    _print_status_panel(
+        "success"
+        if status_text in {"baseline", "unchanged", "changed", "noise_only"}
+        else "warning",
+        "已建立网页监控" if created else "监控已存在",
+        f"状态：{status_text or 'unknown'}\n监控 ID：{item['monitor_id']}",
+    )
+
+
+@monitor_app.command("check")
+def monitor_check(monitor_id: str = typer.Argument(..., help="monitor list 显示的监控 ID")) -> None:
+    """立即检查一次，并把真实变化写入事件档案。"""
+
+    service = _monitor_service()
+    try:
+        result = asyncio.run(
+            service.check_monitor(
+                monitor_id,
+                request_id=f"cli-check:{uuid.uuid4()}",
+                manual=True,
+            )
+        )
+    except (KeyError, RuntimeError, ValueError) as error:
+        _print_status_panel("error", "检查失败", str(error))
+        raise typer.Exit(code=1) from error
+    console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+
+
+@monitor_app.command("pause")
+def monitor_pause(monitor_id: str = typer.Argument(...)) -> None:
+    """暂停一个监控，但保留全部历史。"""
+
+    item = _monitor_service().store.set_status(monitor_id, "paused")
+    if item is None:
+        raise typer.BadParameter("监控不存在")
+    console.print("已暂停，历史仍保存在本机。")
+
+
+@monitor_app.command("resume")
+def monitor_resume(monitor_id: str = typer.Argument(...)) -> None:
+    """恢复一个已暂停或需要处理的监控。"""
+
+    item = _monitor_service().store.set_status(monitor_id, "active")
+    if item is None:
+        raise typer.BadParameter("监控不存在")
+    console.print("已恢复，将在下一轮检查。")
+
+
+@monitor_app.command("remove")
+def monitor_remove(monitor_id: str = typer.Argument(...)) -> None:
+    """停止并软删除监控，事件和版本档案不会被清空。"""
+
+    item = _monitor_service().store.set_status(monitor_id, "deleted")
+    if item is None:
+        raise typer.BadParameter("监控不存在")
+    console.print("已移除监控；已有版本和事件档案仍保存在本机。")
+
+
+@monitor_app.command("notifications")
+def monitor_notifications(include_read: bool = typer.Option(False, "--all")) -> None:
+    """查看网页监控的本地持久通知。"""
+
+    payload = _monitor_service().store.notifications(include_read=include_read)
+    table = Table(title=f"网页监控通知（未读 {payload['unread_count']}）")
+    table.add_column("类型")
+    table.add_column("标题")
+    table.add_column("时间")
+    table.add_column("通知 ID")
+    for item in payload["items"]:
+        table.add_row(
+            str(item.get("kind") or ""),
+            str(item.get("title") or ""),
+            str(item.get("created_at") or ""),
+            str(item.get("delivery_id") or ""),
+        )
+    console.print(table)
+
+
+@monitor_app.command("read")
+def monitor_notification_read(delivery_id: str = typer.Argument(..., help="通知 ID")) -> None:
+    """把一条网页监控通知标记为已读。"""
+
+    item = _monitor_service().store.mark_notification(
+        delivery_id,
+        action="read",
+        request_id=f"cli:notification:read:{delivery_id}",
+    )
+    if item is None:
+        raise typer.BadParameter("通知不存在")
+    console.print("已标记为已读。")
 
 
 def _build_usage_recorder() -> Any:

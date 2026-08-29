@@ -439,7 +439,58 @@ created, edited, or deleted; pending candidates can be accepted, edited before
 acceptance, or rejected; a currently deleted item exposes a version-checked
 restore action from history. Empty, loading, conflict, timeout, and retry states
 all reconcile from the backend truth rather than optimistic client-only state.
-P5 webpage/PDF monitoring and reliable notifications remain out of scope.
+
+### Phase 5 webpage/PDF monitoring (implemented deterministic contract)
+
+Phase 5 is a separate document-watch ledger, not a `NewsSourceAdapter`, tracked
+observation, recommendation source, or personal-memory producer:
+
+```text
+user-added public URL
+  -> per-hop SSRF validation + bounded fetch
+  -> immutable raw/text snapshot
+  -> deterministic normalization and diff
+       baseline / unchanged / noise_only / meaningful / failure
+  -> meaningful only: existing event change + durable local notification
+```
+
+`web_monitor_targets`, `web_monitor_checks`, `web_monitor_snapshots`,
+`web_monitor_diffs`, `web_monitor_notifications`, and
+`web_monitor_commands` form the authoritative schema-v9 aggregate. A monitor
+and its deterministic `document_monitor` event are created in one transaction.
+A meaningful successor snapshot, Phase-3 change projection, exact diff, target
+cursor, check terminal state, and notification are also committed in one
+transaction. Snapshots and diffs are append-only; remove is a soft target state.
+
+The first successful fetch is always a baseline and cannot notify. Raw bytes may
+change while normalized text stays equal; that produces an auditable
+`noise_only` version without an event or notification. The fact recorded in the
+event says the monitored document text was observed to change at detection
+time; it never invents the policy's legal effective date. User label/focus text
+is presentation metadata and cannot override the objective diff.
+
+The fetcher permits only public HTTP(S), standard ports, and a bounded redirect
+chain. On every hop it resolves and validates a public address set, connects to
+one of those exact IP literals while preserving the original Host/SNI identity,
+and then requires the actual peer to match the selected IP. It rejects
+credentials, localhost/private/reserved/link-local targets and HTTPS downgrade,
+ignores environment proxies, sends no cookies or authorization, and never
+forwards origin validators or response cookies to another host. Time,
+decompressed-byte, MIME/magic and PDF page/text limits are all bounded. HTML
+removes executable, navigation, form, footer and narrowly scoped
+layout/cookie/share/time noise. PDF extraction uses `pypdf` in a separate child
+process; a 20-second parse deadline kills that process. Frozen distributions
+without a packaged safe worker fail closed instead of falling back to an
+uninterruptible thread. Encrypted, damaged, scanned and oversized documents are
+surfaced as explicit safe failures.
+
+An independent scheduler claims due rows through persisted leases and a partial
+unique running-check index. Concurrent manual/background calls join the same
+check; expired owners are fenced. Retry delays are bounded at 1m, 5m, 30m, 2h
+and 6h before `needs_attention`. Failure, recovery and change notifications are
+durable rows; delivered/read/dismiss mutations use request receipts so an
+ambiguous retry cannot silently become a different action. This workflow never
+calls an LLM or Tavily and never reads/writes the Soul profile or Phase-4 memory.
 
 ## Client contract
 
@@ -455,16 +506,22 @@ P5 webpage/PDF monitoring and reliable notifications remain out of scope.
   Phase 1 does not add a desktop research-question, result-list or history UI.
   The event dossier reads only the shared Phase 3 event truth; it does not infer
   event state in JavaScript. Phase 4 adds the four-section personal-memory
-  manager and uses only the versioned local personal-memory API.
+  manager and uses only the versioned local personal-memory API. Phase 5 adds a
+  scan-first monitor subpage: counts remain unknown until loaded, history stays
+  folded, and event details open through the existing Phase-3 workspace.
 - Mobile Web/PWA uses the same API and adds pull-to-refresh and explicit
   online/degraded/offline state. Phase 1 adds no Research controls and never
-  sends a Tavily credential to this client.
+  sends a Tavily credential to this client. The responsive `/web` monitor view
+  uses the same backend rows rather than maintaining a mobile copy.
 - The browser extension is a display-only side-panel client. Its manifest has
   no news-site host permissions, content scripts, cookie access, or page hooks.
-  Phase 1 adds no Research control and never stores the Tavily credential.
+  Phase 1 adds no Research control and never stores the Tavily credential. P5
+  only adds a bounded localhost inbox probe and a link to the formal monitor
+  page; the extension itself never fetches the monitored document.
 - DSH is a trailing grid column. Its plugin failure is isolated so Harness can
   continue loading even if NewsClaw is unavailable. Its research tools call the
-  local Agent Bridge and never hold the Tavily credential.
+  local Agent Bridge and never hold the Tavily credential. Its content library,
+  durable inbox and seven P5 Agent operations consume the same local ledger.
 
 All feedback writes carry stable `request_id`/`event_id` values. Duplicate
 clicks or retries return the original receipt and cannot teach twice.

@@ -1095,21 +1095,16 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-# Schema version for migrations. V8 adds the user-controlled NewsClaw personal
-# memory ledger. It is intentionally separate from the behavioural ``events``
-# log and AI-generated soul/profile files: only explicit user actions can move a
-# candidate into the active memory table.
-_SCHEMA_VERSION = 8
+# Schema version for migrations. V9 adds the user-controlled NewsClaw webpage /
+# PDF monitoring ledger.  Targets, immutable snapshots, checks, diffs and local
+# notification deliveries live beside (but do not pollute) article discovery.
+_SCHEMA_VERSION = 9
 
 _PERSONAL_MEMORY_KINDS = frozenset({"confirmed_fact", "research_direction"})
 _PERSONAL_MEMORY_ITEM_STATUSES = frozenset({"active", "deleted"})
 _PERSONAL_MEMORY_CANDIDATE_STATUSES = frozenset({"pending", "accepted", "rejected"})
-_PERSONAL_MEMORY_CANDIDATE_SOURCE_TYPES = frozenset(
-    {"system_inference", "chat", "event", "import"}
-)
-_PERSONAL_MEMORY_EVIDENCE_FIELDS = frozenset(
-    {"type", "ref", "excerpt", "hash", "observed_at"}
-)
+_PERSONAL_MEMORY_CANDIDATE_SOURCE_TYPES = frozenset({"system_inference", "chat", "event", "import"})
+_PERSONAL_MEMORY_EVIDENCE_FIELDS = frozenset({"type", "ref", "excerpt", "hash", "observed_at"})
 
 _NEWS_EVENT_CONTRACT_VERSION = "news-event-v1"
 _NEWS_EVENT_FACT_GATE_MIGRATION_VERSION = "news-event-fact-gate-v4"
@@ -2312,6 +2307,7 @@ class Database:
         self._ensure_content_history_tables()
         self._ensure_tracked_observations_table()
         self._ensure_news_event_projection_tables()
+        self._ensure_web_monitor_tables()
         self._ensure_user_visual_clusters_table()
         self._ensure_auth_state_table()
         self._ensure_init_runs_table()
@@ -2326,6 +2322,189 @@ class Database:
         )
         self._conn.commit()
         logger.info("Database initialized at %s", self._db_path)
+
+    def _ensure_web_monitor_tables(self) -> None:
+        """Create the additive v9 user-controlled document-monitoring ledger.
+
+        The schema is intentionally independent from ``tracked_observations``:
+        a monitored policy page or PDF is evidence for an event, not a news
+        article that belongs in the recommendation pool.  All state required to
+        recover a lease, a failed check or an undelivered local notification is
+        durable in SQLite.
+        """
+
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS web_monitor_targets (
+                monitor_id            TEXT PRIMARY KEY,
+                canonical_url         TEXT NOT NULL,
+                content_kind          TEXT NOT NULL DEFAULT 'auto'
+                    CHECK (content_kind IN ('auto', 'html', 'pdf')),
+                label                 TEXT NOT NULL DEFAULT '',
+                focus                 TEXT NOT NULL DEFAULT '',
+                interval_minutes      INTEGER NOT NULL DEFAULT 1440
+                    CHECK (interval_minutes BETWEEN 5 AND 10080),
+                status                TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN (
+                        'active', 'paused', 'retry_wait', 'needs_attention', 'deleted'
+                    )),
+                state_version         INTEGER NOT NULL DEFAULT 0,
+                event_id              TEXT NOT NULL,
+                current_snapshot_id   TEXT,
+                etag                  TEXT NOT NULL DEFAULT '',
+                last_modified         TEXT NOT NULL DEFAULT '',
+                last_attempt_at       TEXT NOT NULL DEFAULT '',
+                last_success_at       TEXT NOT NULL DEFAULT '',
+                last_change_at        TEXT NOT NULL DEFAULT '',
+                next_check_at         TEXT NOT NULL DEFAULT '',
+                consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+                last_error_kind       TEXT NOT NULL DEFAULT '',
+                last_error            TEXT NOT NULL DEFAULT '',
+                lease_owner           TEXT NOT NULL DEFAULT '',
+                lease_token           TEXT NOT NULL DEFAULT '',
+                lease_until           TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (event_id) REFERENCES news_events(event_id),
+                FOREIGN KEY (current_snapshot_id)
+                    REFERENCES web_monitor_snapshots(snapshot_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_web_monitor_target_identity
+                ON web_monitor_targets(canonical_url, content_kind)
+                WHERE status != 'deleted';
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_targets_due
+                ON web_monitor_targets(status, next_check_at, monitor_id);
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_targets_event
+                ON web_monitor_targets(event_id, status, monitor_id);
+
+            CREATE TABLE IF NOT EXISTS web_monitor_checks (
+                check_id              TEXT PRIMARY KEY,
+                monitor_id            TEXT NOT NULL,
+                request_id            TEXT NOT NULL,
+                lease_token           TEXT NOT NULL DEFAULT '',
+                status                TEXT NOT NULL
+                    CHECK (status IN (
+                        'running', 'baseline', 'unchanged', 'noise_only', 'changed',
+                        'retry_wait', 'failed', 'cancelled'
+                    )),
+                from_snapshot_id      TEXT,
+                to_snapshot_id        TEXT,
+                http_status           INTEGER,
+                error_kind            TEXT NOT NULL DEFAULT '',
+                error_message         TEXT NOT NULL DEFAULT '',
+                retryable             INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+                started_at            TEXT NOT NULL,
+                finished_at           TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (monitor_id) REFERENCES web_monitor_targets(monitor_id),
+                FOREIGN KEY (from_snapshot_id)
+                    REFERENCES web_monitor_snapshots(snapshot_id),
+                FOREIGN KEY (to_snapshot_id)
+                    REFERENCES web_monitor_snapshots(snapshot_id),
+                UNIQUE (monitor_id, request_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_web_monitor_one_running
+                ON web_monitor_checks(monitor_id) WHERE status = 'running';
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_checks_history
+                ON web_monitor_checks(monitor_id, started_at DESC, check_id DESC);
+
+            CREATE TABLE IF NOT EXISTS web_monitor_snapshots (
+                snapshot_id           TEXT PRIMARY KEY,
+                monitor_id            TEXT NOT NULL,
+                ordinal               INTEGER NOT NULL,
+                raw_hash              TEXT NOT NULL,
+                semantic_hash         TEXT NOT NULL,
+                normalizer_version    TEXT NOT NULL,
+                content_kind          TEXT NOT NULL CHECK (content_kind IN ('html', 'pdf')),
+                mime_type             TEXT NOT NULL DEFAULT '',
+                title                 TEXT NOT NULL DEFAULT '',
+                normalized_text       TEXT NOT NULL,
+                byte_count            INTEGER NOT NULL DEFAULT 0,
+                final_url             TEXT NOT NULL DEFAULT '',
+                etag                  TEXT NOT NULL DEFAULT '',
+                last_modified         TEXT NOT NULL DEFAULT '',
+                classification        TEXT NOT NULL DEFAULT 'meaningful'
+                    CHECK (classification IN ('baseline', 'meaningful', 'noise_only')),
+                suppression_reason    TEXT NOT NULL DEFAULT '',
+                fetched_at            TEXT NOT NULL,
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (monitor_id) REFERENCES web_monitor_targets(monitor_id),
+                UNIQUE (monitor_id, ordinal)
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_snapshots_history
+                ON web_monitor_snapshots(monitor_id, ordinal DESC, snapshot_id DESC);
+
+            CREATE TABLE IF NOT EXISTS web_monitor_diffs (
+                diff_id               TEXT PRIMARY KEY,
+                monitor_id            TEXT NOT NULL,
+                check_id              TEXT NOT NULL,
+                from_snapshot_id      TEXT NOT NULL,
+                to_snapshot_id        TEXT NOT NULL,
+                change_id             TEXT,
+                classification        TEXT NOT NULL
+                    CHECK (classification IN ('meaningful', 'noise_only')),
+                summary               TEXT NOT NULL DEFAULT '',
+                added_json            TEXT NOT NULL DEFAULT '[]',
+                removed_json          TEXT NOT NULL DEFAULT '[]',
+                evidence_quote        TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (monitor_id) REFERENCES web_monitor_targets(monitor_id),
+                FOREIGN KEY (check_id) REFERENCES web_monitor_checks(check_id),
+                FOREIGN KEY (from_snapshot_id)
+                    REFERENCES web_monitor_snapshots(snapshot_id),
+                FOREIGN KEY (to_snapshot_id)
+                    REFERENCES web_monitor_snapshots(snapshot_id),
+                FOREIGN KEY (change_id) REFERENCES news_event_changes(change_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_diffs_history
+                ON web_monitor_diffs(monitor_id, created_at DESC, diff_id DESC);
+
+            CREATE TABLE IF NOT EXISTS web_monitor_notifications (
+                delivery_id           TEXT PRIMARY KEY,
+                notification_key      TEXT NOT NULL UNIQUE,
+                monitor_id            TEXT NOT NULL,
+                event_id              TEXT NOT NULL,
+                change_id             TEXT,
+                check_id              TEXT NOT NULL,
+                kind                  TEXT NOT NULL
+                    CHECK (kind IN ('change', 'failure', 'recovered')),
+                title                 TEXT NOT NULL,
+                body                  TEXT NOT NULL,
+                delivery_state        TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (delivery_state IN (
+                        'pending', 'delivered', 'retry_wait', 'dead_letter'
+                    )),
+                attempt_count         INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at       TEXT NOT NULL DEFAULT '',
+                last_error            TEXT NOT NULL DEFAULT '',
+                delivered_at          TEXT NOT NULL DEFAULT '',
+                read_at               TEXT NOT NULL DEFAULT '',
+                dismissed_at          TEXT NOT NULL DEFAULT '',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (monitor_id) REFERENCES web_monitor_targets(monitor_id),
+                FOREIGN KEY (event_id) REFERENCES news_events(event_id),
+                FOREIGN KEY (change_id) REFERENCES news_event_changes(change_id),
+                FOREIGN KEY (check_id) REFERENCES web_monitor_checks(check_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_web_monitor_notification_change_channel
+                ON web_monitor_notifications(change_id)
+                WHERE change_id IS NOT NULL AND change_id != '' AND kind = 'change';
+            CREATE INDEX IF NOT EXISTS idx_web_monitor_notification_inbox
+                ON web_monitor_notifications(
+                    dismissed_at, read_at, created_at DESC, delivery_id DESC
+                );
+
+            CREATE TABLE IF NOT EXISTS web_monitor_commands (
+                request_id            TEXT PRIMARY KEY,
+                operation             TEXT NOT NULL,
+                payload_hash          TEXT NOT NULL,
+                monitor_id            TEXT NOT NULL DEFAULT '',
+                result_json           TEXT NOT NULL DEFAULT '{}',
+                created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -4058,9 +4237,7 @@ class Database:
             evidence_type = cls._personal_memory_text(
                 raw.get("type"), field="evidence type", max_length=40, required=True
             ).lower()
-            evidence_ref = cls._personal_memory_source_ref(
-                raw.get("ref"), required=True
-            )
+            evidence_ref = cls._personal_memory_source_ref(raw.get("ref"), required=True)
             detached = {"type": evidence_type, "ref": evidence_ref}
             excerpt = cls._personal_memory_text(
                 raw.get("excerpt"), field="evidence excerpt", max_length=500
@@ -4147,9 +4324,7 @@ class Database:
         claim_key: str,
         content_fingerprint: str,
     ) -> str:
-        return hashlib.sha256(
-            f"{kind}\0{claim_key}\0{content_fingerprint}".encode()
-        ).hexdigest()
+        return hashlib.sha256(f"{kind}\0{claim_key}\0{content_fingerprint}".encode()).hexdigest()
 
     @classmethod
     def _personal_memory_item_dict(cls, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -4195,9 +4370,7 @@ class Database:
         if result.get("action") == "accept_candidate" and isinstance(result["after"], dict):
             snapshot = result["after"].get("candidate") or result["after"]
         result["title"] = str(snapshot.get("title") or "") if isinstance(snapshot, dict) else ""
-        result["content"] = (
-            str(snapshot.get("content") or "") if isinstance(snapshot, dict) else ""
-        )
+        result["content"] = str(snapshot.get("content") or "") if isinstance(snapshot, dict) else ""
         return result
 
     @classmethod
@@ -4346,17 +4519,16 @@ class Database:
         normalized_content = self._personal_memory_text(
             content, field="content", max_length=4000, required=True
         )
-        normalized_title = self._personal_memory_text(
-            title, field="title", max_length=120
-        ) or normalized_content[:48]
+        normalized_title = (
+            self._personal_memory_text(title, field="title", max_length=120)
+            or normalized_content[:48]
+        )
         if str(source_type or "user").strip().lower() != "user":
             raise ValueError("only an explicit user action can create active personal memory")
         if str(origin_candidate_id or "").strip():
             raise ValueError("candidate memory must be accepted through the candidate workflow")
         normalized_request_id = self._personal_memory_request_id(request_id)
-        claim_key = self._personal_memory_claim_key(
-            kind=normalized_kind, title=normalized_title
-        )
+        claim_key = self._personal_memory_claim_key(kind=normalized_kind, title=normalized_title)
         content_fingerprint = self._personal_memory_content_fingerprint(
             kind=normalized_kind, content=normalized_content
         )
@@ -4549,18 +4721,14 @@ class Database:
             memory_id, field="memory_id", max_length=128, required=True
         )
         normalized_request_id = self._personal_memory_request_id(request_id)
-        normalized_reason = self._personal_memory_text(
-            reason, field="reason", max_length=1000
-        )
+        normalized_reason = self._personal_memory_text(reason, field="reason", max_length=1000)
         normalized_title = (
             self._personal_memory_text(title, field="title", max_length=120, required=True)
             if title is not None
             else None
         )
         normalized_content = (
-            self._personal_memory_text(
-                content, field="content", max_length=4000, required=True
-            )
+            self._personal_memory_text(content, field="content", max_length=4000, required=True)
             if content is not None
             else None
         )
@@ -4874,9 +5042,10 @@ class Database:
         normalized_content = self._personal_memory_text(
             content, field="content", max_length=4000, required=True
         )
-        normalized_title = self._personal_memory_text(
-            title, field="title", max_length=120
-        ) or normalized_content[:48]
+        normalized_title = (
+            self._personal_memory_text(title, field="title", max_length=120)
+            or normalized_content[:48]
+        )
         normalized_reason = self._personal_memory_text(
             proposal_reason, field="proposal_reason", max_length=1000, required=True
         )
@@ -5039,9 +5208,7 @@ class Database:
             else None
         )
         normalized_content = (
-            self._personal_memory_text(
-                content, field="content", max_length=4000, required=True
-            )
+            self._personal_memory_text(content, field="content", max_length=4000, required=True)
             if content is not None
             else None
         )
@@ -23130,6 +23297,11 @@ class Database:
             effective_at=effective_at,
             effective_precision=effective_precision,
         )
+        occurrence_id = str(change.get("occurrence_id") or "").strip()[:200]
+        if occurrence_id:
+            fingerprint = hashlib.sha256(
+                f"{fingerprint}\x1foccurrence:{occurrence_id}".encode()
+            ).hexdigest()
         existing = conn.execute(
             """
             SELECT * FROM news_event_changes
@@ -23137,7 +23309,7 @@ class Database:
             """,
             (normalized_event_id, fingerprint),
         ).fetchone()
-        if existing is None:
+        if existing is None and not occurrence_id:
             # A first observation may know the state transition but not its
             # effective time.  When later evidence supplies that time, upgrade
             # the one unambiguous provisional row in place so its evidence and

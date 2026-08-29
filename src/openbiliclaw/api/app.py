@@ -2633,6 +2633,16 @@ def create_app(
             # registry, so a broken model configuration must not lock the user
             # out of their own durable memory.
             or (newsclaw_mode and path.startswith("/api/personal-memory"))
+            # P5 webpage/PDF monitoring and its in-app notification inbox are
+            # deterministic local controls; they remain usable while the LLM
+            # registry is being repaired.
+            or (
+                newsclaw_mode
+                and (
+                    path.startswith("/api/news/monitors")
+                    or path.startswith("/api/news/monitor-notifications")
+                )
+            )
             or path == "/favicon.ico"
             or path == "/api/autostart-status"
             or path == "/api/autostart/apply"

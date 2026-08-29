@@ -181,6 +181,42 @@ async def test_news_runtime_applies_and_reports_effective_settings(tmp_path: Pat
     assert runtime.runtime_state()["effective_settings"] == effective
 
 
+@pytest.mark.asyncio
+async def test_monitor_scheduler_starts_even_when_other_runtime_settings_fail(
+    tmp_path: Path,
+) -> None:
+    def broken_settings(_settings: Mapping[str, object]) -> None:
+        raise RuntimeError("controller unavailable")
+
+    runtime = NewsRuntime(
+        data_path=tmp_path,
+        database=_FakeDatabase(),
+        soul_engine=_FakeSoul(),
+        event_ingress=_FakeIngress(),
+        request_replenishment=_noop_replenishment,
+        apply_runtime_settings=broken_settings,
+    )
+    lifecycle: list[str] = []
+
+    class MonitorService:
+        async def start(self) -> None:
+            lifecycle.append("started")
+
+        async def stop(self) -> None:
+            lifecycle.append("stopped")
+
+    runtime.web_monitor_service = MonitorService()  # type: ignore[assignment]
+
+    await runtime.start()
+    try:
+        assert lifecycle == ["started"]
+        assert runtime.runtime_state()["effective_settings"] == runtime.settings()
+    finally:
+        await runtime.stop()
+
+    assert lifecycle == ["started", "stopped"]
+
+
 def test_manual_tracking_runner_caps_user_retry_policy(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     payload = runtime.settings_store.load()

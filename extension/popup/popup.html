@@ -53,6 +53,12 @@
       width: 32px; height: 32px; padding: 0; border: 1px solid var(--line);
       border-radius: 10px; color: #59677f; background: #fff;
     }
+    .monitor-btn { position: relative; }
+    .monitor-badge {
+      position: absolute; top: -5px; right: -5px; min-width: 16px; height: 16px;
+      padding: 0 4px; border: 2px solid #fff; border-radius: 999px;
+      color: #fff; background: var(--brand-strong); font-size: 9px; font-weight: 800; line-height: 12px;
+    }
     .content { position: relative; min-height: 0; }
     .client-frame { width: 100%; height: 100%; border: 0; background: #fff; }
     .state-card {
@@ -89,6 +95,7 @@
       <img class="brand-mark" src="../icons/icon48.png" alt="">
       <div class="brand"><strong>NewsClaw · 新闻爪</strong><small id="connectionText">正在连接本机服务…</small></div>
       <span class="status-dot" id="connectionDot" aria-hidden="true"></span>
+      <button class="icon-btn monitor-btn" id="monitorButton" type="button" title="打开网页监控" aria-label="打开网页监控" hidden>◎<span class="monitor-badge" id="monitorBadge" hidden></span></button>
       <button class="icon-btn" id="openFullButton" type="button" title="在新标签页打开" aria-label="在新标签页打开">↗</button>
       <button class="icon-btn" id="settingsButton" type="button" title="连接设置" aria-label="连接设置">⚙</button>
     </header>

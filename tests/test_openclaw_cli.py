@@ -1027,3 +1027,144 @@ async def test_newsclaw_capabilities_include_research_only_with_runtime() -> Non
     assert "newsclaw_extract_evidence" not in without_runtime["data"]["skill_names"]  # type: ignore[index]
     assert "newsclaw_search_web" in with_runtime["data"]["skill_names"]  # type: ignore[index]
     assert "newsclaw_extract_evidence" in with_runtime["data"]["skill_names"]  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_web_monitor_bridge_commands_share_runtime_truth() -> None:
+    from openbiliclaw.integrations.openclaw.cli import _build_parser, _run_command
+
+    monitor = {
+        "monitor_id": "monitor-1",
+        "event_id": "event-1",
+        "label": "政策页",
+        "status": "active",
+        "lease_owner": "private-worker",
+        "lease_token": "private-token",
+        "etag": "private-etag",
+    }
+
+    class Store:
+        def list_monitors(self) -> list[dict[str, object]]:
+            return [dict(monitor)]
+
+        def get_monitor(self, monitor_id: str) -> dict[str, object] | None:
+            return dict(monitor) if monitor_id == "monitor-1" else None
+
+        def set_status(self, monitor_id: str, status: str) -> dict[str, object] | None:
+            if monitor_id != "monitor-1":
+                return None
+            return {**monitor, "status": status}
+
+        def history(self, monitor_id: str, *, limit: int) -> dict[str, object] | None:
+            if monitor_id != "monitor-1":
+                return None
+            return {
+                "monitor": dict(monitor),
+                "checks": [{"check_id": "check-1", "lease_token": "private"}],
+                "versions": [],
+                "diffs": [],
+                "limit": limit,
+            }
+
+        def notifications(self, *, include_read: bool, limit: int) -> dict[str, object]:
+            return {"items": [], "unread_count": 0, "include_read": include_read, "limit": limit}
+
+        def mark_notification(
+            self, delivery_id: str, *, action: str, request_id: str
+        ) -> dict[str, object] | None:
+            if delivery_id != "notice-1":
+                return None
+            return {"delivery_id": delivery_id, "action": action, "request_id": request_id}
+
+    class Service:
+        store = Store()
+
+        @staticmethod
+        def runtime_state() -> dict[str, object]:
+            return {"running": True}
+
+        async def schedule_check(
+            self, monitor_id: str, *, request_id: str, manual: bool
+        ) -> dict[str, object]:
+            return {
+                "status": "unchanged",
+                "monitor": dict(monitor),
+                "check": {"check_id": request_id, "lease_token": "private"},
+                "manual": manual,
+            }
+
+    parser = _build_parser()
+    runtime = SimpleNamespace(web_monitor_service=Service())
+    listed = await _run_command(
+        parser.parse_args(["web-monitor-list"]), object(), news_runtime=runtime
+    )
+    checked = await _run_command(
+        parser.parse_args(
+            ["web-monitor-check", "--monitor-id", "monitor-1", "--request-id", "check-1"]
+        ),
+        object(),
+        news_runtime=runtime,
+    )
+    paused = await _run_command(
+        parser.parse_args(
+            ["web-monitor-set-state", "--monitor-id", "monitor-1", "--action", "pause"]
+        ),
+        object(),
+        news_runtime=runtime,
+    )
+    history = await _run_command(
+        parser.parse_args(["web-monitor-history", "--monitor-id", "monitor-1"]),
+        object(),
+        news_runtime=runtime,
+    )
+    notice = await _run_command(
+        parser.parse_args(
+            [
+                "web-monitor-notification-action",
+                "--delivery-id",
+                "notice-1",
+                "--action",
+                "read",
+                "--request-id",
+                "notice-read-1",
+            ]
+        ),
+        object(),
+        news_runtime=runtime,
+    )
+    unavailable = await _run_command(
+        parser.parse_args(["web-monitor-list"]), object(), news_runtime=None
+    )
+
+    assert listed["data"]["items"][0]["monitor_id"] == "monitor-1"  # type: ignore[index]
+    assert "lease_token" not in listed["data"]["items"][0]  # type: ignore[index]
+    assert checked["data"]["status"] == "unchanged"  # type: ignore[index]
+    assert "lease_token" not in checked["data"]["check"]  # type: ignore[index]
+    assert paused["data"]["item"]["status"] == "paused"  # type: ignore[index]
+    assert "lease_token" not in history["data"]["checks"][0]  # type: ignore[index]
+    assert notice["data"]["item"]["request_id"] == "notice-read-1"  # type: ignore[index]
+    assert unavailable["error_type"] == "operation_error"
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_capabilities_include_p5_only_with_news_runtime() -> None:
+    from openbiliclaw.integrations.openclaw.cli import _build_parser, _run_command
+
+    args = _build_parser().parse_args(["capabilities"])
+    without_runtime = await _run_command(args, _FakeCliAdapter())
+    with_runtime = await _run_command(
+        args,
+        _FakeCliAdapter(),
+        news_runtime=SimpleNamespace(web_monitor_service=object()),
+    )
+    p5_names = {
+        "newsclaw_list_web_monitors",
+        "newsclaw_add_web_monitor",
+        "newsclaw_check_web_monitor",
+        "newsclaw_set_web_monitor_state",
+        "newsclaw_get_web_monitor_history",
+        "newsclaw_list_monitor_notifications",
+        "newsclaw_act_on_monitor_notification",
+    }
+    assert p5_names.isdisjoint(without_runtime["data"]["skill_names"])  # type: ignore[index]
+    assert p5_names.issubset(with_runtime["data"]["skill_names"])  # type: ignore[index]
