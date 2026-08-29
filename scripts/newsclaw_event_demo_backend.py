@@ -126,10 +126,10 @@ class DemoSoul:
         return False
 
     async def get_profile(self) -> dict[str, object]:
-        return {}
+        raise RuntimeError("profile is intentionally unavailable in the isolated demo")
 
     async def get_raw_profile(self) -> dict[str, object]:
-        return {}
+        raise RuntimeError("profile is intentionally unavailable in the isolated demo")
 
     def get_overrides(self) -> dict[str, object]:
         return {}
@@ -443,16 +443,17 @@ def _run(*, port: int) -> None:
             print(f"NewsClaw isolated SQLite demo: http://{LOOPBACK_HOST}:{port}/web/")
             print("Real API + disposable DB; no credentials, sources, scheduler, or LLM loaded.")
             try:
-                uvicorn.Server(
-                    uvicorn.Config(
-                        app,
-                        host=LOOPBACK_HOST,
-                        port=port,
-                        workers=1,
-                        lifespan="off",
-                        log_level="warning",
-                    )
-                ).run()
+                with suppress(KeyboardInterrupt):
+                    uvicorn.Server(
+                        uvicorn.Config(
+                            app,
+                            host=LOOPBACK_HOST,
+                            port=port,
+                            workers=1,
+                            lifespan="off",
+                            log_level="warning",
+                        )
+                    ).run()
             finally:
                 close_demo_resources(app, database)
 

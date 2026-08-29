@@ -130,6 +130,17 @@ def test_demo_html_is_visibly_disclosed(demo_backend: tuple[TestClient, Any, Pat
     assert "演示环境 · 正式库未连接" in response.text
 
 
+def test_unavailable_profile_is_reported_without_a_server_error(
+    demo_backend: tuple[TestClient, Any, Path],
+) -> None:
+    client, _database, _root = demo_backend
+
+    response = client.get("/api/profile-summary")
+
+    assert response.status_code == 200
+    assert response.json()["initialized"] is False
+
+
 def test_runtime_files_contain_no_credentials_or_enabled_sources(
     demo_backend: tuple[TestClient, Any, Path],
 ) -> None:
