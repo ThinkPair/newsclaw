@@ -1488,3 +1488,43 @@ def test_newsclaw_reconcile_uses_liked_rows_as_protected_target_floor(tmp_path: 
         str(row["feedback_type"])
         for row in db.conn.execute("SELECT feedback_type FROM content_cache").fetchall()
     } == {"like"}
+
+
+def test_newsclaw_reconcile_recounts_when_hidden_topic_rows_surface(tmp_path: Path) -> None:
+    db = Database(tmp_path / "topic-window-recount.db")
+    db.initialize()
+    for index in range(4):
+        bvid = f"news:same-topic-{index}"
+        db.cache_content(
+            bvid,
+            title=bvid,
+            source="news",
+            source_platform="news",
+            content_id=f"same-topic-{index}",
+            content_url=f"https://example.com/{bvid}",
+            published_at="2026-08-30T05:00:00Z",
+            relevance_score=0.7 + index / 20,
+            style_key="news_brief",
+            topic_group="same-topic",
+        )
+        db.update_pool_copy(
+            bvid,
+            expression=f"reason-{index}",
+            topic_label="same-topic",
+        )
+
+    assert db.count_pool_candidates() == 3
+    maintained = db.reconcile_newsclaw_pool_after_admission(
+        target=2,
+        raw_ceiling=4,
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+
+    assert maintained == 2
+    assert db.count_pool_candidates() == 2
+    stale = db.conn.execute(
+        "SELECT COUNT(*) AS count FROM content_cache WHERE pool_status = 'stale'"
+    ).fetchone()
+    assert stale is not None
+    assert int(stale["count"]) == 2

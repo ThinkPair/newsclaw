@@ -192,7 +192,10 @@ progress, reconciliation runs once the visible pool is at or above target. Runti
 small reconciliation debt across coordinator retries (and starts with one repair check after a
 process restart); debt is repaid before any new copy work, never while the pool is below target.
 Missing maintenance, database failure, cancellation, or provider failure cannot silently clear
-that debt. Ordinary product mode continues to use the existing global watermark path.
+that debt. Reconciliation reloads the canonical visible set after every demotion because removing
+one topic-window row can reveal another previously folded row; it stops only at the effective
+target or with an explicit no-progress error. Ordinary product mode continues to use the existing
+global watermark path.
 
 NewsClaw's desktop home is a decision workbench rather than a dense reading
 wall. The queue carries only priority, topic, title, source, time and evidence

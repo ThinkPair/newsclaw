@@ -10342,24 +10342,26 @@ class Database:
         try:
             conn.execute("BEGIN IMMEDIATE")
             viewed = self._recent_viewed_content_keys_on(conn)
-            available_rows = self._load_available_pool_candidate_rows_on(
-                conn,
-                _viewed_content_keys=viewed,
-                full_rows=True,
-            )
-            protected_visible = sum(
-                str(row.get("feedback_type") or "").strip().lower() == "like"
-                for row in available_rows
-            )
-            # A user's explicit likes outrank the rotating-pool target.  When
-            # the protected set alone is larger than the configured target,
-            # the only mathematically consistent invariant is to retain that
-            # protected floor and reconcile every replaceable row around it.
-            effective_target = max(clean_target, protected_visible)
-            effective_raw_ceiling = max(clean_raw_ceiling, effective_target)
-            overflow = max(0, len(available_rows) - effective_target)
             demoted = 0
-            if overflow > 0:
+            effective_target = clean_target
+            while True:
+                available_rows = self._load_available_pool_candidate_rows_on(
+                    conn,
+                    _viewed_content_keys=viewed,
+                    full_rows=True,
+                )
+                protected_visible = sum(
+                    str(row.get("feedback_type") or "").strip().lower() == "like"
+                    for row in available_rows
+                )
+                # A user's explicit likes outrank the rotating-pool target.  When
+                # the protected set alone is larger than the configured target,
+                # the only mathematically consistent invariant is to retain that
+                # protected floor and reconcile every replaceable row around it.
+                effective_target = max(clean_target, protected_visible)
+                overflow = max(0, len(available_rows) - effective_target)
+                if overflow <= 0:
+                    break
                 candidates = [
                     row
                     for row in available_rows
@@ -10390,7 +10392,12 @@ class Database:
                 victims = [bvid for bvid in victims if bvid]
                 if len(victims) < overflow:
                     raise RuntimeError("NewsClaw pool overflow has no replaceable visible row")
-                demoted = self._apply_content_status_on(conn, victims, status="stale")
+                changed = self._apply_content_status_on(conn, victims, status="stale")
+                if changed <= 0:
+                    raise RuntimeError("NewsClaw pool overflow reconciliation made no progress")
+                demoted += changed
+
+            effective_raw_ceiling = max(clean_raw_ceiling, effective_target)
 
             protected_ids = {
                 str(row["bvid"])
