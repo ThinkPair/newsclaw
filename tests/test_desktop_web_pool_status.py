@@ -397,7 +397,11 @@ def test_desktop_web_opens_local_newsclaw_about_panel() -> None:
     assert 'id="starButton"' not in top_actions.group(0)
     assert 'id="starCount"' not in top_actions.group(0)
     assert 'id="aboutOverlay"' in index_html
-    assert "这是独立产品，不是换皮入口" in index_html
+    assert "看见真正的变化" in index_html
+    assert "你的数据，由你控制" in index_html
+    assert "开源致谢" in index_html
+    assert "换皮入口" not in index_html
+    assert "OpenBiliClaw" not in index_html
     assert "product-about" in app_css
     assert 'openPanel("aboutOverlay")' in app_js
     assert "STAR_REPO_URL" not in app_js

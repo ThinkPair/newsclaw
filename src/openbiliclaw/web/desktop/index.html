@@ -998,7 +998,7 @@
         <button class="mobile-menu-item" data-mobile-page="chatPage" type="button"><span>聊聊口味</span><small>告诉新闻爪你的偏好和边界</small></button>
         <button class="mobile-menu-item" data-mobile-panel="messagesDrawer" type="button"><span>消息</span><small><span id="mobileMessageCount">0</span> 条通知</small></button>
         <button class="mobile-menu-item" data-mobile-page="settingsPage" data-settings="models" type="button"><span>设置</span><small>模型、前端、新闻源和调度配置</small></button>
-        <button class="mobile-menu-item" data-mobile-panel="aboutOverlay" type="button"><span>关于新闻爪</span><small>产品定位、数据边界与技术许可</small></button>
+        <button class="mobile-menu-item" data-mobile-panel="aboutOverlay" type="button"><span>关于新闻爪</span><small>了解它如何追踪变化并留下你的信息积累</small></button>
       </div>
       <section class="mobile-summary-card" id="mobilePersonalMemorySummary" aria-label="个人记忆摘要">
         <div class="mobile-summary-head"><p class="eyebrow">Personal memory</p><button class="small-btn" data-mobile-page="profilePage" type="button">打开记忆</button></div>
@@ -1033,28 +1033,28 @@
     <div class="scrim" data-close="aboutOverlay"></div>
     <div class="modal-panel about-panel" role="dialog" aria-modal="true" aria-labelledby="aboutNewsClawTitle">
       <div class="modal-head">
-        <div><p class="eyebrow">Independent local news agent</p><h2 id="aboutNewsClawTitle">关于新闻爪</h2></div>
+        <div><p class="eyebrow">Local intelligence assistant</p><h2 id="aboutNewsClawTitle">关于新闻爪</h2></div>
         <button class="icon-btn" data-close="aboutOverlay" type="button" aria-label="关闭关于新闻爪">×</button>
       </div>
-      <p class="about-lead">NewsClaw / 新闻爪是一款独立运行的本地个性化新闻 Agent。它每天按你的关注方向整理真实新闻，帮助你提升宏观理解、辅助投资研究和内容创作。</p>
+      <p class="about-lead">NewsClaw / 新闻爪是一款本地优先的个人情报助手。它把散落的新闻、网页和 PDF 组织成可以持续跟踪的事件，帮你看清相比之前究竟发生了什么变化，以及这些变化为什么值得关注。</p>
       <div class="about-capability-grid" aria-label="新闻爪的核心能力">
-        <article><strong>找到真实新闻</strong><span>从你启用的新闻 API、官方 RSS 与自定义 RSS 获取内容，并保留来源与时间。</span></article>
-        <article><strong>解释与你的关系</strong><span>结合你的画像说明为什么值得看、可能的影响链，以及后续观察点。</span></article>
-        <article><strong>越用越懂你</strong><span>打开推荐、喜欢、不感兴趣、忽略、评论和对话会修正后续推荐；收藏与稍后读只在本机保存。</span></article>
+        <article><strong>看见真正的变化</strong><span>把多来源报道、网页和 PDF 放回同一事件，突出新增事实、证据冲突与被修正的说法。</span></article>
+        <article><strong>持续跟进重要线索</strong><span>信息不会看完就消失；观察点、版本、证据和后续通知会沿着同一事件持续留档。</span></article>
+        <article><strong>沉淀为你的信息资产</strong><span>收藏、事件档案和你确认的个人记忆保存在本机，让后续推荐与分析建立在过去积累上。</span></article>
       </div>
       <section class="about-boundary-card">
-        <p class="settings-section-kicker">Product boundary</p>
-        <h3>这是独立产品，不是换皮入口</h3>
+        <p class="settings-section-kicker">Privacy &amp; control</p>
+        <h3>你的数据，由你控制</h3>
         <ul>
-          <li>新闻爪不是 OpenBiliClaw 的皮肤、插件或官方新闻版，也不依赖它运行。</li>
-          <li>数据库、画像、配置和行为记录保存在本机；启用 AI 后，只把完成任务所需的相关内容交给你配置的模型服务。</li>
-          <li>产品提供信息整理与理解辅助，不给出买卖指令，也不连接券商或自动交易。</li>
+          <li>事件档案、网页版本、收藏、配置和个人记忆默认保存在这台电脑上。</li>
+          <li>需要模型分析时，只发送完成当前任务所需的最小内容；使用哪个模型由你配置。</li>
+          <li>事实、来源和推断分开记录，方便你核验和研究；最终判断由你做出。</li>
         </ul>
       </section>
       <section class="about-license-card">
-        <p class="settings-section-kicker">Technology &amp; licenses</p>
-        <h3>技术来源与许可</h3>
-        <p>部分交互、记忆与工程代码依据 OpenBiliClaw 的开源许可进行适配；它只属于技术来源，不是新闻爪的产品主页、客服、更新渠道或新闻服务。完整著作权与第三方许可随本机项目保存在 <code>LICENSE</code>、<code>NOTICE</code> 与 <code>licenses</code> 中。</p>
+        <p class="settings-section-kicker">Open source</p>
+        <h3>开源致谢</h3>
+        <p>新闻爪的部分工程实现基于开源软件适配与扩展。相关版权与许可证随本机项目保存在 <code>LICENSE</code> 与 <code>NOTICE</code> 中。</p>
       </section>
       <div class="drawer-actions about-actions"><button class="pill-btn primary" data-close="aboutOverlay" type="button">知道了</button></div>
     </div>
