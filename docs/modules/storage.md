@@ -16,6 +16,9 @@
   existing-cache repair 不驱逐任何旧行。维护优先移除低优先级未保护行，并保护 liked、
   已推荐和 token-owned 行；若受保护可展示数高于配置目标，以该保护数作为有效下限。
   raw 行数仍受共享 ceiling 限制。
+- `get_pool_candidates_needing_copy()` 接受可选的来源与发布时间半开区间；NewsClaw runtime
+  只有在来源、开始和结束边界同时存在时才使用该能力。SQL 先做 scope 过滤再排序和 LIMIT，
+  所以旧闻、其它来源、缺失或非法时间以及恰好落在结束边界的行都不会进入当日文案批次。
 
 本模块当前承担六类边界：
 

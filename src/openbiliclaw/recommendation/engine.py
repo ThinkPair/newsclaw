@@ -1724,6 +1724,10 @@ class RecommendationEngine:
         limit: int,
         batch_size: int = _DEFAULT_EXPRESSION_BATCH_SIZE,
         max_extra_requests: int = 6,
+        bypass_inventory_watermark: bool = False,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> int:
         """Generate popup copy for classified-but-uncopied pool candidates.
 
@@ -1740,10 +1744,17 @@ class RecommendationEngine:
             # Re-read canonical ready inventory *inside* the expression lock.
             # This is what prevents two queued drains from both observing the
             # same deficit and overfilling the high watermark.
-            effective_limit = self._expression_copy_drain_limit(limit)
+            effective_limit = (
+                max(0, int(limit))
+                if bypass_inventory_watermark
+                else self._expression_copy_drain_limit(limit)
+            )
             candidates = self._load_pool_candidates_needing_copy(
                 limit=effective_limit,
                 eligible_available_first=self.copy_ready_target_count > 0,
+                source_platform=source_platform,
+                published_after=published_after,
+                published_before=published_before,
             )
             if not candidates:
                 return 0
@@ -1842,6 +1853,41 @@ class RecommendationEngine:
             limit=max(0, min(60, int(limit))),
             batch_size=_DEFAULT_EXPRESSION_BATCH_SIZE,
             max_extra_requests=max(0, int(max_extra_requests)),
+        )
+
+    async def drain_scoped_pending_expression_copy(
+        self,
+        *,
+        profile: SoulProfile,
+        limit: int = 60,
+        source_platform: str,
+        published_after: str,
+        published_before: str,
+        max_extra_requests: int = 6,
+    ) -> int:
+        """Copy a bounded time-sensitive lane even when historical inventory is full.
+
+        NewsClaw must make a newly admitted article servable before replacing an
+        older pool row.  The normal copy watermark intentionally stops work at a
+        full pool, so this explicit, fully scoped path bypasses only that
+        watermark.  Missing scope fails closed; ordinary product callers keep
+        using :meth:`drain_pending_expression_copy` unchanged.
+        """
+
+        platform = str(source_platform or "").strip().lower()
+        after = str(published_after or "").strip()
+        before = str(published_before or "").strip()
+        if not platform or not after or not before:
+            return 0
+        return await self._drain_expression_copy(
+            profile=profile,
+            limit=max(0, min(60, int(limit))),
+            batch_size=_DEFAULT_EXPRESSION_BATCH_SIZE,
+            max_extra_requests=max(0, int(max_extra_requests)),
+            bypass_inventory_watermark=True,
+            source_platform=platform,
+            published_after=after,
+            published_before=before,
         )
 
     def set_copy_pending_callback(self, callback: Callable[[str], None] | None) -> None:
@@ -4027,11 +4073,7 @@ class RecommendationEngine:
                 "media": item.author_name or item.up_name,
                 "provider": item.source_strategy.removeprefix("news-"),
                 "content_scope": next(
-                    (
-                        tag
-                        for tag in item.tags
-                        if tag in {"title_only", "summary", "full_text"}
-                    ),
+                    (tag for tag in item.tags if tag in {"title_only", "summary", "full_text"}),
                     "full_text" if item.body_text else "title_only",
                 ),
             }
@@ -4402,11 +4444,7 @@ class RecommendationEngine:
                 "media": content.author_name or content.up_name,
                 "provider": content.source_strategy.removeprefix("news-"),
                 "content_scope": next(
-                    (
-                        tag
-                        for tag in content.tags
-                        if tag in {"title_only", "summary", "full_text"}
-                    ),
+                    (tag for tag in content.tags if tag in {"title_only", "summary", "full_text"}),
                     "full_text" if content.body_text else "title_only",
                 ),
             },
@@ -5519,11 +5557,25 @@ class RecommendationEngine:
         *,
         limit: int,
         eligible_available_first: bool = False,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[DiscoveredContent]:
+        kwargs: dict[str, object] = {
+            "limit": limit,
+            "xhs_self_nickname": self._xhs_self_nickname(),
+            "eligible_available_first": eligible_available_first,
+        }
+        if source_platform or published_after or published_before:
+            kwargs.update(
+                {
+                    "source_platform": source_platform,
+                    "published_after": published_after,
+                    "published_before": published_before,
+                }
+            )
         rows = self._database.get_pool_candidates_needing_copy(
-            limit=limit,
-            xhs_self_nickname=self._xhs_self_nickname(),
-            eligible_available_first=eligible_available_first,
+            **kwargs,
         )
         return self._rows_to_discovered(rows)
 

@@ -13134,6 +13134,9 @@ class Database:
         *,
         xhs_self_nickname: str = "",
         eligible_available_first: bool = False,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Return fresh pool candidates missing precomputed popup copy.
 
@@ -13156,6 +13159,9 @@ class Database:
             self.conn,
             xhs_self_nickname=xhs_self_nickname,
             _viewed_content_keys=viewed_content_keys,
+            source_platform=source_platform,
+            published_after=published_after,
+            published_before=published_before,
         )
         if not eligible_available_first:
             return pending_rows[:max_rows]

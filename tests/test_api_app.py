@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from openbiliclaw import __version__
 from openbiliclaw.api.app import (
     _RECOMMENDATION_PRIORITY_CANDIDATE_LIMIT,
+    _china_today_window,
     _recommendation_snapshot_rows_and_expiry,
     create_app,
 )
@@ -680,6 +681,342 @@ async def test_copy_ready_target_clamps_and_rebinds_provider_on_rebuild(tmp_path
     assert new_engine.pool_available_target_count == 2
     assert getattr(new_provider, "__self__", None) is new_engine
     assert new_provider() == 2
+
+
+def test_newsclaw_expression_copy_provider_ignores_full_historical_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.api.runtime_context import build_runtime_context
+    from openbiliclaw.config import Config
+    from openbiliclaw.discovery.candidate_pipeline import CandidateEvalScope
+
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    config = Config(data_dir=str(tmp_path / "data"))
+    config.llm.default_provider = "ollama"
+    config.llm.ollama.model = "llama3"
+    config.scheduler.pool_target_count = 1
+    config.scheduler.copy_ready_target_count = 1
+    ctx = build_runtime_context(config)
+    ctx.database.cache_content(
+        "BV_EXISTING_READY",
+        title="existing ready row",
+        source="search",
+        relevance_score=0.9,
+        style_key="tutorial",
+        topic_group="existing-ready",
+        pool_expression="existing expression",
+        pool_topic_label="existing topic",
+    )
+    today, published_after, published_before = _china_today_window()
+    del today
+    current_time = datetime.fromisoformat(published_after.replace("Z", "+00:00")) + timedelta(
+        hours=1
+    )
+    for content_id, published_at in (
+        ("current-copy", current_time.isoformat()),
+        ("old-copy", (current_time - timedelta(days=2)).isoformat()),
+    ):
+        ctx.database.cache_content(
+            f"news:{content_id}",
+            title=content_id,
+            source="news",
+            source_platform="news",
+            content_id=content_id,
+            content_url=f"https://example.com/{content_id}",
+            published_at=published_at,
+            relevance_score=0.9,
+            style_key="news_brief",
+            topic_group="宏观政策",
+        )
+    pipeline = ctx.runtime_controller.candidate_eval_coordinator.pipeline
+    pipeline.eval_scope_provider = lambda: CandidateEvalScope(
+        source_platform="news",
+        published_after=published_after,
+        published_before=published_before,
+    )
+
+    assert ctx.recommendation_engine.count_pending_expression_copy_demand() == 0
+    assert ctx.runtime_controller.expression_copy_coordinator.pending_count_provider() == 1
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_expression_copy_retries_reconciliation_debt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.api.runtime_context import build_runtime_context
+    from openbiliclaw.config import Config
+    from openbiliclaw.discovery.candidate_pipeline import CandidateEvalScope
+
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    config = Config(data_dir=str(tmp_path / "data"))
+    config.llm.default_provider = "ollama"
+    config.llm.ollama.model = "llama3"
+    config.scheduler.pool_target_count = 1
+    config.scheduler.copy_ready_target_count = 1
+    ctx = build_runtime_context(config)
+    ctx.database.cache_content(
+        "news:ready",
+        title="ready",
+        source="news",
+        source_platform="news",
+        content_id="ready",
+        content_url="https://example.com/ready",
+        published_at=datetime.now(UTC).isoformat(),
+        relevance_score=0.9,
+        style_key="news_brief",
+        topic_group="宏观政策",
+        pool_expression="ready expression",
+        pool_topic_label="ready topic",
+    )
+    _today, published_after, published_before = _china_today_window()
+    pipeline = ctx.runtime_controller.candidate_eval_coordinator.pipeline
+    pipeline.eval_scope_provider = lambda: CandidateEvalScope(
+        source_platform="news",
+        published_after=published_after,
+        published_before=published_before,
+    )
+    attempts = 0
+
+    def reconcile(_source_family: str, _limit: int) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("database busy")
+        return 0
+
+    coordinator = ctx.runtime_controller.expression_copy_coordinator
+
+    assert coordinator.pending_count_provider() == 1
+    with pytest.raises(RuntimeError, match="reconciliation is not configured"):
+        await coordinator.drain_callback(1)
+    assert coordinator.pending_count_provider() == 1
+    pipeline.post_admission_maintenance = reconcile
+    with pytest.raises(RuntimeError, match="database busy"):
+        await coordinator.drain_callback(1)
+    assert coordinator.pending_count_provider() == 1
+    assert await coordinator.drain_callback(1) == 0
+    assert coordinator.pending_count_provider() == 0
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_partial_copy_reconciles_before_preserving_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.api.runtime_context import build_runtime_context
+    from openbiliclaw.config import Config
+    from openbiliclaw.discovery.candidate_pipeline import CandidateEvalScope
+
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    config = Config(data_dir=str(tmp_path / "data"))
+    config.llm.default_provider = "ollama"
+    config.llm.ollama.model = "llama3"
+    config.scheduler.pool_target_count = 1
+    config.scheduler.copy_ready_target_count = 1
+    ctx = build_runtime_context(config)
+    ctx.database.cache_content(
+        "news:ready",
+        title="ready",
+        source="news",
+        source_platform="news",
+        content_id="ready",
+        content_url="https://example.com/ready",
+        published_at=datetime.now(UTC).isoformat(),
+        relevance_score=0.9,
+        style_key="news_brief",
+        topic_group="ready-topic",
+        pool_expression="ready expression",
+        pool_topic_label="ready topic",
+    )
+    _today, published_after, published_before = _china_today_window()
+    pipeline = ctx.runtime_controller.candidate_eval_coordinator.pipeline
+    pipeline.eval_scope_provider = lambda: CandidateEvalScope(
+        source_platform="news",
+        published_after=published_after,
+        published_before=published_before,
+    )
+    reconciled: list[tuple[str, int]] = []
+    pipeline.post_admission_maintenance = lambda family, limit: (
+        reconciled.append((family, limit)) or 1
+    )
+    coordinator = ctx.runtime_controller.expression_copy_coordinator
+    assert await coordinator.drain_callback(1) == 0
+    assert reconciled == [("news", 1)]
+    reconciled.clear()
+
+    current_time = datetime.fromisoformat(published_after.replace("Z", "+00:00")) + timedelta(
+        hours=1
+    )
+    ctx.database.cache_content(
+        "news:pending",
+        title="pending",
+        source="news",
+        source_platform="news",
+        content_id="pending",
+        content_url="https://example.com/pending",
+        published_at=current_time.isoformat(),
+        relevance_score=0.9,
+        style_key="news_brief",
+        topic_group="pending-topic",
+    )
+    partial_error = RuntimeError("partial copy failed")
+    partial_error.completed = 1  # type: ignore[attr-defined]
+
+    async def fail_after_partial_copy(**_kwargs: object) -> int:
+        raise partial_error
+
+    monkeypatch.setattr(
+        ctx.recommendation_engine,
+        "drain_scoped_pending_expression_copy",
+        fail_after_partial_copy,
+    )
+
+    async def initialized_profile() -> object:
+        return object()
+
+    monkeypatch.setattr(ctx.soul_engine, "get_profile", initialized_profile)
+
+    with pytest.raises(RuntimeError, match="partial copy failed") as raised:
+        await coordinator.drain_callback(1)
+
+    assert raised.value is partial_error
+    assert reconciled == [("news", 1)]
+
+    reconciled.clear()
+    failed_error = RuntimeError("copy failed before progress")
+    failed_error.completed = 0  # type: ignore[attr-defined]
+
+    async def fail_without_progress(**_kwargs: object) -> int:
+        raise failed_error
+
+    monkeypatch.setattr(
+        ctx.recommendation_engine,
+        "drain_scoped_pending_expression_copy",
+        fail_without_progress,
+    )
+    with pytest.raises(RuntimeError, match="copy failed before progress"):
+        await coordinator.drain_callback(1)
+    assert reconciled == []
+
+    async def cancel_copy(**_kwargs: object) -> int:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        ctx.recommendation_engine,
+        "drain_scoped_pending_expression_copy",
+        cancel_copy,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator.drain_callback(1)
+    assert reconciled == []
+
+    combined_error = RuntimeError("auth failed after copy")
+    combined_error.completed = 1  # type: ignore[attr-defined]
+    combined_error.kind = "auth_failed"  # type: ignore[attr-defined]
+
+    async def persist_then_fail(**_kwargs: object) -> int:
+        ctx.database.update_pool_copy(
+            "news:pending",
+            expression="copied before auth failure",
+            topic_label="pending topic",
+        )
+        raise combined_error
+
+    repair_attempts = 0
+
+    def fail_then_reconcile(_source_family: str, _limit: int) -> int:
+        nonlocal repair_attempts
+        repair_attempts += 1
+        if repair_attempts == 1:
+            raise RuntimeError("reconcile busy")
+        return ctx.database.reconcile_newsclaw_pool_after_admission(
+            target=1,
+            raw_ceiling=2,
+            published_after=published_after,
+            published_before=published_before,
+        )
+
+    pipeline.post_admission_maintenance = fail_then_reconcile
+    monkeypatch.setattr(
+        ctx.recommendation_engine,
+        "drain_scoped_pending_expression_copy",
+        persist_then_fail,
+    )
+    with pytest.raises(RuntimeError, match="reconcile busy") as combined:
+        await coordinator.drain_callback(1)
+    assert combined.value.__cause__ is combined_error
+    assert getattr(combined.value, "completed", 0) == 1
+    assert coordinator.pending_count_provider() == 1
+
+    assert await coordinator.drain_callback(1) == 0
+    assert coordinator.pending_count_provider() == 0
+    assert repair_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_copy_below_target_does_not_run_strict_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.api.runtime_context import build_runtime_context
+    from openbiliclaw.config import Config
+    from openbiliclaw.discovery.candidate_pipeline import CandidateEvalScope
+
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    config = Config(data_dir=str(tmp_path / "data"))
+    config.llm.default_provider = "ollama"
+    config.llm.ollama.model = "llama3"
+    config.scheduler.pool_target_count = 2
+    config.scheduler.copy_ready_target_count = 2
+    ctx = build_runtime_context(config)
+    _today, published_after, published_before = _china_today_window()
+    published_at = datetime.fromisoformat(published_after.replace("Z", "+00:00")) + timedelta(
+        hours=1
+    )
+    for content_id, expression in (("ready", "ready expression"), ("pending", "")):
+        ctx.database.cache_content(
+            f"news:{content_id}",
+            title=content_id,
+            source="news",
+            source_platform="news",
+            content_id=content_id,
+            content_url=f"https://example.com/{content_id}",
+            published_at=published_at.isoformat(),
+            relevance_score=0.9,
+            style_key="news_brief",
+            topic_group=content_id,
+            pool_expression=expression,
+            pool_topic_label=content_id if expression else "",
+        )
+    pipeline = ctx.runtime_controller.candidate_eval_coordinator.pipeline
+    pipeline.eval_scope_provider = lambda: CandidateEvalScope(
+        source_platform="news",
+        published_after=published_after,
+        published_before=published_before,
+    )
+    reconciled: list[tuple[str, int]] = []
+    pipeline.post_admission_maintenance = lambda family, limit: (
+        reconciled.append((family, limit)) or 0
+    )
+
+    async def report_copy_without_persisting(**_kwargs: object) -> int:
+        return 1
+
+    async def initialized_profile() -> object:
+        return object()
+
+    monkeypatch.setattr(
+        ctx.recommendation_engine,
+        "drain_scoped_pending_expression_copy",
+        report_copy_without_persisting,
+    )
+    monkeypatch.setattr(ctx.soul_engine, "get_profile", initialized_profile)
+
+    assert await ctx.runtime_controller.expression_copy_coordinator.drain_callback(1) == 1
+    assert reconciled == []
 
 
 @pytest.mark.asyncio

@@ -184,6 +184,16 @@ cached row never evicts. Liked, already recommended, and token-owned rows are pr
 when protected visible rows exceed the configured target, they define the effective floor.
 An empty or still-processing day remains explicit and older articles are never substituted.
 
+The ordinary expression-copy watermark remains unchanged, but NewsClaw has one explicit
+escape hatch for this full-pool sequence: the coordinator counts and copies only `news` rows
+inside the same Beijing-day half-open window, with a maximum batch of sixty. It may bypass the
+historical inventory watermark only when all three scope fields are present. After a copy makes
+progress, reconciliation runs once the visible pool is at or above target. Runtime keeps a
+small reconciliation debt across coordinator retries (and starts with one repair check after a
+process restart); debt is repaid before any new copy work, never while the pool is below target.
+Missing maintenance, database failure, cancellation, or provider failure cannot silently clear
+that debt. Ordinary product mode continues to use the existing global watermark path.
+
 NewsClaw's desktop home is a decision workbench rather than a dense reading
 wall. The queue carries only priority, topic, title, source, time and evidence
 level; the selected-item pane owns the explanation and actions. Selection is

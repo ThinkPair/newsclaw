@@ -3665,6 +3665,117 @@ async def test_copy_ready_target_fills_only_deficit_and_leaves_deep_backlog() ->
 
 
 @pytest.mark.asyncio
+async def test_newsclaw_scoped_copy_breaks_full_pool_deadlock_without_copying_old_news() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        _seed_visible(
+            db,
+            "BV_EXISTING_READY",
+            title="existing ready row",
+            topic_group="existing-ready",
+        )
+        published_after = "2026-08-29T16:00:00Z"
+        published_before = "2026-08-30T16:00:00Z"
+        current_bvid = "news:current-copy"
+        start_boundary_bvid = "news:start-boundary"
+        old_bvid = "news:old-copy"
+        common = {
+            "source": "news",
+            "source_platform": "news",
+            "style_key": "news_brief",
+            "topic_group": "宏观政策",
+            "relevance_score": 0.9,
+        }
+        db.cache_content(
+            current_bvid,
+            title="today pending copy",
+            content_id="current-copy",
+            content_url="https://example.com/current-copy",
+            published_at="2026-08-30T01:00:00Z",
+            **common,
+        )
+        db.cache_content(
+            old_bvid,
+            title="old pending copy",
+            content_id="old-copy",
+            content_url="https://example.com/old-copy",
+            published_at="2026-08-28T01:00:00Z",
+            **common,
+        )
+        for bvid, published_at in (
+            (start_boundary_bvid, published_after),
+            ("news:end-boundary", published_before),
+            ("news:missing-time", ""),
+            ("news:invalid-time", "not-a-time"),
+        ):
+            db.cache_content(
+                bvid,
+                title=bvid,
+                content_id=bvid.removeprefix("news:"),
+                content_url=f"https://example.com/{bvid}",
+                published_at=published_at,
+                **common,
+            )
+        db.cache_content(
+            "BV_NON_NEWS",
+            title="non-news pending copy",
+            source="search",
+            source_platform="bilibili",
+            content_url="https://www.bilibili.com/video/BV_NON_NEWS",
+            relevance_score=0.9,
+            style_key="tutorial",
+            topic_group="other",
+        )
+        llm = _CopyReadyExpressionLLM()
+        engine = RecommendationEngine(
+            llm=llm,
+            database=db,
+            copy_ready_target_count=1,
+            pool_available_target_count=1,
+        )
+
+        assert engine.count_pending_expression_copy_demand() == 0
+        assert await engine.drain_pending_expression_copy(profile=_build_profile(), limit=60) == 0
+        assert (
+            await engine.drain_scoped_pending_expression_copy(
+                profile=_build_profile(),
+                limit=60,
+                source_platform="news",
+                published_after=published_after,
+                published_before=published_before,
+            )
+            == 2
+        )
+        copied = db.conn.execute(
+            """
+            SELECT bvid, pool_expression
+            FROM content_cache
+            WHERE bvid IN (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                current_bvid,
+                start_boundary_bvid,
+                old_bvid,
+                "news:end-boundary",
+                "news:missing-time",
+                "news:invalid-time",
+                "BV_NON_NEWS",
+            ),
+        ).fetchall()
+        expressions = {str(row["bvid"]): str(row["pool_expression"] or "") for row in copied}
+        assert expressions[current_bvid]
+        assert expressions[start_boundary_bvid]
+        assert expressions[old_bvid] == ""
+        assert expressions["news:end-boundary"] == ""
+        assert expressions["news:missing-time"] == ""
+        assert expressions["news:invalid-time"] == ""
+        assert expressions["BV_NON_NEWS"] == ""
+        assert llm.batch_sizes == [2]
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_copy_ready_target_does_not_drain_backlog_hidden_by_topic_window() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         db = Database(Path(tmpdir) / "test.db")

@@ -1540,31 +1540,175 @@ class RuntimeContext:
 
         from openbiliclaw.runtime.expression_copy import ExpressionCopyCoordinator
 
-        async def _drain_expression_copy(limit: int) -> int:
-            profile = await new_soul_engine.get_profile()
-            if profile is None:
+        # A process restart can happen after copy was persisted but before the
+        # matching full-pool replacement committed.  Keep a tiny in-memory
+        # reconciliation debt so the coordinator performs one safe repair on
+        # startup and retries a failed repair even after the copy queue is
+        # empty.  The debt is surfaced only when the visible pool has reached
+        # its target; strict reconciliation must not run during normal refill.
+        newsclaw_reconciliation_pending = bool(newsclaw_mode)
+
+        def _newsclaw_expression_scope() -> tuple[str, str, str] | None:
+            if not newsclaw_mode:
+                return None
+            scope_provider = getattr(new_candidate_pipeline, "eval_scope_provider", None)
+            if not callable(scope_provider):
+                return None
+            try:
+                scope = scope_provider()
+            except Exception:
+                logger.exception("NewsClaw expression-copy scope failed closed")
+                return None
+            platform = str(getattr(scope, "source_platform", "") or "").strip().lower()
+            published_after = str(getattr(scope, "published_after", "") or "").strip()
+            published_before = str(getattr(scope, "published_before", "") or "").strip()
+            if not platform or not published_after or not published_before:
+                return None
+            return platform, published_after, published_before
+
+        def _pending_expression_copy_demand() -> int:
+            nonlocal newsclaw_reconciliation_pending
+            if not newsclaw_mode:
+                return int(new_recommendation_engine.count_pending_expression_copy_demand())
+            scope = _newsclaw_expression_scope()
+            if scope is None:
                 return 0
-            before = int(_candidate_eval_snapshot().available)
-            completed = await new_recommendation_engine.drain_pending_expression_copy(
-                profile=cast("Any", profile), limit=limit
+            get_pending = getattr(self.database, "get_pool_candidates_needing_copy", None)
+            if not callable(get_pending):
+                return 0
+            platform, published_after, published_before = scope
+            try:
+                rows = get_pending(
+                    limit=60,
+                    source_platform=platform,
+                    published_after=published_after,
+                    published_before=published_before,
+                )
+            except Exception:
+                logger.exception("NewsClaw scoped expression-copy count failed closed")
+                return 0
+            pending = len(rows)
+            if pending > 0:
+                return pending
+            if newsclaw_reconciliation_pending:
+                snapshot = _candidate_eval_snapshot()
+                if snapshot.target > 0 and snapshot.available >= snapshot.target:
+                    return 1
+            return 0
+
+        async def _reconcile_newsclaw_copy_debt(limit: int) -> None:
+            nonlocal newsclaw_reconciliation_pending
+            maintenance = getattr(
+                new_candidate_pipeline,
+                "post_admission_maintenance",
+                None,
             )
+            if not callable(maintenance):
+                newsclaw_reconciliation_pending = True
+                raise RuntimeError("NewsClaw post-copy reconciliation is not configured")
+            try:
+                await asyncio.to_thread(maintenance, "news", max(1, int(limit)))
+            except Exception:
+                newsclaw_reconciliation_pending = True
+                raise
+            newsclaw_reconciliation_pending = False
+
+        async def _drain_expression_copy(limit: int) -> int:
+            nonlocal newsclaw_reconciliation_pending
+            before = int(_candidate_eval_snapshot().available)
             if newsclaw_mode:
-                after_copy = _candidate_eval_snapshot()
-                overflow = max(0, after_copy.available - after_copy.target)
-                maintenance = getattr(
-                    new_candidate_pipeline,
-                    "post_admission_maintenance",
+                scope = _newsclaw_expression_scope()
+                drain_scoped = getattr(
+                    new_recommendation_engine,
+                    "drain_scoped_pending_expression_copy",
                     None,
                 )
-                if overflow > 0 and callable(maintenance):
-                    await asyncio.to_thread(maintenance, "news", overflow)
+                if scope is None or not callable(drain_scoped):
+                    return 0
+                platform, published_after, published_before = scope
+                start_snapshot = _candidate_eval_snapshot()
+                if (
+                    newsclaw_reconciliation_pending
+                    and start_snapshot.target > 0
+                    and start_snapshot.available >= start_snapshot.target
+                ):
+                    # Repair a previous copy/reconcile crash before starting
+                    # more LLM work.  This path does not require a Soul profile
+                    # and therefore cannot be stranded by provider setup.
+                    await _reconcile_newsclaw_copy_debt(1)
+                get_pending = getattr(self.database, "get_pool_candidates_needing_copy", None)
+                if not callable(get_pending):
+                    return 0
+                pending_before = len(
+                    get_pending(
+                        limit=max(1, min(60, int(limit))),
+                        source_platform=platform,
+                        published_after=published_after,
+                        published_before=published_before,
+                    )
+                )
+                completed = 0
+                copy_error: Exception | None = None
+                if pending_before > 0:
+                    profile = await new_soul_engine.get_profile()
+                    if profile is None:
+                        return 0
+                    try:
+                        completed = await drain_scoped(
+                            profile=cast("Any", profile),
+                            limit=limit,
+                            source_platform=platform,
+                            published_after=published_after,
+                            published_before=published_before,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        copy_error = exc
+                        completed = max(0, int(getattr(exc, "completed", 0) or 0))
+                    if completed > 0:
+                        newsclaw_reconciliation_pending = True
+
+                after_copy = _candidate_eval_snapshot()
+                should_reconcile = bool(
+                    after_copy.target > 0
+                    and after_copy.available >= after_copy.target
+                    and completed > 0
+                )
+                if should_reconcile:
+                    try:
+                        await _reconcile_newsclaw_copy_debt(completed)
+                    except Exception as maintenance_error:
+                        if copy_error is not None:
+                            # A database repair failure must remain retryable;
+                            # using it as the primary error prevents an auth
+                            # copy error from pausing the coordinator while
+                            # still retaining that original error as the cause.
+                            with suppress(Exception):
+                                maintenance_error.completed = completed  # type: ignore[attr-defined]
+                            raise maintenance_error from copy_error
+                        raise
+
+                if copy_error is not None:
+                    raise copy_error.with_traceback(copy_error.__traceback__)
+            else:
+                profile = await new_soul_engine.get_profile()
+                if profile is None:
+                    return 0
+                completed = await new_recommendation_engine.drain_pending_expression_copy(
+                    profile=cast("Any", profile), limit=limit
+                )
             await new_runtime_controller._publish_precompute_replenishment_if_needed(  # noqa: SLF001
                 before_pool_count=before
             )
             return int(completed)
 
         expression_coordinator = ExpressionCopyCoordinator(
-            pending_count_provider=new_recommendation_engine.count_pending_expression_copy_demand,
+            pending_count_provider=(
+                _pending_expression_copy_demand
+                if newsclaw_mode
+                else new_recommendation_engine.count_pending_expression_copy_demand
+            ),
             drain_callback=_drain_expression_copy,
             safety_wake_seconds=float(
                 getattr(new_config.scheduler, "refresh_check_interval_seconds", 60)
