@@ -839,6 +839,18 @@
       return new Date(date.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
     }
 
+    function millisecondsUntilNextChinaMidnight(value = Date.now()) {
+      const current = value instanceof Date ? value : new Date(value);
+      if (!Number.isFinite(current.getTime())) return 1000;
+      const china = new Date(current.getTime() + 8 * 60 * 60 * 1000);
+      const nextMidnightUtc = Date.UTC(
+        china.getUTCFullYear(),
+        china.getUTCMonth(),
+        china.getUTCDate() + 1,
+      ) - 8 * 60 * 60 * 1000;
+      return Math.max(1000, nextMidnightUtc - current.getTime() + 250);
+    }
+
     function isTodayNewsDelightItem(item, now = Date.now()) {
       if (!isNewsDelightItem(item)) return false;
       const candidate = item?.data && typeof item.data === "object" ? item.data : item;
@@ -1067,10 +1079,16 @@
     let appendMoreInFlight = false;
     let reshuffleInFlight = false;
     let todayRefreshInFlight = false;
-    let delightQueueRequestGeneration = 0;
+    let todayRefreshAwaitingResults = false;
+    let delightQueueFetchPromise = null;
+    let delightQueueFetchQueued = false;
+    let todayRefreshStatusRevision = 0;
+    let delightRenderRevision = 0;
+    let delightContentApplyTimer = 0;
     let todayQueuePollTimer = 0;
     let todayQueuePollAttempts = 0;
     let todayQueuePollDate = "";
+    let todayMidnightTimer = 0;
     let lastAutoLoadAt = 0;
     let recommendationGridBottomReady = false;
     let recommendationGridScrollIntent = false;
@@ -3289,6 +3307,8 @@
       if (newsclawMode) renderPersonalMemory();
       else renderProfileDetails();
       if (!newsclawMode) {
+        stopTodayMidnightRollover();
+        stopTodayQueueProcessingPoll();
         state.webMonitorNotificationGeneration += 1;
         state.webMonitors.refreshGeneration += 1;
         state.webMonitors.items = null;
@@ -3324,6 +3344,7 @@
         }
       }
       if (newsclawMode && previousMode !== true) {
+        scheduleTodayMidnightRollover();
         void refreshWebMonitors();
         void refreshWebMonitorNotifications();
       }
@@ -12954,7 +12975,11 @@ ${cardFeedbackBarHtml()}`;
     }
 
     function setActiveDelight(index = state.delightIndex) {
+      const renderRevision = ++delightRenderRevision;
+      const todayStatusRevisionAtRender = todayRefreshStatusRevision;
       const controls = Array.from(document.querySelectorAll("[data-delight]"));
+      if (delightContentApplyTimer) window.clearTimeout(delightContentApplyTimer);
+      delightContentApplyTimer = 0;
       const newsOnlyQueue = state.delights.filter(isNewsDelightItem)
         .filter((item) => state.newsclawMode !== true || isTodayNewsDelightItem(item));
       if (newsOnlyQueue.length !== state.delights.length) {
@@ -12963,6 +12988,17 @@ ${cardFeedbackBarHtml()}`;
       }
       if (!state.delights.length) {
         state.delight = null;
+        const staleCopy = $(".delight-copy");
+        const staleThumb = $(".delight .thumb");
+        const staleBanner = $("#delightBanner");
+        if (staleCopy) staleCopy.classList.remove("is-exiting");
+        if (staleThumb) staleThumb.classList.remove("is-exiting");
+        if (staleBanner) {
+          if (staleBanner._heightRaf) cancelAnimationFrame(staleBanner._heightRaf);
+          staleBanner._heightRaf = null;
+          staleBanner.style.removeProperty("height");
+          staleBanner.classList.remove("is-height-locked", "is-height-settling");
+        }
         closeDelightComposer();
         renderDelightCover(null);
         renderDelightTurns(null);
@@ -12992,8 +13028,13 @@ ${cardFeedbackBarHtml()}`;
       const shouldAnimateTransition = Boolean(state.delight);
       state.delightIndex = Math.max(0, Math.min(index, state.delights.length - 1));
       state.delight = state.delights[state.delightIndex];
+      const delightAtRender = state.delight;
       // 锁定容器高度防止下方布局跳变
       const banner = $("#delightBanner");
+      if (banner?._heightRaf) {
+        cancelAnimationFrame(banner._heightRaf);
+        banner._heightRaf = null;
+      }
       if (banner && shouldAnimateTransition) {
         banner.style.height = `${banner.offsetHeight}px`;
         banner.classList.add("is-height-locked");
@@ -13003,29 +13044,57 @@ ${cardFeedbackBarHtml()}`;
       const copy = $(".delight-copy");
       const thumb = $(".delight .thumb");
       const applyContent = () => {
+        if (!delightRenderIsCurrent(
+          renderRevision,
+          delightRenderRevision,
+          delightAtRender,
+          state.delight,
+        )) {
+          if (renderRevision === delightRenderRevision) {
+            if (copy) copy.classList.remove("is-exiting");
+            if (thumb) thumb.classList.remove("is-exiting");
+            if (banner) {
+              banner.style.removeProperty("height");
+              banner.classList.remove("is-height-locked", "is-height-settling");
+            }
+          }
+          return;
+        }
         closeDelightComposer();
-        renderDelightCover(state.delight);
-        renderDelightTurns(state.delight);
-        $("#delightTitle").textContent = state.delight.title;
-        renderDelightDecision(state.delight);
-        syncDelightExcerpt(state.delight);
+        renderDelightCover(delightAtRender);
+        renderDelightTurns(delightAtRender);
+        $("#delightTitle").textContent = delightAtRender.title;
+        renderDelightDecision(delightAtRender);
+        syncDelightExcerpt(delightAtRender);
         const delightStatsEl = $("#delightStats");
         if (delightStatsEl) {
-          const delightStats = recommendationStats(state.delight);
+          const delightStats = recommendationStats(delightAtRender);
           delightStatsEl.textContent = delightStats;
           delightStatsEl.hidden = !delightStats;
         }
         const delightPublishedEl = $("#delightPublished");
         if (delightPublishedEl) {
-          const published = formatPublishedTime(state.delight);
+          const published = formatPublishedTime(delightAtRender);
           delightPublishedEl.textContent = published;
-          delightPublishedEl.title = Number.isFinite(Date.parse(state.delight.published_at))
-            ? new Date(state.delight.published_at).toLocaleString()
+          delightPublishedEl.title = Number.isFinite(Date.parse(delightAtRender.published_at))
+            ? new Date(delightAtRender.published_at).toLocaleString()
             : "";
           delightPublishedEl.hidden = !published;
         }
-        $("#delightReason").textContent = state.delight.reason;
-        if ($("#delightStatus")) $("#delightStatus").textContent = state.delight.response_message || "";
+        $("#delightReason").textContent = delightAtRender.reason;
+        const delightStatus = $("#delightStatus");
+        const queueStatusProtected = shouldPreserveTodayQueueStatus(
+          state.newsclawMode,
+          todayRefreshInFlight,
+          todayRefreshAwaitingResults,
+          state.delightLoadState,
+          todayStatusRevisionAtRender,
+          todayRefreshStatusRevision,
+        );
+        if (delightStatus && !queueStatusProtected) {
+          delightStatus.removeAttribute("role");
+          delightStatus.textContent = delightAtRender.response_message || "";
+        }
         if (copy) copy.classList.remove("is-exiting");
         if (thumb) thumb.classList.remove("is-exiting");
         // 用 requestAnimationFrame 手动驱动高度动画（避免 CSS transition 启动时序问题）
@@ -13069,7 +13138,10 @@ ${cardFeedbackBarHtml()}`;
       if (copy && shouldAnimateTransition) copy.classList.add("is-exiting");
       if (thumb && shouldAnimateTransition) thumb.classList.add("is-exiting");
       if (shouldAnimateTransition && (copy || thumb)) {
-        setTimeout(applyContent, 250);
+        delightContentApplyTimer = window.setTimeout(() => {
+          delightContentApplyTimer = 0;
+          applyContent();
+        }, 250);
       } else {
         applyContent();
       }
@@ -13189,6 +13261,41 @@ ${cardFeedbackBarHtml()}`;
       });
     }
 
+    function todayQueueLoadState(itemCount, backendState) {
+      if (String(backendState || "").trim().toLowerCase() === "processing") return "processing";
+      return Number(itemCount) > 0 ? "ready" : "empty";
+    }
+
+    function shouldPreserveTodayQueueStatus(
+      newsclawMode,
+      refreshInFlight,
+      awaitingResults,
+      loadState,
+      renderRevision,
+      currentRevision,
+    ) {
+      return newsclawMode === true && (
+        refreshInFlight
+        || awaitingResults
+        || loadState === "processing"
+        || loadState === "failed"
+        || renderRevision !== currentRevision
+      );
+    }
+
+    function delightRenderIsCurrent(
+      renderRevision,
+      currentRevision,
+      delightAtRender,
+      currentDelight,
+    ) {
+      return Boolean(
+        delightAtRender
+        && renderRevision === currentRevision
+        && delightAtRender === currentDelight
+      );
+    }
+
     function applyDelights(payload) {
       const hasQueuePayload = Array.isArray(payload?.items) || Boolean(payload?.item);
       if (!hasQueuePayload) return false;
@@ -13202,11 +13309,7 @@ ${cardFeedbackBarHtml()}`;
       const backendState = String(payload?.state || "").trim().toLowerCase();
       state.delightPendingCount = Math.max(0, Number(payload?.pending_count) || 0);
       state.delightLastRefreshAt = String(payload?.last_refresh_at || "");
-      state.delightLoadState = normalized.length
-        ? "ready"
-        : backendState === "processing"
-          ? "processing"
-          : "empty";
+      state.delightLoadState = todayQueueLoadState(normalized.length, backendState);
       state.delightLoadError = "";
       const previousActiveBvid = String(state.delight?.bvid || "");
       const existingByBvid = new Map(state.delights.map((item) => [String(item.bvid || ""), item]));
@@ -13287,8 +13390,7 @@ ${cardFeedbackBarHtml()}`;
       applyRuntimeStatus({ unread_count: getRenderableMessages().length });
     }
 
-    async function fetchDelightQueue() {
-      const requestGeneration = ++delightQueueRequestGeneration;
+    async function fetchDelightQueueOnce() {
       if (state.delightLoadState !== "processing") state.delightLoadState = "loading";
       state.delightLoadError = "";
       if (!state.delights.length) setActiveDelight(0);
@@ -13298,7 +13400,6 @@ ${cardFeedbackBarHtml()}`;
           cache: "no-store",
           headers: { "Cache-Control": "no-cache" },
         });
-        if (requestGeneration !== delightQueueRequestGeneration) return null;
         if (!applyDelights(payload)) throw new Error("今日首选响应格式不完整，请稍后重试。");
         if (state.newsclawMode === true && String(payload?.state || "").toLowerCase() === "processing") {
           scheduleTodayQueueProcessingPoll();
@@ -13307,7 +13408,6 @@ ${cardFeedbackBarHtml()}`;
         }
         return payload;
       } catch (error) {
-        if (requestGeneration !== delightQueueRequestGeneration) return null;
         state.delightLoadState = "failed";
         state.delightLoadError = configErrorMessage(error?.details) || error?.message || "读取今日首选失败，请检查本地后端连接。";
         state.delights = state.delights.filter((item) => (
@@ -13326,14 +13426,38 @@ ${cardFeedbackBarHtml()}`;
       }
     }
 
+    function fetchDelightQueue() {
+      delightQueueFetchQueued = true;
+      if (!delightQueueFetchPromise) {
+        delightQueueFetchPromise = (async () => {
+          let latestPayload = null;
+          try {
+            while (delightQueueFetchQueued) {
+              delightQueueFetchQueued = false;
+              latestPayload = await fetchDelightQueueOnce();
+            }
+            return latestPayload;
+          } finally {
+            delightQueueFetchPromise = null;
+          }
+        })();
+      }
+      return delightQueueFetchPromise;
+    }
+
     function syncTodayRefreshButton() {
       const button = $("#todayRefreshBtn");
       if (!button) return;
-      button.disabled = todayRefreshInFlight;
-      button.classList.toggle("is-loading", todayRefreshInFlight);
-      button.setAttribute("aria-busy", todayRefreshInFlight ? "true" : "false");
-      button.setAttribute("aria-disabled", todayRefreshInFlight ? "true" : "false");
-      const label = todayRefreshInFlight ? "正在刷新今天新闻" : "刷新今天新闻";
+      const busy = todayRefreshInFlight || todayRefreshAwaitingResults;
+      button.disabled = busy;
+      button.classList.toggle("is-loading", busy);
+      button.setAttribute("aria-busy", busy ? "true" : "false");
+      button.setAttribute("aria-disabled", busy ? "true" : "false");
+      const label = todayRefreshInFlight
+        ? "正在刷新今天新闻"
+        : todayRefreshAwaitingResults
+          ? "正在生成今日首选"
+          : "刷新今天新闻";
       button.setAttribute("aria-label", label);
       button.title = label;
     }
@@ -13343,6 +13467,22 @@ ${cardFeedbackBarHtml()}`;
       todayQueuePollTimer = 0;
       todayQueuePollAttempts = 0;
       todayQueuePollDate = "";
+      todayRefreshAwaitingResults = false;
+      syncTodayRefreshButton();
+    }
+
+    function finishTodayQueueProcessingPoll() {
+      if (todayQueuePollTimer) window.clearTimeout(todayQueuePollTimer);
+      todayQueuePollTimer = 0;
+      todayQueuePollAttempts = 0;
+      todayQueuePollDate = "";
+      todayRefreshAwaitingResults = false;
+      syncTodayRefreshButton();
+      const count = state.delights.filter(isTodayNewsDelightItem).length;
+      const message = count
+        ? `今天已有 ${count} 条首选；后台仍在分析，已停止自动等待，可稍后检查进度。`
+        : "后台仍在分析，已停止自动等待；可稍后点击刷新检查进度。";
+      setTodayRefreshStatus(message);
     }
 
     function scheduleTodayQueueProcessingPoll({ reset = false } = {}) {
@@ -13353,7 +13493,19 @@ ${cardFeedbackBarHtml()}`;
         todayQueuePollAttempts = 0;
         todayQueuePollDate = currentDate;
       }
-      if (todayQueuePollTimer || todayQueuePollAttempts >= 40) return;
+      todayRefreshAwaitingResults = true;
+      syncTodayRefreshButton();
+      if (!todayRefreshInFlight) {
+        const count = state.delights.filter(isTodayNewsDelightItem).length;
+        setTodayRefreshStatus(count
+          ? `今天已有 ${count} 条首选，后台仍在继续分析；完成后会自动更新。`
+          : "今天的新材料正在分析；不会用旧闻补位。");
+      }
+      if (todayQueuePollTimer) return;
+      if (todayQueuePollAttempts >= 40) {
+        finishTodayQueueProcessingPoll();
+        return;
+      }
       todayQueuePollTimer = window.setTimeout(async () => {
         todayQueuePollTimer = 0;
         todayQueuePollAttempts += 1;
@@ -13364,18 +13516,43 @@ ${cardFeedbackBarHtml()}`;
       }, 15000);
     }
 
+    function stopTodayMidnightRollover() {
+      if (todayMidnightTimer) window.clearTimeout(todayMidnightTimer);
+      todayMidnightTimer = 0;
+    }
+
+    function scheduleTodayMidnightRollover() {
+      stopTodayMidnightRollover();
+      if (state.newsclawMode !== true) return;
+      todayMidnightTimer = window.setTimeout(async () => {
+        todayMidnightTimer = 0;
+        stopTodayQueueProcessingPoll();
+        state.delights = [];
+        state.delight = null;
+        state.delightIndex = 0;
+        state.delightLoadState = "loading";
+        setActiveDelight(0);
+        await fetchDelightQueue();
+        scheduleTodayMidnightRollover();
+      }, millisecondsUntilNextChinaMidnight());
+    }
+
     function setTodayRefreshStatus(message, { error = false } = {}) {
       const status = $("#delightStatus");
       if (!status) return;
+      todayRefreshStatusRevision += 1;
       status.setAttribute("role", error ? "alert" : "status");
       status.textContent = String(message || "");
     }
 
     async function refreshTodaySelection() {
-      if (todayRefreshInFlight) {
-        showToast("今天新闻正在刷新，请稍候。");
+      if (todayRefreshInFlight || todayRefreshAwaitingResults) {
+        showToast(todayRefreshAwaitingResults
+          ? "今天的首选仍在生成，完成后会自动更新。"
+          : "今天新闻正在刷新，请稍候。");
         return;
       }
+      scheduleTodayMidnightRollover();
       todayRefreshInFlight = true;
       syncTodayRefreshButton();
       stopTodayQueueProcessingPoll();
@@ -13401,6 +13578,9 @@ ${cardFeedbackBarHtml()}`;
           if (error?.status === 409) sourceAlreadyRunning = true;
           else sourceIssue = error;
         }
+        if (!sourceIssue && String(sourceResult?.status || "").toLowerCase() === "offline") {
+          sourceIssue = new Error("所有新闻源当前都不可用，请检查来源设置或网络连接。");
+        }
 
         if (sourceAlreadyRunning) {
           setTodayRefreshStatus("后台已有刷新在进行，正在等待今天的首选生成…");
@@ -13418,23 +13598,31 @@ ${cardFeedbackBarHtml()}`;
           throw sourceIssue || new Error("读取今日首选失败，请检查本地后端连接。");
         }
         const count = state.delights.length;
-        if (count) {
-          const message = `已更新：今天有 ${count} 条首选。`;
-          setTodayRefreshStatus(message);
+        const backendProcessing = String(payload.state || "").toLowerCase() === "processing";
+        if (sourceIssue) {
+          const message = sourceIssue?.name === "TimeoutError"
+            ? `抓取结果仍未知，后台可能继续运行；${count ? `当前保留今天已有的 ${count} 条首选。` : "今天暂时没有可展示的首选。"}`
+            : `抓取失败：${sourceIssue?.message || "请稍后重试"}${count ? `；当前保留今天已有的 ${count} 条首选。` : ""}`;
+          setTodayRefreshStatus(message, { error: true });
           showToast(message);
-          stopTodayQueueProcessingPoll();
-        } else if (String(payload.state || "").toLowerCase() === "processing") {
+          if (backendProcessing) scheduleTodayQueueProcessingPoll({ reset: true });
+          else stopTodayQueueProcessingPoll();
+        } else if (backendProcessing) {
           const pending = Math.max(0, Number(payload.pending_count) || 0);
-          const message = `抓取已完成，正在分析${pending ? ` ${pending} 条候选` : "今天的新材料"}；不会用旧闻补位。`;
+          const message = count
+            ? `今天已有 ${count} 条首选，正在继续分析${pending ? ` ${pending} 条新候选` : "今天的新材料"}；完成后会自动更新。`
+            : `抓取已完成，正在分析${pending ? ` ${pending} 条候选` : "今天的新材料"}；不会用旧闻补位。`;
           setTodayRefreshStatus(message);
           showToast("今天新闻已抓取，正在生成首选");
           scheduleTodayQueueProcessingPoll({ reset: true });
-        } else if (sourceIssue) {
-          const message = sourceIssue?.name === "TimeoutError"
-            ? "刷新结果仍未知，后台可能继续运行；今天暂时还没有可展示的首选。"
-            : `刷新失败：${sourceIssue?.message || "请稍后重试"}`;
-          setTodayRefreshStatus(message, { error: true });
+        } else if (count) {
+          const articleCount = Math.max(0, Number(sourceResult?.article_count) || 0);
+          const message = articleCount
+            ? `已更新：今天有 ${count} 条首选。`
+            : `本轮没有抓到新文章，今天现有 ${count} 条首选保持不变。`;
+          setTodayRefreshStatus(message);
           showToast(message);
+          stopTodayQueueProcessingPoll();
         } else {
           const message = "已刷新：今天暂时没有达到首选门槛的新内容。";
           setTodayRefreshStatus(message);
@@ -13480,6 +13668,9 @@ ${cardFeedbackBarHtml()}`;
       if (SOURCE_STATUS_REFRESH_EVENTS.has(event.type)) void renderSourcesStatus();
       // 库存变化事件只刷新 Tab 数字 / 空态 / 自动续页 gate，不碰已加载的推荐卡片。
       if (event.type === "refresh.pool_updated" || event.type === "pool_status") schedulePlatformAvailabilityRefresh();
+      if (event.type === "refresh.pool_updated" && state.newsclawMode === true) {
+        scheduleDelightQueueRefresh();
+      }
       if (event.type === "degraded") {
         presentDegradedConfigRecovery({
           degraded: true,
@@ -13536,7 +13727,7 @@ ${cardFeedbackBarHtml()}`;
       if (event.type === "delight.candidate" && event.bvid) {
         const delight = normalizeDelight(event);
         if (delight && (state.newsclawMode !== true || isTodayNewsDelightItem(delight))) {
-          state.delightLoadState = "ready";
+          if (state.delightLoadState !== "processing") state.delightLoadState = "ready";
           state.delightLoadError = "";
           const key = String(delight.bvid || "");
           const existingIndex = state.delights.findIndex((item) => String(item.bvid || "") === key);

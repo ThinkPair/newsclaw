@@ -8688,6 +8688,8 @@ class Database:
         conn: sqlite3.Connection,
         *,
         source_platform: str | None = None,
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Return non-terminal discovery rows that still count as supply.
 
@@ -8697,11 +8699,28 @@ class Database:
         influence readiness, raw ceilings, or source-share rebalancing.
         """
 
-        source = str(source_platform or "").strip()
-        source_clause = " AND source_platform = ?" if source else ""
+        source = str(source_platform or "").strip().lower()
+        scope_clauses: list[str] = []
+        scope_params: list[str] = []
+        if source:
+            scope_clauses.append(
+                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
+            )
+            scope_params.append(source)
+        if published_after:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
+            )
+            scope_params.append(published_after)
+        if published_before:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
+            )
+            scope_params.append(published_before)
+        scope_sql = "\n              ".join(scope_clauses)
         cursor = conn.execute(
             f"""
-            SELECT id, status, source_platform, source_strategy,
+            SELECT id, candidate_key, status, source_platform, source_strategy,
                    relevance_score, last_seen_at, claim_token, eval_error,
                    published_at, temporal_class, temporal_confidence,
                    temporal_policy_version, temporal_validity_mode,
@@ -8716,9 +8735,9 @@ class Database:
                     OR COALESCE(temporal_review_retry_at, '') = ''
                     OR julianday(temporal_review_retry_at) <= julianday('now')
               )
-            {source_clause}
+              {scope_sql}
             """,
-            (source,) if source else (),
+            tuple(scope_params),
         )
         temporal_now = datetime.now(UTC)
         rows: list[dict[str, Any]] = []
@@ -10047,6 +10066,9 @@ class Database:
         xhs_self_nickname: str = "",
         limit: int | None = None,
         _viewed_content_keys: set[str] | None = None,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Load admitted, classified rows whose recommendation copy is incomplete."""
 
@@ -10057,6 +10079,25 @@ class Database:
             conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
         )
         delight_guard_sql = _delight_claim_guard_sql()
+        scope_clauses: list[str] = []
+        scope_params: list[str] = []
+        platform = str(source_platform or "").strip().lower()
+        if platform:
+            scope_clauses.append(
+                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
+            )
+            scope_params.append(platform)
+        if published_after:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
+            )
+            scope_params.append(published_after)
+        if published_before:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
+            )
+            scope_params.append(published_before)
+        scope_sql = "\n              ".join(scope_clauses)
         max_rows = None if limit is None else max(0, int(limit))
         if max_rows == 0:
             return []
@@ -10079,6 +10120,7 @@ class Database:
               )
               {guard_sql}
               {delight_guard_sql}
+              {scope_sql}
               AND NOT EXISTS (
                 SELECT 1
                 FROM recommendations AS r
@@ -10091,7 +10133,7 @@ class Database:
                 view_count DESC,
                 bvid ASC
             """,
-            (*admission_params, *guard_params, delight_threshold),
+            (*admission_params, *guard_params, delight_threshold, *scope_params),
         )
         viewed_content_keys = (
             self._recent_viewed_content_keys_on(conn)
@@ -29240,6 +29282,76 @@ class Database:
         ]
         return rows[: max(1, int(limit))]
 
+    def get_delight_processing_candidate_keys(
+        self,
+        *,
+        published_after: str,
+        published_before: str,
+        source_platform: str = "news",
+        min_delight_score_for_reason: float = _DELIGHT_CLAIM_MIN_SCORE,
+    ) -> set[str]:
+        """Return canonical keys still moving through the real delight pipeline.
+
+        Each stage reuses the same eligibility query as its worker.  Using a
+        key union prevents a row crossing from discovery into ``content_cache``
+        during this read from being counted twice.
+        """
+
+        self._ensure_fresh_read()
+        platform = str(source_platform or "").strip().lower()
+        if not platform or not published_after or not published_before:
+            return set()
+        discovery_rows = self._load_temporally_eligible_admission_waiting_rows_on(
+            self.conn,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        copy_rows = self._load_admitted_pending_copy_rows_on(
+            self.conn,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+            limit=None,
+        )
+        scoring_rows = self.get_pool_candidates_needing_delight_score(
+            limit=None,
+            min_delight_score_for_reason=min_delight_score_for_reason,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        keys = {
+            str(row.get("candidate_key") or "").strip()
+            for row in discovery_rows
+            if str(row.get("candidate_key") or "").strip()
+        }
+        keys.update(
+            str(row.get("item_key") or "").strip()
+            for row in (*copy_rows, *scoring_rows)
+            if str(row.get("item_key") or "").strip()
+        )
+        return keys
+
+    def count_delight_processing_candidates(
+        self,
+        *,
+        published_after: str,
+        published_before: str,
+        source_platform: str = "news",
+        min_delight_score_for_reason: float = _DELIGHT_CLAIM_MIN_SCORE,
+    ) -> int:
+        """Count source/date-scoped rows still active in the delight pipeline."""
+
+        return len(
+            self.get_delight_processing_candidate_keys(
+                published_after=published_after,
+                published_before=published_before,
+                source_platform=source_platform,
+                min_delight_score_for_reason=min_delight_score_for_reason,
+            )
+        )
+
     def mark_delight_notified(self, bvid: str) -> None:
         """Mark one content item as delight-notified."""
         self._execute_write(
@@ -29369,11 +29481,14 @@ class Database:
 
     def get_pool_candidates_needing_delight_score(
         self,
-        limit: int = 30,
+        limit: int | None = 30,
         *,
         min_delight_score_for_reason: float | None = None,
         min_relevance_score: float = 0.55,
         xhs_self_nickname: str = "",
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Return copy-ready pool candidates that still need delight synchronization.
 
@@ -29391,11 +29506,30 @@ class Database:
         entirely — they're not going to delight anyone they don't
         already half-fit.
         """
-        max_rows = max(0, int(limit))
+        max_rows = None if limit is None else max(0, int(limit))
         if max_rows == 0:
             return []
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
+        scope_clauses: list[str] = []
+        scope_params: list[str] = []
+        platform = str(source_platform or "").strip().lower()
+        if platform:
+            scope_clauses.append(
+                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
+            )
+            scope_params.append(platform)
+        if published_after:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
+            )
+            scope_params.append(published_after)
+        if published_before:
+            scope_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
+            )
+            scope_params.append(published_before)
+        scope_sql = "\n                  ".join(scope_clauses)
         effective_min_relevance_score = _normalize_admission_min_score(min_relevance_score)
         if min_delight_score_for_reason is None:
             cursor = self.conn.execute(
@@ -29409,11 +29543,13 @@ class Database:
                   {_delight_ready_copy_sql()}
                   {guard_sql}
                   {_delight_unseen_guard_sql()}
+                  {scope_sql}
                 ORDER BY relevance_score DESC, discovered_at DESC
                 """,
                 (
                     effective_min_relevance_score,
                     *guard_params,
+                    *scope_params,
                 ),
             )
         else:
@@ -29451,6 +29587,7 @@ class Database:
                   )
                   {guard_sql}
                   {_delight_unseen_guard_sql()}
+                  {scope_sql}
                 ORDER BY
                     relevance_score DESC,
                     delight_score DESC,
@@ -29462,6 +29599,7 @@ class Database:
                     min_delight_score_for_reason,
                     min_delight_score_for_reason,
                     *guard_params,
+                    *scope_params,
                 ),
             )
         temporal_now = datetime.now(UTC)
@@ -29470,7 +29608,7 @@ class Database:
             for row in cursor.fetchall()
             if self._temporal_eligibility_for_row(dict(row), now=temporal_now)
         ]
-        return rows[:max_rows]
+        return rows if max_rows is None else rows[:max_rows]
 
     @staticmethod
     def _decode_event_metadata(row: dict[str, Any]) -> dict[str, Any]:

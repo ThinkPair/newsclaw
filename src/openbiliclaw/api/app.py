@@ -1914,9 +1914,10 @@ def _china_today_window(now: datetime | None = None) -> tuple[str, str, str]:
     start_utc = datetime.combine(china_now.date(), datetime.min.time(), tzinfo=UTC) - timedelta(
         hours=8
     )
+    next_midnight_utc = start_utc + timedelta(days=1)
     # A small clock-skew allowance is useful for publisher feeds, but a
     # clearly future-dated row must never be presented as today's news.
-    before_utc = current + timedelta(minutes=5)
+    before_utc = min(current + timedelta(minutes=5), next_midnight_utc)
     return (
         china_now.date().isoformat(),
         start_utc.isoformat().replace("+00:00", "Z"),
@@ -10345,7 +10346,6 @@ def create_app(
             with suppress(Exception):
                 threshold = float(dynamic_threshold())
         response_limit = max(1, min(100, int(requested_limit)))
-        response.headers["Cache-Control"] = "no-store"
         request_now = datetime.now(UTC)
         today_date, published_after, published_before = _china_today_window(request_now)
         get_candidates = ctx.database.get_delight_candidates
@@ -10355,6 +10355,7 @@ def create_app(
             "include_liked": True,
         }
         if newsclaw_mode:
+            response.headers["Cache-Control"] = "no-store"
             with suppress(TypeError, ValueError):
                 parameters = inspect.signature(get_candidates).parameters
                 if "published_after" in parameters:
@@ -10433,18 +10434,47 @@ def create_app(
             return {"items": items}
 
         pending_count = 0
-        get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
-        if callable(get_runtime_status):
-            with suppress(Exception):
-                runtime_status = await asyncio.to_thread(get_runtime_status)
+        processing_active = False
+        scoped_count_succeeded = False
+        count_processing = getattr(ctx.database, "count_delight_processing_candidates", None)
+        if callable(count_processing):
+            try:
                 pending_count = max(
                     0,
                     int(
-                        runtime_status.get("candidate_eval_pending", 0)
-                        if isinstance(runtime_status, Mapping)
-                        else 0
+                        await asyncio.to_thread(
+                            count_processing,
+                            published_after=published_after,
+                            published_before=published_before,
+                            source_platform="news",
+                            min_delight_score_for_reason=threshold,
+                        )
                     ),
                 )
+                processing_active = pending_count > 0
+                scoped_count_succeeded = True
+            except Exception:
+                logger.debug("Failed to count NewsClaw's scoped delight pipeline", exc_info=True)
+        if not scoped_count_succeeded:
+            # Compatibility fallback for adapters that do not expose the
+            # source/date-scoped counter. Include every live stage so a
+            # claimed batch cannot briefly look empty while the LLM is busy.
+            get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
+            if callable(get_runtime_status):
+                with suppress(Exception):
+                    runtime_status = await asyncio.to_thread(get_runtime_status)
+                    if isinstance(runtime_status, Mapping):
+                        processing_counts = [
+                            max(0, int(runtime_status.get(field, 0) or 0))
+                            for field in (
+                                "candidate_eval_pending",
+                                "candidate_eval_in_flight",
+                                "expression_pending_count",
+                                "pool_evaluated_pending_count",
+                            )
+                        ]
+                        pending_count = max(processing_counts, default=0)
+                        processing_active = any(processing_counts)
         refresh_running = False
         last_refresh_at = ""
         news_runtime = getattr(app.state, "newsclaw_runtime", None)
@@ -10456,10 +10486,10 @@ def create_app(
                     refresh_running = bool(news_state.get("refresh_running", False))
                     last_refresh_at = str(news_state.get("last_refresh", "") or "")
         queue_state = (
-            "ready"
+            "processing"
+            if refresh_running or processing_active
+            else "ready"
             if items
-            else "processing"
-            if refresh_running or pending_count
             else "empty"
         )
         return {
