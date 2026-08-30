@@ -294,7 +294,7 @@ export function normalizeSourcePlatform(item) {
   const explicit = explicitRaw.toLowerCase();
   if (explicit && SOURCE_ALIAS_MAP[explicit]) return SOURCE_ALIAS_MAP[explicit];
   if (explicitRaw) return explicitRaw;
-  const url = normalizeText(item?.content_url || item?.canonical_url);
+  const url = normalizeText(item?.original_url || item?.content_url || item?.canonical_url);
   if (url) {
     const lowerUrl = url.toLowerCase();
     if (lowerUrl.includes("bilibili.com") || lowerUrl.includes("b23.tv")) return "bilibili";
@@ -326,7 +326,7 @@ export function normalizeSavedIdentity(item = {}) {
     item_key: normalizeText(item?.item_key) || (contentId ? `${sourcePlatform}:${contentId}` : ""),
     source_platform: sourcePlatform,
     content_id: contentId,
-    content_url: normalizeText(item?.content_url || item?.canonical_url || item?.url),
+    content_url: normalizeText(item?.original_url || item?.content_url || item?.canonical_url || item?.url),
     content_type: normalizeText(item?.content_type) || "article",
   };
 }
@@ -386,8 +386,23 @@ export function buildTwitterUrl(statusId) {
   return `https://x.com/i/status/${normalizeText(statusId)}`;
 }
 
+export function normalizeHttpContentUrl(value) {
+  const text = normalizeText(value);
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+    return text;
+  } catch {
+    return "";
+  }
+}
+
 export function buildContentUrl(item) {
-  if (item?.content_url || item?.canonical_url) return item.content_url || item.canonical_url;
+  for (const candidate of [item?.original_url, item?.content_url, item?.canonical_url]) {
+    const exactUrl = normalizeHttpContentUrl(candidate);
+    if (exactUrl) return exactUrl;
+  }
   const platform = normalizeSourcePlatform(item);
   const vid = normalizeText(item?.content_id || item?.bvid);
   if (!vid) return "";
@@ -410,13 +425,40 @@ export function buildContentUrl(item) {
   return buildVideoUrl(vid);
 }
 
+export function getRecommendationSourceLink(item) {
+  const exactUrl = buildContentUrl(item);
+  if (exactUrl) {
+    return {
+      state: "exact",
+      url: exactUrl,
+      label: "阅读原文",
+      statusLabel: "原文可核验",
+    };
+  }
+  const lookupUrl = normalizeHttpContentUrl(item?.source_lookup_url);
+  if (normalizeText(item?.source_link_status).toLowerCase() === "search" && lookupUrl) {
+    return {
+      state: "search",
+      url: lookupUrl,
+      label: "检索来源",
+      statusLabel: "来源未提供直链",
+    };
+  }
+  return {
+    state: "missing",
+    url: "",
+    label: "暂无原文",
+    statusLabel: "链接信息缺失",
+  };
+}
+
 export function buildRecommendationClickPayload(item, contentUrl = "") {
   const bvid = normalizeText(item?.bvid || item?.content_id || item?.article_id);
   const contentId = normalizeText(item?.content_id || item?.article_id || item?.bvid);
   return {
     bvid,
     content_id: contentId,
-    content_url: normalizeText(contentUrl) || normalizeText(item?.content_url || item?.canonical_url),
+    content_url: normalizeHttpContentUrl(contentUrl) || buildContentUrl(item),
     source_platform: normalizeSourcePlatform(item),
     title: normalizeText(item?.title),
     recommendation_id: typeof item?.id === "number" ? item.id : null,
@@ -435,7 +477,7 @@ export function normalizeRecommendation(item) {
   return {
     id: Number(item?.id ?? 0),
     bvid,
-    title: normalizeText(item?.title) || DEFAULT_TITLE,
+    title: normalizeText(item?.display_title || item?.title) || DEFAULT_TITLE,
     up_name: normalizeText(item?.up_name || item?.author_name || item?.reporter || item?.media)
       || DEFAULT_CREATOR_NAME,
     cover_url: normalizeCoverUrl(item?.cover_url),
@@ -445,8 +487,11 @@ export function normalizeRecommendation(item) {
     item_key: normalizeText(item?.item_key),
     article_id: contentId,
     content_id: contentId,
-    canonical_url: normalizeText(item?.canonical_url || item?.content_url) || "",
-    content_url: normalizeText(item?.content_url || item?.canonical_url) || "",
+    original_url: normalizeText(item?.original_url),
+    canonical_url: normalizeText(item?.original_url || item?.canonical_url || item?.content_url) || "",
+    content_url: normalizeText(item?.original_url || item?.content_url || item?.canonical_url) || "",
+    source_link_status: normalizeText(item?.source_link_status),
+    source_lookup_url: normalizeText(item?.source_lookup_url),
     media: normalizeText(item?.media || item?.source_platform || item?.source_name),
     source_platform: sourcePlatform,
     content_type: normalizeText(item?.content_type) || "article",
@@ -467,7 +512,7 @@ export function normalizeRecommendation(item) {
     impact_chain: normalizeText(item?.impact_chain),
     observation_points: Array.isArray(item?.observation_points)
       ? item.observation_points.map(normalizeText).filter(Boolean)
-      : [],
+      : [normalizeText(item?.observation_points)].filter(Boolean),
     published_label: String(item?.published_label ?? "").replace(/\s+/g, " ").trim().slice(0, 64),
     view_count: Number(item?.view_count ?? 0),
     like_count: Number(item?.like_count ?? 0),
@@ -786,12 +831,15 @@ export function normalizeDelightCandidate(item) {
     bvid: normalizeText(item?.bvid),
     item_key: normalizeText(item?.item_key),
     content_id: normalizeText(item?.content_id),
-    title: normalizeText(item?.title) || DEFAULT_DELIGHT_TITLE,
+    title: normalizeText(item?.display_title || item?.title) || DEFAULT_DELIGHT_TITLE,
     delight_reason: normalizeText(item?.delight_reason) || DEFAULT_DELIGHT_REASON,
     delight_score: Number(item?.delight_score ?? 0),
     delight_hook: normalizeText(item?.delight_hook),
     cover_url: normalizeCoverUrl(item?.cover_url),
-    content_url: normalizeText(item?.content_url),
+    original_url: normalizeText(item?.original_url),
+    content_url: normalizeText(item?.original_url || item?.content_url || item?.canonical_url),
+    source_link_status: normalizeText(item?.source_link_status),
+    source_lookup_url: normalizeText(item?.source_lookup_url),
     source_platform: normalizeSourcePlatform(item),
     published_at: normalizeText(item?.published_at),
     published_label: String(item?.published_label ?? "").replace(/\s+/g, " ").trim().slice(0, 64),

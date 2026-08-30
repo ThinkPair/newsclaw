@@ -7,17 +7,22 @@ INDEX_HTML = Path("src/openbiliclaw/web/desktop/index.html")
 SAVED_SYNC_CORE = Path("src/openbiliclaw/web/desktop/assets/js/saved-sync-core.js")
 
 
-def test_main_recommendation_detail_owns_the_only_original_link() -> None:
+def test_main_recommendation_detail_distinguishes_exact_and_search_links() -> None:
     app_js = APP_JS.read_text(encoding="utf-8")
 
     # The compact queue is a selector, not a wall of miniature detail cards.
-    # Safe navigation lives in the selected-item pane; a missing URL is an
-    # honestly disabled label rather than a clickable cover.
+    # Safe navigation lives in the selected-item pane. Provider URLs and
+    # title-search fallbacks are different controls and the latter is never
+    # presented as an already verified original.
     assert '<div class="cover${recommendationCoverClass(item)}"' in app_js
     assert 'class="video-title queue-card-select"' in app_js
-    assert '<a class="small-btn primary" data-detail-open-original' in app_js
-    assert 'href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"' in app_js
-    assert '<span class="small-btn is-disabled" aria-disabled="true">暂无原文链接</span>' in app_js
+    assert "data-detail-open-original" in app_js
+    assert "data-detail-search-source" in app_js
+    assert 'rel="noopener noreferrer"' in app_js
+    assert 'statusLabel: "来源未提供直链"' in app_js
+    assert 'label: "检索来源"' in app_js
+    assert 'label: "暂无原文"' in app_js
+    assert "搜索结果不是新闻爪认定的原文" in app_js
 
 
 def test_detail_original_link_tracks_click_and_auxclick_without_window_open() -> None:
@@ -44,6 +49,31 @@ def test_detail_original_link_tracks_click_and_auxclick_without_window_open() ->
         r"if \(event\.button === 1\) recordOriginalOpen\(\);",
         app_js,
     )
+    assert 'sourceSearchLink?.addEventListener("click", recordSourceSearch);' in app_js
+    search_start = app_js.index("const recordSourceSearch = () => {")
+    search_end = app_js.index(
+        'sourceSearchLink?.addEventListener("click", recordSourceSearch);',
+        search_start,
+    )
+    search_handler = app_js[search_start:search_end]
+    assert "本次检索不记为阅读或原文点击" in search_handler
+    assert "trackRecommendationClick" not in search_handler
+
+
+def test_recommendation_title_and_body_remove_provider_prefix_duplication() -> None:
+    app_js = APP_JS.read_text(encoding="utf-8")
+
+    assert "BRACKETED_NEWS_TITLE_RE" in app_js
+    assert "function recommendationBodyForDisplay(item)" in app_js
+    assert "compactBody.startsWith(candidate)" in app_js
+    assert "查看正文（已去除重复标题）" in app_js
+    assert "来源正文与标题完全相同，没有更多内容可展开" in app_js
+
+
+def test_saved_item_normalization_accepts_newsclaw_original_url_alias() -> None:
+    core = SAVED_SYNC_CORE.read_text(encoding="utf-8")
+
+    assert "item.original_url || item.content_url || item.canonical_url || item.url" in core
 
 
 def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
@@ -55,11 +85,26 @@ def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
         '"${escapeHtml(item.source_platform || item.platform || "news")}"'
     )
     assert saved_anchor in app_js
-    assert 'data-notification-msg="view" href="${escapeHtml(msg.content_url)}"' in app_js
+    assert 'data-notification-msg="view" data-source-link-state="exact"' in app_js
+    assert 'data-notification-msg="search" data-source-link-state="search"' in app_js
+    assert 'data-notification-msg="missing" data-source-link-state="missing"' in app_js
     assert "function ensureDelightThumbAnchor()" in app_js
     assert 'document.createElement("a")' in app_js
     assert "function delightContentUrl(delight)" in app_js
     assert 'window.open(msg.content_url, "_blank", "noopener,noreferrer")' not in app_js
+
+
+def test_pending_notification_ack_is_strict_and_updates_the_open_snapshot() -> None:
+    app_js = APP_JS.read_text(encoding="utf-8")
+    start = app_js.index("async function respondNotification")
+    end = app_js.index("async function refreshWebMonitorNotifications", start)
+    responder = app_js[start:end]
+
+    assert "await requestJsonStrict(ENDPOINTS.notificationSent" in responder
+    assert "await requestJson(ENDPOINTS.notificationSent" not in responder
+    assert "state.messageListSnapshot = state.messageListSnapshot.filter" in responder
+    assert "catch (error)" in responder
+    assert "标记通知失败" in responder
 
 
 def test_delight_view_button_actually_opens_the_content() -> None:
@@ -73,26 +118,29 @@ def test_delight_view_button_actually_opens_the_content() -> None:
 
     # respondDelight takes an openUrl flag and opens in the view branch.
     assert "async function respondDelight(delight, response, el = null, openUrl = false)" in app_js
+    respond_start = app_js.index("async function respondDelight")
+    respond_end = app_js.index("function openMessageChat", respond_start)
+    respond_source = app_js[respond_start:respond_end]
     view_match = re.search(
         r'if \(response === "view"\) \{(?P<body>.*?)\n        return;\n      \}',
-        app_js,
+        respond_source,
         flags=re.S,
     )
     assert view_match is not None, "delight view branch not found"
     view_body = view_match.group("body")
-    assert "if (!url) {" in view_body
-    assert 'if (openUrl) window.open(url, "_blank", "noopener,noreferrer");' in view_body
+    assert 'if (sourceLink.state === "search") {' in view_body
+    assert 'if (sourceLink.state !== "exact" || !sourceLink.url) {' in view_body
+    assert 'window.open(url, "_blank", "noopener,noreferrer")' in view_body
+    assert "if (opened) opened.opener = null;" in view_body
 
     # The 去看看 button ([data-delight] handler) passes openUrl=true for view.
     assert 'await respondDelight(state.delight, response, null, response === "view");' in app_js
 
-    # The cover thumbnail triggers must NOT pass openUrl (they navigate via the
-    # native <a href>), so there's no double-open.
+    # The cover thumbnail triggers only exact links and do not pass openUrl
+    # (they navigate via the native <a href>), so there's no double-open.
     assert 'void respondDelight(state.delight, "view");' in app_js
-    guarded_thumb_click = (
-        "if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();"
-    )
-    assert guarded_thumb_click in app_js
+    assert 'if (delightFeedbackInFlight || sourceLink.state !== "exact") {' in app_js
+    assert "event.preventDefault();\n        return;" in app_js
 
 
 def test_delight_close_button_is_labeled_as_permanent_seen_action() -> None:

@@ -555,7 +555,7 @@ export function normalizeSavedItemInput(item = {}) {
   return {
     source_platform: sourcePlatform,
     content_id: contentId,
-    content_url: String(item.content_url || item.canonical_url || item.url || "").trim(),
+    content_url: String(item.original_url || item.content_url || item.canonical_url || item.url || "").trim(),
     content_type: String(item.content_type || "article").trim(),
     title: String(item.title || "").trim(),
     author_name: String(item.author_name || item.up_name || item.author || item.reporter || item.media || "").trim(),

@@ -210,6 +210,12 @@ from openbiliclaw.discovery.temporal import (
     is_complete_temporal_evidence_marker,
 )
 from openbiliclaw.llm.base import safe_llm_failure_message
+from openbiliclaw.news.presentation import (
+    collapse_news_display_duplicates,
+    compact_news_headline,
+    news_source_link_fields,
+    safe_http_url,
+)
 from openbiliclaw.runtime import embedding_progress
 from openbiliclaw.runtime.dialogue_reply_scheduler import (
     DialogueExecutionCoordinator,
@@ -6895,7 +6901,7 @@ def create_app(
         await _request_runtime_replenishment(reason="init_completed", force=True)
         return {"ok": True}
 
-    def _news_presentation_fields(content: Any) -> dict[str, str]:
+    def _news_presentation_fields(content: Any) -> dict[str, Any]:
         """Project canonical content into additive NewsClaw display aliases."""
 
         def value(name: str) -> object:
@@ -6904,7 +6910,10 @@ def create_app(
             return getattr(content, name, "")
 
         content_id = str(value("article_id") or value("content_id") or value("bvid") or "")
-        content_url = str(value("original_url") or value("content_url") or "")
+        content_url = str(
+            value("original_url") or value("content_url") or value("canonical_url") or ""
+        )
+        title = str(value("title") or "")
         media = str(
             value("media")
             or value("publisher_name")
@@ -6927,12 +6936,15 @@ def create_app(
             return {}
         if not provider and source_strategy.startswith("news-"):
             provider = source_strategy.removeprefix("news-")
+        exact_url = safe_http_url(content_url)
         return {
             "article_id": content_id,
-            "original_url": content_url,
+            "original_url": exact_url,
             "media": media,
             "publisher_name": media,
             "technical_provider": provider,
+            "display_title": compact_news_headline(title),
+            **news_source_link_fields(title=title, media=media, content_url=exact_url),
         }
 
     def _delight_presentation_fields(content: Mapping[str, Any]) -> dict[str, object]:
@@ -7194,7 +7206,10 @@ def create_app(
             if snapshot is not None:
                 snapshot_rows.append((int(item.recommendation_id), snapshot))
         _persist_recommendation_snapshots(snapshot_rows)
-        return _sort_recommendation_outputs(serialized)
+        ordered = _sort_recommendation_outputs(serialized)
+        if newsclaw_mode:
+            return collapse_news_display_duplicates(ordered)
+        return ordered
 
     def _filter_recommendation_objects_for_latest_dislikes(items: list[Any]) -> list[Any]:
         """Recheck an in-flight serve batch at the final HTTP boundary."""
@@ -8195,6 +8210,8 @@ def create_app(
                 )
             ),
         )
+        if newsclaw_mode:
+            rows = collapse_news_display_duplicates(rows)
         rows = _cap_by_franchise(rows, max_per_franchise=2)[:20]
         response_items: list[RecommendationOut] = []
         snapshot_rows: list[tuple[int, Mapping[str, Any]]] = []
@@ -9799,13 +9816,11 @@ def create_app(
             )
         items = _filter_recommendation_objects_for_latest_dislikes(items)
         items = _filter_recommendation_media(items, media)
-        if items:
+        serialized = _serialize_recommendation_items(items)
+        if serialized:
             from openbiliclaw.sources.event_format import SOURCE_WEB, build_event
 
-            returned_item_ids = [
-                str(getattr(getattr(item, "content", None), "bvid", "") or "").strip()
-                for item in items
-            ]
+            returned_item_ids = [str(item.bvid or "").strip() for item in serialized]
             returned_item_ids = [item_id for item_id in returned_item_ids if item_id]
             reshuffle_event = build_event(
                 event_type="reshuffle",
@@ -9817,7 +9832,7 @@ def create_app(
                     **({"recommendation_media": media} if media else {}),
                     "excluded_item_ids": excluded_bvids[:100],
                     "returned_item_ids": returned_item_ids[:100],
-                    "batch_size": len(items),
+                    "batch_size": len(serialized),
                     "event_namespace": "recommendation",
                     "profile_update_owner": "generic",
                 },
@@ -9831,7 +9846,9 @@ def create_app(
         _schedule_exact_pool_status_snapshot()
         available_after = counts_after.get("available")
         await _trigger_replenishment_if_needed(
-            force=available_after == 0 or _scoped_batch_came_up_short(source_platform, items, 10),
+            force=(
+                available_after == 0 or _scoped_batch_came_up_short(source_platform, serialized, 10)
+            ),
             available_count=available_after,
         )
         logger.info(
@@ -9848,7 +9865,6 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        serialized = _serialize_recommendation_items(items)
         if not serialized:
             return RecommendationReshuffleResponse(
                 items=[],
@@ -9942,10 +9958,13 @@ def create_app(
             )
         items = _filter_recommendation_objects_for_latest_dislikes(items)
         items = _filter_recommendation_media(items, media)
+        serialized = _serialize_recommendation_items(items)
         _schedule_exact_pool_status_snapshot()
         available_after = counts_after.get("available")
         await _trigger_replenishment_if_needed(
-            force=(available_after == 0 or _scoped_batch_came_up_short(source_platform, items, 10)),
+            force=(
+                available_after == 0 or _scoped_batch_came_up_short(source_platform, serialized, 10)
+            ),
             available_count=available_after,
         )
         logger.info(
@@ -9962,7 +9981,6 @@ def create_app(
             float(getattr(timings, "persist_ms", 0.0)),
             (time.perf_counter() - request_started) * 1000.0,
         )
-        serialized = _serialize_recommendation_items(items)
         if not serialized:
             return RecommendationReshuffleResponse(
                 items=[],

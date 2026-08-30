@@ -7602,6 +7602,108 @@ class TestBackendAPI:
             for event in hub.events
         )
 
+    def test_newsclaw_reshuffle_collapses_only_fact_identical_display_duplicates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        from openbiliclaw.discovery.engine import DiscoveredContent
+        from openbiliclaw.recommendation.engine import Recommendation
+
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
+
+        class FakeSoulEngine:
+            async def get_profile(self) -> dict[str, object]:
+                return {"profile": "ok"}
+
+        class FakeMemoryManager:
+            def __init__(self) -> None:
+                self.events: list[dict[str, object]] = []
+
+            async def propagate_event(self, _event: dict[str, object]) -> None:
+                self.events.append(_event)
+
+        class FakeRuntimeController:
+            pool_available_count = 3
+
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, bool]] = []
+
+            def get_runtime_status(self) -> dict[str, object]:
+                return {
+                    "initialized": True,
+                    "pool_available_count": self.pool_available_count,
+                    "pool_pending_count": 0,
+                }
+
+            async def request_replenishment(
+                self,
+                *,
+                reason: str,
+                force: bool = False,
+            ) -> dict[str, object]:
+                self.requests.append((reason, force))
+                return {"accepted": True, "state": "running", "reason": reason}
+
+        class FakeRecommendationEngine:
+            async def reshuffle_recommendations(self, **_kwargs: object) -> list[object]:
+                def item(
+                    recommendation_id: int,
+                    title: str,
+                    body_text: str,
+                ) -> Recommendation:
+                    return Recommendation(
+                        content=DiscoveredContent(
+                            bvid=f"news-{recommendation_id}",
+                            content_id=f"news-{recommendation_id}",
+                            source_platform="news",
+                            content_type="article",
+                            title=title,
+                            body_text=body_text,
+                            up_name="财经快讯",
+                            published_at="2026-08-25T05:00:00Z",
+                        ),
+                        recommendation_id=recommendation_id,
+                        topic_label="宏观政策",
+                    )
+
+                base = "【央行货币政策出现新的明确变化】"
+                duplicates = [
+                    item(
+                        recommendation_id,
+                        f"{base}央行发布决定",
+                        f"{base}央行发布决定。下调25个基点。",
+                    )
+                    for recommendation_id in range(1, 10)
+                ]
+                return [
+                    *duplicates,
+                    item(10, f"{base}央行发布决定", f"{base}央行发布决定。下调50个基点。"),
+                ]
+
+        memory = FakeMemoryManager()
+        runtime = FakeRuntimeController()
+        app = create_app(
+            memory_manager=memory,
+            database=object(),
+            soul_engine=FakeSoulEngine(),
+            recommendation_engine=FakeRecommendationEngine(),
+            runtime_controller=runtime,
+        )
+
+        with TestClient(app) as client:
+            response = client.post("/api/recommendations/reshuffle")
+            deadline = time.monotonic() + 1.0
+            while not runtime.requests and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        assert response.status_code == 200
+        assert [item["id"] for item in response.json()["items"]] == [1, 10]
+        assert all(item["source_link_status"] == "search" for item in response.json()["items"])
+        assert memory.events[0]["metadata"]["returned_item_ids"] == ["news-1", "news-10"]
+        assert memory.events[0]["metadata"]["batch_size"] == 2
+        assert runtime.requests == [("pool_empty", True)]
+
     def test_reshuffle_rechecks_dislike_committed_during_inflight_serve(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -7925,6 +8027,52 @@ class TestBackendAPI:
                 "reason": "这条很对你现在的口味。",
             }
         }
+
+    def test_newsclaw_pending_notification_keeps_source_navigation_fields(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
+
+        class FakeDatabase:
+            def get_notification_candidate(
+                self,
+                *,
+                min_confidence: float = 0.82,
+            ) -> dict[str, object] | None:
+                assert min_confidence == 0.82
+                return {
+                    "id": 9,
+                    "bvid": "news-pending",
+                    "title": "【国家宏观政策出现一项确定变化】政策部门发布正式决定",
+                    "expression": "这条变化值得继续跟进。",
+                }
+
+            def get_content(self, content_id: str) -> dict[str, object] | None:
+                assert content_id == "news-pending"
+                return {
+                    "bvid": content_id,
+                    "content_id": content_id,
+                    "source_platform": "news",
+                    "source": "tushare-news",
+                    "content_type": "article",
+                    "title": "【国家宏观政策出现一项确定变化】政策部门发布正式决定",
+                    "up_name": "财经快讯",
+                    "content_url": "",
+                }
+
+        app = create_app(memory_manager=object(), database=FakeDatabase(), soul_engine=object())
+        client = TestClient(app)
+
+        response = client.get("/api/notifications/pending")
+
+        assert response.status_code == 200
+        item = response.json()["item"]
+        assert item["display_title"] == "国家宏观政策出现一项确定变化"
+        assert item["source_link_status"] == "search"
+        assert item["source_lookup_url"].startswith("https://www.bing.com/search?")
 
     def test_notification_sent_endpoint_marks_delivery(self) -> None:
         from fastapi.testclient import TestClient

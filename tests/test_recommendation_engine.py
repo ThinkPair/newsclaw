@@ -6042,6 +6042,40 @@ class _SkippedFinalCommitDB(_SnapshotSpyDB):
         )
 
 
+class _NewsHistorySnapshotDB(_SnapshotSpyDB):
+    """Snapshot double that exposes previously persisted news as history."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__(_snapshot_with(rows))
+        self.rows_by_bvid = {str(row["bvid"]): dict(row) for row in rows}
+        self.history: list[dict[str, Any]] = []
+        self.persisted_batches: list[list[str]] = []
+
+    def get_recommendations(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self.history[:limit]]
+        for row in rows:
+            # Mirrors Database.get_recommendations(): publisher metadata and
+            # source_platform are selected, while the discovery strategy is not.
+            row.pop("source", None)
+        return rows
+
+    async def persist_pool_serve_async(
+        self,
+        items: list[dict[str, Any]],
+        shown_bvids: list[str],
+    ) -> Any:
+        from openbiliclaw.storage.database import PoolServePersistResult
+
+        assert [str(item["bvid"]) for item in items] == shown_bvids
+        self.persisted_batches.append(list(shown_bvids))
+        for bvid in reversed(shown_bvids):
+            self.history.insert(0, dict(self.rows_by_bvid[bvid]))
+        return PoolServePersistResult(
+            recommendation_ids=tuple(range(1, len(items) + 1)),
+            committed_bvids=tuple(shown_bvids),
+        )
+
+
 def _snapshot_with(rows: list[dict[str, Any]]) -> Any:
     from openbiliclaw.storage.database import PoolServeSnapshot
 
@@ -6070,6 +6104,27 @@ def _pool_row(bvid: str, platform: str) -> dict[str, Any]:
         "style_key": "tutorial",
         "topic_group": f"组 {bvid}",
     }
+
+
+def _news_pool_row(
+    bvid: str,
+    *,
+    title: str,
+    body_text: str,
+    relevance_score: float,
+) -> dict[str, Any]:
+    row = _pool_row(bvid, "news")
+    row.update(
+        title=title,
+        body_text=body_text,
+        content_url="",
+        source="tushare-news",
+        up_name="财经快讯",
+        published_at="2026-08-25T05:00:00+08:00",
+        relevance_score=relevance_score,
+        topic_group=f"新闻组 {bvid}",
+    )
+    return row
 
 
 @pytest.mark.asyncio
@@ -6137,6 +6192,63 @@ async def test_serve_rejects_cross_platform_rows_leaked_by_the_snapshot(
     assert [item.content.bvid for item in recommendations] == ["ZH01"]
     assert "BV99" in caplog.text
     assert "zhihu" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_serve_dedupes_before_persist_and_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    headline = "【国家宏观政策出现一项确定变化】政策部门发布正式决定"
+    duplicate_body = f"{headline}。政策规模为100亿元，执行时间为下周。"
+    rows = [
+        _news_pool_row(
+            "NEWS-1",
+            title=headline,
+            body_text=duplicate_body,
+            relevance_score=0.99,
+        ),
+        _news_pool_row(
+            "NEWS-2",
+            title=headline,
+            body_text=duplicate_body,
+            relevance_score=0.98,
+        ),
+        _news_pool_row(
+            "NEWS-3",
+            title="【另一项政策出现确定变化】部门公布实施细则",
+            body_text="【另一项政策出现确定变化】部门公布实施细则。细则从9月起执行。",
+            relevance_score=0.97,
+        ),
+        _news_pool_row(
+            "NEWS-4",
+            title="【第三项政策出现确定变化】部门公布配套安排",
+            body_text="【第三项政策出现确定变化】部门公布配套安排。首批名单已经发布。",
+            relevance_score=0.96,
+        ),
+    ]
+    stub = _NewsHistorySnapshotDB(rows)
+    engine = RecommendationEngine(llm=_DummyLLM(), database=stub)  # type: ignore[arg-type]
+
+    first = await engine.serve_with_result(
+        _build_profile(),
+        limit=2,
+        source_platform="news",
+    )
+    second = await engine.serve_with_result(
+        _build_profile(),
+        limit=2,
+        source_platform="news",
+    )
+
+    first_ids = [item.content.bvid for item in first.items]
+    second_ids = [item.content.bvid for item in second.items]
+    assert len(first_ids) == 2
+    assert "NEWS-2" not in first_ids
+    assert "NEWS-2" not in second_ids
+    assert set(first_ids).isdisjoint(second_ids)
+    assert stub.persisted_batches == [first_ids, second_ids]
+    assert stub.snapshot_kwargs[0]["limit"] >= 80
 
 
 class _LegacyCompatDB:

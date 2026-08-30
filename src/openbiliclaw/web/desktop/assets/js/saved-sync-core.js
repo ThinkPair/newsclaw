@@ -42,7 +42,7 @@
     const explicit = explicitRaw.toLowerCase();
     if (explicitRaw) return PLATFORM_ALIASES[explicit] || explicitRaw;
     try {
-      const host = new URL(text(item?.content_url || item?.canonical_url || item?.url)).hostname.toLowerCase();
+      const host = new URL(text(item?.original_url || item?.content_url || item?.canonical_url || item?.url)).hostname.toLowerCase();
       if (host === "youtu.be" || host.endsWith(".youtube.com")) return "youtube";
       if (host === "x.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com")) return "twitter";
       if (host.endsWith(".zhihu.com")) return "zhihu";
@@ -61,7 +61,7 @@
     const sourcePlatform = inferPlatform(item);
     const legacyId = text(item.bvid);
     const contentId = text(item.content_id || item.article_id || (legacyId && !legacyId.includes(":") ? legacyId : ""));
-    const contentUrl = text(item.content_url || item.canonical_url || item.url);
+    const contentUrl = text(item.original_url || item.content_url || item.canonical_url || item.url);
     const explicitType = text(item.content_type);
     return {
       ...item,

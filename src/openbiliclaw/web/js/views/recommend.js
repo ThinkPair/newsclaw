@@ -45,7 +45,7 @@ import {
   buildFeedbackPayload,
   validateCommentInput,
   getCommentSubmitUiState,
-  buildContentUrl,
+  getRecommendationSourceLink,
   buildRecommendationClickPayload,
   normalizeSourcePlatform,
   normalizeSavedIdentity,
@@ -524,6 +524,7 @@ function renderDelightTray() {
   const idx = state.delightCurrentIndex;
   const d = normalizeDelightCandidate(delights[idx] || delights[0]);
   const uiState = getDelightUiState(d);
+  const delightSourceLink = getRecommendationSourceLink(d);
   if (!uiState.visible) return;
 
   const tray = document.createElement("div");
@@ -584,7 +585,7 @@ function renderDelightTray() {
     const actions = document.createElement("div");
     actions.className = "delight-actions";
     const btns = [
-      { label: "\u9605\u8BFB\u539F\u6587", action: "view" },
+      { label: delightSourceLink.label, action: "view" },
       { label: "\u559C\u6B22", action: "like" },
       { label: "\u2606", action: "watch-later" },
       { label: "\u2661", action: "favorite" },
@@ -652,6 +653,12 @@ function renderDelightTray() {
         });
       } else {
         btn.addEventListener("click", () => handleDelightAction(d, b.action));
+        if (b.action === "view") {
+          btn.dataset.sourceLinkState = delightSourceLink.state;
+          btn.disabled = delightSourceLink.state === "missing";
+          btn.title = `${delightSourceLink.statusLabel}，${delightSourceLink.label}`;
+          btn.setAttribute("aria-label", btn.title);
+        }
         if (b.action === "like") {
           btn.setAttribute("aria-pressed", uiState.like_pressed ? "true" : "false");
           btn.disabled = uiState.like_disabled;
@@ -785,7 +792,12 @@ function renderDelightTray() {
   // 整卡点击打开内容（issue #126：惊喜卡此前只有「看看」可跳转，和下方信息流卡片
   // 的整卡点击不一致）。已反馈过（show_actions=false）、正在输入聊天、或拿不到
   // URL 时不接管点击。
-  const canTapOpenDelight = Boolean(uiState.show_actions && !d.composer_open && buildContentUrl(d));
+  const canTapOpenDelight = Boolean(
+    uiState.show_actions
+    && !d.composer_open
+    && delightSourceLink.state === "exact"
+    && delightSourceLink.url
+  );
   if (canTapOpenDelight) {
     tray.style.cursor = "pointer";
   }
@@ -986,6 +998,15 @@ function skipDelightAt(index) {
 }
 
 async function handleDelightAction(d, action) {
+  let viewSourceLink = null;
+  if (action === "view") {
+    viewSourceLink = getRecommendationSourceLink(d);
+    if (viewSourceLink.state === "search") {
+      if (viewSourceLink.url) openContentUrl(viewSourceLink.url);
+      return;
+    }
+    if (viewSourceLink.state !== "exact" || !viewSourceLink.url) return;
+  }
   const { apiResponse, uiState, permanent } = getDelightActionState(action);
 
   if (action === "chat") {
@@ -1059,8 +1080,7 @@ async function handleDelightAction(d, action) {
   }
 
   if (action === "view") {
-    const url = buildContentUrl(d);
-    if (url) openContentUrl(url);
+    openContentUrl(viewSourceLink.url);
   }
 }
 
@@ -1232,7 +1252,8 @@ function renderCard(rawItem, index = 0) {
   const item = normalizeRecommendation(rawItem);
   const card = document.createElement("div");
   card.className = "card";
-  const url = buildContentUrl(item);
+  const sourceLink = getRecommendationSourceLink(item);
+  const url = sourceLink.url;
   const cardMedia = getRecommendationCardKind(item);
   const fingerprint = getRecommendationTagFingerprint(item);
   if (cardMedia.kind === "fingerprint") card.classList.add("is-fingerprint-card");
@@ -1269,12 +1290,17 @@ function renderCard(rawItem, index = 0) {
       : scopeLabel === "全文级"
         ? "全文级信息"
         : "";
-  const observationText = Array.isArray(item.observation_points) && item.observation_points.length
+  const expressionText = String(item.expression || "").trim();
+  const expressionIncludesImpact = /(?:^|[。；;\n])\s*可能影响链\s*[：:]/.test(expressionText);
+  const expressionIncludesObservation = /(?:^|[。；;\n])\s*后续观察(?:点)?\s*[：:]/.test(expressionText);
+  const observationText = !expressionIncludesObservation
+    && Array.isArray(item.observation_points)
+    && item.observation_points.length
     ? `后续观察：${item.observation_points.join("；")}`
     : "";
   const explanation = [
-    item.expression,
-    item.impact_chain ? `可能影响链：${item.impact_chain}` : "",
+    expressionText,
+    item.impact_chain && !expressionIncludesImpact ? `可能影响链：${item.impact_chain}` : "",
     observationText,
   ].filter(Boolean).join("\n");
 
@@ -1303,13 +1329,17 @@ function renderCard(rawItem, index = 0) {
   const alreadyFeedback = feedbackDone.get(item.id);
 
   const openBtn = createCardAction(
-    "阅读原文",
+    sourceLink.label,
     () => {
-      reportClick(buildRecommendationClickPayload(item, url));
+      if (sourceLink.state === "exact") {
+        reportClick(buildRecommendationClickPayload(item, url));
+      }
       if (url) openContentUrl(url);
     },
-    { ariaLabel: "阅读原文", iconHtml: LINK_SVG_ICON, showText: true },
+    { ariaLabel: `${sourceLink.statusLabel}，${sourceLink.label}`, iconHtml: LINK_SVG_ICON, showText: true },
   );
+  openBtn.dataset.sourceLinkState = sourceLink.state;
+  if (!url) openBtn.disabled = true;
 
   const likeBtn = createCardAction(
     "",
@@ -1450,7 +1480,7 @@ function renderCard(rawItem, index = 0) {
   card.appendChild(actionsRow);
 
   // Whole card click (except action row)
-  if (url) {
+  if (sourceLink.state === "exact" && url) {
     card.style.cursor = "pointer";
     card.addEventListener("click", () => {
       reportClick(buildRecommendationClickPayload(item, url));

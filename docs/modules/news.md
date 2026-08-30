@@ -33,6 +33,7 @@ candidate pool.
 | Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; the live desktop list/route/empty state and API schema were verified locally, while populated-card and change paths are covered by automated contracts |
 | Durable event projection (Phase 3) | Implemented | Projects completed tracking evidence into stable events, immutable evidence memberships and deduplicated state changes in the same transaction; only confirmed, effective objective changes enter the default feed, while expectations/sentiment/analysis remain secondary |
 | Event workspace projection (Phase 4) | Implemented | Desktop event inbox, safe applied A→B change set, scalar reachable `current_state`, conflict freeze, explicit audit history, evidence drawer, unread state and mobile master/detail all consume the shared backend event truth |
+| News presentation and source navigation | Implemented | Keeps canonical title/body untouched, derives a compact headline only for substantial `【标题】正文` provider rows, conservatively folds same-provider/same-day duplicates only when lead, complete normalized body and exact URL also match, and distinguishes safe provider URLs from an explicitly labelled media-plus-title search fallback across initial, reshuffle and append responses |
 
 ## Canonical article contract
 
@@ -50,6 +51,19 @@ Every adapter returns `Article` values with exactly these public fields:
 Malformed publication times remain empty/`unknown`; the adapter does not invent
 a time. Missing bodies become `title_only`; an adapter cannot mark an empty body
 as `summary` or `full_text`.
+
+Tushare `news` and `major_news` do not contract an original URL. NewsClaw must
+therefore keep `canonical_url` empty for those rows rather than inventing one.
+At presentation time it may derive a Bing exact-title search URL, but that route
+is labelled as source lookup and is never persisted or described as a verified
+original. `display_title` is likewise a derived view: only an explicit bounded
+`【标题】正文` or `[标题]正文` shape is shortened; the canonical title and body stay
+available for audit. After priority sorting, the NewsClaw recommendation view
+also folds rows only when media and publication day match and the compact
+headline, normalized lead, complete normalized body and exact URL are identical
+after removing a calendar-year presentation variant. Empty-body rows, different
+URLs, media, publication days, and every changed fact remain separate; no stored
+evidence is deleted.
 
 ## Public API
 

@@ -223,6 +223,38 @@ test("desktop only exposes absolute HTTP(S) links to original content", async ()
   assert.equal(safeHttpContentUrl("/relative/path"), "");
 });
 
+test("desktop title and body compaction is conservative at content boundaries", async () => {
+  const js = await read("src/openbiliclaw/web/desktop/assets/js/app.js");
+  const titleSource = js.match(/function displayRecommendationTitle\([^)]*\) \{[\s\S]*?\n    \}/)?.[0] || "";
+  const bodySource = js.match(/function recommendationBodyForDisplay\([^)]*\) \{[\s\S]*?\n    \}/)?.[0] || "";
+  assert.ok(titleSource && bodySource);
+  const displayTitle = new Function(
+    "ID_TITLE_RE", "BRACKETED_NEWS_TITLE_RE", "ASCII_BRACKETED_NEWS_TITLE_RE", "ZHIHU_TITLE_PLACEHOLDERS",
+    `${titleSource}; return displayRecommendationTitle;`,
+  )(
+    /^(answer|article|question|zhihu)_\S+$/,
+    /^【\s*([^】\r\n]{4,180}?)\s*】/,
+    /^\[\s*([^\]\r\n]{4,180}?)\s*\]/,
+    { answer: "来自知乎的回答", article: "来自知乎的文章", question: "来自知乎的提问" },
+  );
+  const displayBody = new Function(`${bodySource}; return recommendationBodyForDisplay;`)();
+
+  assert.equal(displayTitle("【官方MV】歌曲名", "", "video", "bilibili"), "【官方MV】歌曲名");
+  assert.equal(displayTitle("[Official] Real headline", "", "video", "youtube"), "[Official] Real headline");
+  assert.equal(
+    displayTitle("【国家发展改革委召开六网协同会议】会议后续", "", "article", "news"),
+    "国家发展改革委召开六网协同会议",
+  );
+  assert.deepEqual(
+    displayBody({ title: "苹果", original_title: "苹果", body_text: "苹果公司发布财报" }),
+    { text: "苹果公司发布财报", duplicateOnly: false, trimmedPrefix: false },
+  );
+  assert.deepEqual(
+    displayBody({ title: "政策更新", original_title: "政策更新", body_text: "政策更新：下调25个基点" }),
+    { text: "下调25个基点", duplicateOnly: false, trimmedPrefix: true },
+  );
+});
+
 test("desktop priority ordering consumes the decision contract and stays stable", async () => {
   const js = await read("src/openbiliclaw/web/desktop/assets/js/app.js");
   const start = js.indexOf("const RECOMMENDATION_PRIORITY_LEVEL_WEIGHT");
@@ -291,14 +323,29 @@ test("today pick uses the canonical safe URL and explicit failed presentation", 
   const functionSource = (name) => js.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n    \\}`))?.[0] || "";
   const safeSource = functionSource("safeHttpContentUrl");
   const contentSource = functionSource("contentUrl");
+  const sourceLinkSource = functionSource("recommendationSourceLink");
   const delightSource = functionSource("delightContentUrl");
   const emptySource = functionSource("delightEmptyPresentation");
-  assert.ok(safeSource && contentSource && delightSource && emptySource);
+  assert.ok(safeSource && contentSource && sourceLinkSource && delightSource && emptySource);
   const helpers = new Function(
-    `${safeSource}\n${contentSource}\n${delightSource}\n${emptySource}; return { delightContentUrl, delightEmptyPresentation };`,
+    `${safeSource}\n${contentSource}\n${sourceLinkSource}\n${delightSource}\n${emptySource}; return { recommendationSourceLink, delightContentUrl, delightEmptyPresentation };`,
   )();
   assert.equal(helpers.delightContentUrl({ content_url: "javascript:alert(1)", platform: "news" }), "");
   assert.equal(helpers.delightContentUrl({ content_url: "https://example.com/news", platform: "news" }), "https://example.com/news");
+  assert.deepEqual(
+    helpers.recommendationSourceLink({ source_lookup_url: "https://www.bing.com/search?q=article", platform: "news" }),
+    {
+      state: "search",
+      url: "https://www.bing.com/search?q=article",
+      label: "检索来源",
+      statusLabel: "来源未提供直链",
+      explanation: "将按标题检索公开网页；搜索结果不是新闻爪认定的原文。",
+    },
+  );
+  assert.equal(
+    helpers.recommendationSourceLink({ source_lookup_url: "javascript:alert(1)", platform: "news" }).label,
+    "暂无原文",
+  );
   const failed = helpers.delightEmptyPresentation("failed", "本地后端超时");
   assert.equal(failed.title, "今日首选暂时不可用");
   assert.equal(failed.reason, "本地后端超时");
@@ -327,7 +374,7 @@ test("today pick DOM controls disable unsafe, single-item and repeated-like acti
   const source = js.match(/function syncDelightControlAvailability\([^)]*\) \{[\s\S]*?\n    \}/)?.[0];
   assert.ok(source);
   const button = (action) => ({
-    dataset: { delight: action }, disabled: false, hidden: false, title: "", attrs: {},
+    dataset: { delight: action }, disabled: false, hidden: false, title: "", textContent: "", attrs: {},
     setAttribute(name, value) { this.attrs[name] = String(value); },
   });
   const controls = Object.fromEntries(
@@ -343,18 +390,40 @@ test("today pick DOM controls disable unsafe, single-item and repeated-like acti
       return [...selector.matchAll(/data-delight="([^"]+)"/g)].map((match) => controls[match[1]]);
     },
   };
-  const state = { delights: [{ state: "liked" }], delight: { state: "liked" }, delightLoadState: "ready" };
+  const sourceLink = (item) => ({
+    exact: { state: "exact", url: "https://example.com/article", label: "阅读原文", statusLabel: "原文可核验", explanation: "原文说明" },
+    search: { state: "search", url: "https://www.bing.com/search?q=article", label: "检索来源", statusLabel: "来源未提供直链", explanation: "检索说明" },
+    missing: { state: "missing", url: "", label: "暂无原文", statusLabel: "链接信息缺失", explanation: "缺失说明" },
+  })[item?.sourceState || "missing"];
+  const state = { delights: [{ state: "liked", sourceState: "missing" }], delight: { state: "liked", sourceState: "missing" }, delightLoadState: "ready" };
   const sync = new Function(
-    "state", "document", "delightContentUrl", "$", "delightFeedbackInFlight",
+    "state", "document", "delightSourceLink", "$", "delightFeedbackInFlight",
     `${source}; return syncDelightControlAvailability;`,
-  )(state, fakeDocument, () => "", (selector) => selector === "#delightRetryBtn" ? controls.retry : null, false);
+  )(state, fakeDocument, sourceLink, (selector) => selector === "#delightRetryBtn" ? controls.retry : null, false);
   sync();
   assert.equal(controls.prev.disabled, true);
   assert.equal(controls.next.disabled, true);
   assert.equal(controls.view.disabled, true);
   assert.equal(controls.view.attrs["aria-disabled"], "true");
+  assert.equal(controls.view.textContent, "暂无原文");
+  assert.equal(controls.view.dataset.sourceLinkState, "missing");
   assert.equal(controls.like.disabled, true);
   assert.equal(controls.retry.hidden, true);
+
+  state.delights = [{ state: "pending", sourceState: "search" }];
+  state.delight = state.delights[0];
+  sync();
+  assert.equal(controls.view.disabled, false);
+  assert.equal(controls.view.textContent, "检索来源");
+  assert.equal(controls.view.dataset.sourceLinkState, "search");
+  assert.equal(controls.view.attrs["aria-label"], "来源未提供直链，检索来源");
+
+  state.delights = [{ state: "pending", sourceState: "exact" }];
+  state.delight = state.delights[0];
+  sync();
+  assert.equal(controls.view.disabled, false);
+  assert.equal(controls.view.textContent, "阅读原文");
+  assert.equal(controls.view.dataset.sourceLinkState, "exact");
 
   const committedSource = js.match(/function recommendationFeedbackAlreadyCommitted\([^)]*\) \{[\s\S]*?\n    \}/)?.[0];
   assert.ok(committedSource);
@@ -364,6 +433,51 @@ test("today pick DOM controls disable unsafe, single-item and repeated-like acti
   assert.equal(alreadyCommitted({ feedback_type: "like" }, "like"), true);
   assert.equal(alreadyCommitted({ feedback_type: "comment" }, "like"), false);
   assert.equal(alreadyCommitted({ feedback_type: "like" }, "dislike"), false);
+});
+
+test("today pick source search opens without recording a view", async () => {
+  const js = await read("src/openbiliclaw/web/desktop/assets/js/app.js");
+  assert.match(
+    js,
+    /if \(response === "view"\) \{\s*const sourceLink = delightSourceLink\(delight\);\s*if \(sourceLink\.state === "search"\) \{[\s\S]{0,700}?return;\s*\}\s*if \(sourceLink\.state !== "exact"/,
+  );
+  const searchBranch = js.match(
+    /if \(sourceLink\.state === "search"\) \{[\s\S]{0,700}?return;\s*\}/,
+  )?.[0] || "";
+  assert.ok(searchBranch);
+  assert.match(searchBranch, /window\.open\(sourceLink\.url, "_blank", "noopener,noreferrer"\)/);
+  assert.doesNotMatch(searchBranch, /trackRecommendationClick|delightRespond|response: "view"/);
+});
+
+test("desktop recommendation source search is navigation-only", async () => {
+  const js = await read("src/openbiliclaw/web/desktop/assets/js/app.js");
+  const start = js.indexOf("const recordSourceSearch = () => {");
+  const end = js.indexOf('sourceSearchLink?.addEventListener("click"', start);
+  const searchHandler = js.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(searchHandler, /本次检索不记为阅读或原文点击/);
+  assert.doesNotMatch(searchHandler, /trackRecommendationClick|ENDPOINTS\.click|recommendation-click/);
+});
+
+test("desktop pending notifications keep exact, search and missing source actions distinct", async () => {
+  const js = await read("src/openbiliclaw/web/desktop/assets/js/app.js");
+  assert.match(js, /type: "notification",[\s\S]{0,800}?original_url:[\s\S]{0,400}?source_link_status:[\s\S]{0,250}?source_lookup_url:/);
+  assert.match(js, /data-notification-msg="view" data-source-link-state="exact"/);
+  assert.match(js, /data-notification-msg="search" data-source-link-state="search"/);
+  assert.match(js, /data-notification-msg="missing" data-source-link-state="missing"[\s\S]{0,120}?disabled/);
+
+  const start = js.indexOf("async function respondNotification");
+  const end = js.indexOf("async function refreshWebMonitorNotifications", start);
+  const responder = js.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(responder, /if \(response === "search"\) \{[\s\S]{0,220}?return;/);
+  assert.match(responder, /if \(response === "missing"\) return;/);
+  assert.match(responder, /if \(response === "view"\) \{\s*if \(sourceLink\.state !== "exact" \|\| !sourceLink\.url\) return;\s*trackRecommendationClick\(msg\);/);
+  assert.ok(responder.indexOf('if (response === "search")') < responder.indexOf("ENDPOINTS.notificationSent"));
+  assert.match(responder, /await requestJsonStrict\(ENDPOINTS\.notificationSent/);
+  assert.doesNotMatch(responder, /await requestJson\(ENDPOINTS\.notificationSent/);
+  assert.match(responder, /state\.messageListSnapshot = state\.messageListSnapshot\.filter/);
+  assert.match(responder, /catch \(error\) \{[\s\S]{0,500}?标记通知失败/);
 });
 
 test("desktop initial recommendation state is loading, never a fabricated empty pool", async () => {
@@ -485,7 +599,12 @@ test("mobile compatibility layer accepts canonical NewsClaw article fields", asy
   assert.match(api, /requestJson\("\/news\/refresh"/);
   assert.match(api, /requestJson\("\/news\/sources\/probe"/);
   assert.match(recommendations, /标题级信息/);
-  assert.match(recommendations, /阅读原文/);
+  assert.match(recommendations, /getRecommendationSourceLink/);
+  assert.match(recommendations, /sourceLink\.label/);
+  assert.match(recommendations, /sourceLink\.state === "exact"/);
+  assert.match(models, /label: "阅读原文"/);
+  assert.match(models, /label: "检索来源"/);
+  assert.match(models, /label: "暂无原文"/);
 });
 
 test("first setup submits a durable bootstrap and polls its terminal state", async () => {

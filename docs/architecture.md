@@ -44,7 +44,9 @@ NewsClaw judgment workbench
              → atomic lane/day budget → scoped evaluation even when pool is full
              → copy-ready/servable commit → protected low-priority reconciliation
              → Today Pick; no old-news fallback and no pre-eviction
-        → recommendation_tags projection (tags + decision-priority-v2 + why / impact / observations)
+        → news.presentation fact-identity → pre-selection/cross-batch duplicate suppression
+             └─ full normalized evidence + safe URL; canonical rows remain untouched
+        → recommendation_tags + source projection (tags + priority + why / impact / observations + exact/search/missing)
         → bounded stable sort → desktop priority queue / Today Pick → one selected detail
         ├─ explicit feedback → durable event → profile learning
         ├─ save / click / feedback / removal → immutable judgment snapshot → local history

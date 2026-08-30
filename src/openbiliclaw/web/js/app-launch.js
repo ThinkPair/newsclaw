@@ -151,7 +151,8 @@ function launchAppThenFallback(schemeUrl, webUrl) {
     const hidden = document.hidden;
     cleanup();
     if (hidden) return;
-    const opened = window.open(webUrl, "_blank");
+    const opened = window.open(webUrl, "_blank", "noopener,noreferrer");
+    if (opened) opened.opener = null;
     if (!opened) showWebFallbackToast(webUrl);
   };
   document.addEventListener("visibilitychange", onVisibilityChange);
@@ -182,7 +183,7 @@ function showWebFallbackToast(webUrl) {
   link.textContent = "打开网页版";
   link.href = webUrl;
   link.target = "_blank";
-  link.rel = "noopener";
+  link.rel = "noopener noreferrer";
   link.style.cssText =
     "color:#7ec8ff;font-weight:600;text-decoration:none;white-space:nowrap;";
   const close = document.createElement("button");
@@ -211,6 +212,7 @@ export function openContentUrl(url) {
   if (deepLink) {
     launchAppThenFallback(deepLink, url);
   } else {
-    window.open(url, "_blank");
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+    if (opened) opened.opener = null;
   }
 }

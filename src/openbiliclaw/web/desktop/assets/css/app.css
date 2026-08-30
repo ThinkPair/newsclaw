@@ -3298,6 +3298,65 @@
 .recommendation-detail-head h3:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: 4px; }
 .recommendation-detail-head .video-meta,
 .recommendation-detail-head .video-stats { margin: 0; color: var(--meta); font-size: 11px; }
+.detail-source-evidence {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--surface), var(--bg) 28%);
+}
+.detail-evidence-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-2);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.detail-evidence-state > span {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--meta);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--meta), transparent 84%);
+}
+.detail-source-evidence[data-source-link-state="exact"] .detail-evidence-state > span {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--success), transparent 84%);
+}
+.detail-source-evidence[data-source-link-state="search"] .detail-evidence-state > span {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--warn), transparent 82%);
+}
+.detail-source-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  overflow: hidden;
+  color: var(--meta);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.detail-source-evidence .small-btn {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 11px;
+  font-size: 11px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.detail-source-evidence .small-btn.is-disabled { cursor: not-allowed; opacity: .58; }
 .recommendation-detail-tags {
   min-width: 0;
   display: flex;
@@ -3660,6 +3719,9 @@
     border-radius: 0;
   }
   .recommendation-detail-head h3 { font-size: 21px; -webkit-line-clamp: 4; }
+  .detail-source-evidence { grid-template-columns: minmax(0, 1fr) auto; }
+  .detail-evidence-state { grid-column: 1 / -1; }
+  .detail-source-meta { white-space: normal; }
   .recommendation-detail-scroll .detail-media { height: 170px; }
   .detail-analysis-block { grid-template-columns: 1fr; gap: 6px; }
   .detail-analysis-block li:has(.observation-track-btn) { grid-template-columns: 1fr; }

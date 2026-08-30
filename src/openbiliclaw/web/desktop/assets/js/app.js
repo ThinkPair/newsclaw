@@ -1469,10 +1469,24 @@
     // body text (first sentence), else a generic label, so the card header is
     // never a bare ID even without re-fetching.
     const ID_TITLE_RE = /^(answer|article|question|zhihu)_\S+$/;
+    const BRACKETED_NEWS_TITLE_RE = /^【\s*([^】\r\n]{4,180}?)\s*】/;
+    const ASCII_BRACKETED_NEWS_TITLE_RE = /^\[\s*([^\]\r\n]{4,180}?)\s*\]/;
     const ZHIHU_TITLE_PLACEHOLDERS = { answer: "来自知乎的回答", article: "来自知乎的文章", question: "来自知乎的提问" };
-    function displayRecommendationTitle(rawTitle, bodyText, contentType) {
-      const title = String(rawTitle || "").trim();
-      if (title && !ID_TITLE_RE.test(title)) return title;
+    function displayRecommendationTitle(rawTitle, bodyText, contentType, sourcePlatform = "") {
+      const title = String(rawTitle || "").replace(/\s+/g, " ").trim();
+      if (title && !ID_TITLE_RE.test(title)) {
+        if (String(sourcePlatform || "").toLowerCase() === "news") {
+          for (const pattern of [BRACKETED_NEWS_TITLE_RE, ASCII_BRACKETED_NEWS_TITLE_RE]) {
+            const match = title.match(pattern);
+            const semanticLength = (match?.[1]?.match(/[a-z0-9]+|[\u3400-\u9fff]/gi) || [])
+              .reduce((total, token) => total + token.length, 0);
+            if (match?.[1] && title.slice(match[0].length).trim() && semanticLength >= 12) {
+              return match[1].replace(/\s+/g, " ").trim();
+            }
+          }
+        }
+        return title;
+      }
       const body = String(bodyText || "").trim();
       if (body) {
         const first = (body.split(/[。！？!?\n]/, 1)[0] || "").trim() || body;
@@ -1564,16 +1578,21 @@
       const media = decodeHtmlEntities(item?.media ?? item?.source_name ?? item?.publisher ?? item?.up_name ?? "");
       const reporter = decodeHtmlEntities(item?.reporter ?? item?.author_name ?? item?.up ?? "");
       const priority = normalizeRecommendationPriority(item);
+      const originalTitle = decodeHtmlEntities(item?.title ?? "").replace(/\s+/g, " ").trim();
+      const displayTitle = decodeHtmlEntities(item?.display_title ?? "").replace(/\s+/g, " ").trim();
       return {
         id: Number(item?.id ?? Date.now()),
         bvid: String(item?.bvid ?? contentId),
         item_key: canonical.item_key,
         content_id: contentId,
-        title: displayRecommendationTitle(decodeHtmlEntities(item?.title ?? ""), bodyText, contentType) || "未命名内容",
+        title: displayRecommendationTitle(displayTitle || originalTitle, bodyText, contentType, canonical.source_platform) || "未命名内容",
+        original_title: originalTitle,
         up: reporter || media || "媒体信息暂未提供",
         media,
         cover_url: normalizeImageUrl(item?.cover_url ?? item?.cover ?? item?.pic ?? item?.thumbnail_url ?? item?.thumbnail ?? item?.image_url),
-        content_url: canonical.content_url || String(item?.canonical_url ?? ""),
+        content_url: String(item?.original_url ?? "") || canonical.content_url || String(item?.canonical_url ?? ""),
+        source_link_status: String(item?.source_link_status ?? "").trim().toLowerCase(),
+        source_lookup_url: String(item?.source_lookup_url ?? "").trim(),
         topic: decodeHtmlEntities(item?.topic_label ?? item?.topic ?? "未归类"),
         platform: canonical.source_platform,
         source_platform: canonical.source_platform,
@@ -6554,7 +6573,7 @@ ${savedCardFeedbackBarHtml(listKind)}
 
     function contentUrl(item) {
       const platform = item.platform || item.source_platform;
-      const explicitUrl = safeHttpContentUrl(item.content_url);
+      const explicitUrl = safeHttpContentUrl(item.original_url || item.content_url || item.canonical_url);
       if (explicitUrl) return explicitUrl;
       if (platform === "bilibili" && item.bvid) return `https://www.bilibili.com/video/${encodeURIComponent(item.bvid)}`;
       if (platform === "youtube" && item.content_id) return `https://www.youtube.com/watch?v=${encodeURIComponent(item.content_id)}`;
@@ -6568,6 +6587,36 @@ ${savedCardFeedbackBarHtml(listKind)}
       }
       if (platform === "reddit") return "";
       return "";
+    }
+
+    function recommendationSourceLink(item) {
+      const exactUrl = contentUrl(item);
+      if (exactUrl) {
+        return {
+          state: "exact",
+          url: exactUrl,
+          label: "阅读原文",
+          statusLabel: "原文可核验",
+          explanation: "来源提供了可直接打开的原文地址。",
+        };
+      }
+      const lookupUrl = safeHttpContentUrl(item?.source_lookup_url);
+      if (lookupUrl) {
+        return {
+          state: "search",
+          url: lookupUrl,
+          label: "检索来源",
+          statusLabel: "来源未提供直链",
+          explanation: "将按标题检索公开网页；搜索结果不是新闻爪认定的原文。",
+        };
+      }
+      return {
+        state: "missing",
+        url: "",
+        label: "暂无原文",
+        statusLabel: "链接信息缺失",
+        explanation: "当前材料没有可直接打开或可靠检索的地址。",
+      };
     }
 
     const CONTENT_HISTORY_PAGE_SIZE = 12;
@@ -7646,16 +7695,53 @@ ${cardFeedbackBarHtml()}`;
       return sections.join("");
     }
 
+    function recommendationBodyForDisplay(item) {
+      const body = String(item?.body_text || "").trim();
+      if (!body) return { text: "", duplicateOnly: false, trimmedPrefix: false };
+      const candidates = [item?.original_title, item?.title]
+        .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .sort((left, right) => right.length - left.length);
+      const compactBody = body.replace(/\s+/g, " ").trim();
+      for (const candidate of candidates) {
+        if (!compactBody.startsWith(candidate)) continue;
+        const nextCharacter = compactBody.slice(candidate.length, candidate.length + 1);
+        const candidateEndsAtBoundary = /[\s,，。:：;；|｜·—\-!?！？、）)\]】]$/.test(candidate);
+        const remainderStartsAtBoundary = !nextCharacter || /[\s,，。:：;；|｜·—\-!?！？、（(\[【]/.test(nextCharacter);
+        if (!candidateEndsAtBoundary && !remainderStartsAtBoundary) continue;
+        const remainder = compactBody.slice(candidate.length).replace(/^[\s,，。:：;；|｜·—-]+/, "").trim();
+        return {
+          text: remainder,
+          duplicateOnly: !remainder,
+          trimmedPrefix: true,
+        };
+      }
+      return { text: body, duplicateOnly: false, trimmedPrefix: false };
+    }
+
+    function recommendationSourceMetaHtml(item) {
+      const parts = [];
+      const media = recommendationMediaLabel(item);
+      const published = formatPublishedTime(item);
+      if (media) parts.push(`<span>${escapeHtml(media)}</span>`);
+      if (published) {
+        const exactTitle = Number.isFinite(Date.parse(item.published_at))
+          ? new Date(item.published_at).toLocaleString()
+          : "";
+        parts.push(`<span${exactTitle ? ` title="${escapeHtml(exactTitle)}"` : ""}>${escapeHtml(published)}</span>`);
+      }
+      return parts.join(`<span aria-hidden="true">·</span>`);
+    }
+
     function recommendationDetailHtml(item, items) {
       const index = Math.max(0, items.findIndex((candidate) => recommendationKey(candidate) === recommendationKey(item)));
       const queueRank = String(index + 1).padStart(2, "0");
       const priorityLabel = String(item.priority_label || "").trim() || `队列 ${queueRank}`;
       const priorityLevel = String(item.priority_level || "normal");
-      const priorityReason = String(item.priority_reason || "").trim();
-      const url = contentUrl(item);
+      const sourceLink = recommendationSourceLink(item);
       const stats = recommendationStats(item);
       const tags = recommendationDisplayTags(item);
-      const body = String(item.body_text || "").trim();
+      const body = recommendationBodyForDisplay(item);
       const tagMarkup = tags.length
         ? tags.map((tag) => `<span class="detail-tag" data-tag-type="${escapeHtml(tag.type)}"><span>${escapeHtml(DISPLAY_TAG_TYPE_LABELS[tag.type] || "标签")}</span>${escapeHtml(tag.label)}</span>`).join("")
         : `<span class="detail-tag" data-tag-type="topic"><span>主题</span>${escapeHtml(recommendationTopicLabel(item))}</span>`;
@@ -7663,12 +7749,17 @@ ${cardFeedbackBarHtml()}`;
         <div class="recommendation-detail-shell" data-detail-item-key="${escapeHtml(recommendationKey(item))}">
           <header class="recommendation-detail-head">
             <div class="detail-head-topline">
-              <div class="queue-card-flags"><span class="queue-priority-tag" data-priority="${escapeHtml(priorityLevel)}" title="${escapeHtml(priorityReason || priorityLabel)}">${escapeHtml(priorityLabel)}</span><span class="queue-topic-tag">${escapeHtml(recommendationTopicLabel(item))}</span></div>
-              ${priorityReason ? `<p class="detail-priority-reason">${escapeHtml(priorityReason)}</p>` : ""}
+              <div class="queue-card-flags"><span class="queue-priority-tag" data-priority="${escapeHtml(priorityLevel)}">${escapeHtml(priorityLabel)}</span></div>
               <button class="icon-btn recommendation-detail-close" id="recommendationDetailClose" type="button" aria-label="关闭新闻详情">×</button>
             </div>
             <h3 id="recommendationDetailTitle" tabindex="-1" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h3>
-            <p class="video-meta">${recommendationMetaHtml(item)}</p>
+            <div class="detail-source-evidence" data-source-link-state="${escapeHtml(sourceLink.state)}">
+              <span class="detail-evidence-state" title="${escapeHtml(sourceLink.explanation)}"><span aria-hidden="true"></span>${escapeHtml(sourceLink.statusLabel)}</span>
+              <p class="detail-source-meta">${recommendationSourceMetaHtml(item) || "来源信息暂缺"}</p>
+              ${sourceLink.url
+                ? `<a class="small-btn${sourceLink.state === "exact" ? " primary" : ""}" ${sourceLink.state === "exact" ? "data-detail-open-original" : "data-detail-search-source"} href="${escapeHtml(sourceLink.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</a>`
+                : `<span class="small-btn is-disabled" aria-disabled="true" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</span>`}
+            </div>
             ${stats ? `<p class="video-stats">${escapeHtml(stats)}</p>` : ""}
             <div class="recommendation-detail-tags" aria-label="新闻标签">${tagMarkup}</div>
           </header>
@@ -7678,13 +7769,14 @@ ${cardFeedbackBarHtml()}`;
               <span class="platform" data-platform="${escapeHtml(item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || "新闻")}</span>
             </div>
             <div class="detail-analysis-stack">${recommendationDetailExplanationHtml(item)}</div>
-            ${body ? `<details class="detail-source-copy"><summary>查看已采集的原始内容</summary><p>${escapeHtml(body)}</p></details>` : `<p class="detail-source-missing">当前来源只提供了标题或摘要，没有可展开的正文。</p>`}
+            ${body.text
+              ? `<details class="detail-source-copy"><summary>${body.trimmedPrefix ? "查看正文（已去除重复标题）" : "查看已采集的正文"}</summary><p>${escapeHtml(body.text)}</p></details>`
+              : body.duplicateOnly
+                ? `<p class="detail-source-missing">来源正文与标题完全相同，没有更多内容可展开。</p>`
+                : `<p class="detail-source-missing">当前来源只提供了标题或摘要，没有可展开的正文。</p>`}
           </div>
           <footer class="recommendation-detail-actions" aria-label="当前新闻操作">
             <div class="detail-primary-actions">
-              ${url
-                ? `<a class="small-btn primary" data-detail-open-original href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">阅读原文</a>`
-                : `<span class="small-btn is-disabled" aria-disabled="true">暂无原文链接</span>`}
               <button class="small-btn" data-detail-action="watch-later" type="button" aria-pressed="false">稍后读</button>
               <button class="small-btn" data-detail-action="favorite" type="button" aria-pressed="false">收藏</button>
             </div>
@@ -7790,6 +7882,8 @@ ${cardFeedbackBarHtml()}`;
         selected.body_text,
         selected.cover_url,
         selected.content_url,
+        selected.source_link_status,
+        selected.source_lookup_url,
         selected.priority,
         selected.priority_level,
         selected.priority_label,
@@ -7826,6 +7920,18 @@ ${cardFeedbackBarHtml()}`;
       originalLink?.addEventListener("click", recordOriginalOpen);
       originalLink?.addEventListener("auxclick", (event) => {
         if (event.button === 1) recordOriginalOpen();
+      });
+      const sourceSearchLink = pane.querySelector("[data-detail-search-source]");
+      const recordSourceSearch = () => {
+        const status = pane.querySelector("#recommendationDetailStatus");
+        if (status) {
+          status.removeAttribute("role");
+          status.textContent = "已打开来源检索；本次检索不记为阅读或原文点击，仍需在结果页核验。";
+        }
+      };
+      sourceSearchLink?.addEventListener("click", recordSourceSearch);
+      sourceSearchLink?.addEventListener("auxclick", (event) => {
+        if (event.button === 1) recordSourceSearch();
       });
       pane.querySelectorAll("[data-detail-action]").forEach((button) => {
         button.addEventListener("click", async () => {
@@ -9162,10 +9268,18 @@ ${cardFeedbackBarHtml()}`;
         if (!bvid) return null;
         return {
           type: "notification",
+          id: Number(item.recommendation_id ?? item.id ?? 0) || null,
+          recommendation_id: Number(item.recommendation_id ?? item.id ?? 0) || null,
           bvid: String(bvid),
-          title: item.title || "有一条值得通知你的推荐",
+          content_id: String(item.article_id || item.content_id || bvid),
+          title: item.display_title || item.title || "有一条值得通知你的推荐",
           reason: item.reason || item.expression || "这条推荐达到了通知阈值。",
-          content_url: item.content_url || item.canonical_url || ""
+          original_url: item.original_url || "",
+          content_url: item.original_url || item.content_url || item.canonical_url || "",
+          source_link_status: String(item.source_link_status || "").trim().toLowerCase(),
+          source_lookup_url: item.source_lookup_url || "",
+          source_platform: item.source_platform || "news",
+          media: item.media || item.publisher_name || "",
         };
       }
       if (type === "web-monitor-notification") {
@@ -9296,9 +9410,12 @@ ${cardFeedbackBarHtml()}`;
           });
         } else if (messageType(msg) === "notification") {
           el.classList.add("is-notification");
-          const viewAction = msg.content_url
-            ? `<a class="small-btn" data-notification-msg="view" href="${escapeHtml(msg.content_url)}" target="_blank" rel="noopener noreferrer">阅读原文</a>`
-            : `<button class="small-btn" data-notification-msg="view" type="button">阅读原文</button>`;
+          const sourceLink = recommendationSourceLink(msg);
+          const viewAction = sourceLink.state === "exact"
+            ? `<a class="small-btn" data-notification-msg="view" data-source-link-state="exact" href="${escapeHtml(sourceLink.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</a>`
+            : sourceLink.state === "search"
+              ? `<a class="small-btn" data-notification-msg="search" data-source-link-state="search" href="${escapeHtml(sourceLink.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</a>`
+              : `<button class="small-btn" data-notification-msg="missing" data-source-link-state="missing" type="button" disabled aria-disabled="true" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</button>`;
           el.innerHTML = `<p class="eyebrow">待通知候选</p><h3>${escapeHtml(msg.title)}</h3><p class="video-meta">${escapeHtml(msg.reason)}</p><div class="message-note">这类消息来自后端挑出的高置信推荐，用于插件通知；标记已通知后不会反复出现。</div><div class="message-card-actions"><div class="card-feedback-icons" aria-label="通知候选状态"><button class="feedback-icon-btn" data-notification-msg="dismiss" type="button" aria-label="标记已通知" title="标记已通知"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div><div class="message-primary-actions">${viewAction}</div></div>`;
           el.querySelectorAll("[data-notification-msg]").forEach((btn) => {
             btn.addEventListener("click", () => respondNotification(msg, btn.dataset.notificationMsg, el));
@@ -9338,12 +9455,41 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function respondNotification(msg, response, el) {
-      if (response === "view" && msg.content_url) trackRecommendationClick(msg);
-      await requestJson(ENDPOINTS.notificationSent, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bvid: msg.bvid }) });
-      state.messages = state.messages.filter((item) => !(messageType(item) === "notification" && String(item.bvid) === String(msg.bvid)));
-      renderMessages();
-      if (el) el.remove();
-      showToast(response === "view" ? "已打开并标记这条通知" : "已标记这条通知");
+      const sourceLink = recommendationSourceLink(msg);
+      if (response === "search") {
+        showToast("已打开来源检索；搜索结果不会被当作原文或已读通知");
+        return;
+      }
+      if (response === "missing") return;
+      if (response === "view") {
+        if (sourceLink.state !== "exact" || !sourceLink.url) return;
+        trackRecommendationClick(msg);
+      }
+      const notificationKey = messageKey(msg);
+      el?.setAttribute("aria-busy", "true");
+      el?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+      try {
+        await requestJsonStrict(ENDPOINTS.notificationSent, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bvid: msg.bvid }),
+        });
+        state.messages = state.messages.filter((item) => messageKey(item) !== notificationKey);
+        if (state.messageListSnapshot) {
+          state.messageListSnapshot = state.messageListSnapshot.filter(
+            (item) => messageKey(item) !== notificationKey
+          );
+        }
+        renderMessages();
+        el?.remove();
+        showToast(response === "view" ? "已打开并标记这条通知" : "已标记这条通知");
+      } catch (error) {
+        el?.removeAttribute("aria-busy");
+        el?.querySelectorAll("button").forEach((button) => {
+          button.disabled = button.dataset.notificationMsg === "missing";
+        });
+        showToast(error?.message || "标记通知失败，请稍后重试");
+      }
     }
 
     async function refreshWebMonitorNotifications() {
@@ -9907,6 +10053,10 @@ ${cardFeedbackBarHtml()}`;
       return contentUrl(delight);
     }
 
+    function delightSourceLink(delight) {
+      return recommendationSourceLink(delight || {});
+    }
+
     function ensureDelightThumbAnchor() {
       const thumb = $("#delightThumb");
       if (!thumb || thumb.tagName.toLowerCase() === "a") return thumb;
@@ -10075,7 +10225,23 @@ ${cardFeedbackBarHtml()}`;
         return;
       }
       if (response === "view") {
-        const url = delightContentUrl(delight);
+        const sourceLink = delightSourceLink(delight);
+        if (sourceLink.state === "search") {
+          if (openUrl && sourceLink.url) {
+            const opened = window.open(sourceLink.url, "_blank", "noopener,noreferrer");
+            if (opened) opened.opener = null;
+          }
+          if ($("#delightStatus")) {
+            $("#delightStatus").textContent = "已打开来源检索；搜索结果不是新闻爪认定的原文。";
+          }
+          showToast("已打开来源检索，请在结果页核验原文");
+          return;
+        }
+        if (sourceLink.state !== "exact" || !sourceLink.url) {
+          if ($("#delightStatus")) $("#delightStatus").textContent = "当前材料没有可打开的原文链接。";
+          return;
+        }
+        const url = sourceLink.url;
         // 「阅读原文」按钮是纯 <button>（不是封面那个 <a>），必须在这里显式打开，
         // 否则点了只弹 toast 却什么都不开（field report 2026-07-07）。封面缩略图
         // 已是带 href 的 <a> 靠原生导航打开，openUrl=false 不重复开、避免双开。
@@ -10087,7 +10253,10 @@ ${cardFeedbackBarHtml()}`;
         if (delightFeedbackInFlight) return;
         delightFeedbackInFlight = true;
         syncDelightControlAvailability();
-        if (openUrl) window.open(url, "_blank", "noopener,noreferrer");
+        if (openUrl) {
+          const opened = window.open(url, "_blank", "noopener,noreferrer");
+          if (opened) opened.opener = null;
+        }
         const status = $("#delightStatus");
         if (status) status.textContent = "原文已打开，正在记录这次主动选择…";
         let clickRecorded = false;
@@ -12691,7 +12860,7 @@ ${cardFeedbackBarHtml()}`;
       const delightBody = decodeHtmlEntities(item.body_text ?? "");
       const delightCt = canonical.content_type.toLowerCase();
       const derivedTitle = displayRecommendationTitle(
-        decodeHtmlEntities(item.title ?? ""), delightBody, delightCt);
+        decodeHtmlEntities(item.display_title ?? item.title ?? ""), delightBody, delightCt, canonical.source_platform);
       return {
         type: "delight",
         id: item.recommendation_id ?? item.id ?? null,
@@ -12706,7 +12875,9 @@ ${cardFeedbackBarHtml()}`;
         body_text: delightBody,
         reason: decodeHtmlEntities(item.delight_reason ?? item.reason ?? item.delight_hook ?? item.message ?? "这条来自后端高惊喜分候选。"),
         cover_url: normalizeImageUrl(item.cover_url ?? item.cover ?? item.pic ?? item.thumbnail_url ?? item.thumbnail ?? item.image_url),
-        content_url: canonical.content_url || String(item.canonical_url || ""),
+        content_url: String(item.original_url || "") || canonical.content_url || String(item.canonical_url || ""),
+        source_link_status: String(item.source_link_status ?? "").trim().toLowerCase(),
+        source_lookup_url: String(item.source_lookup_url ?? "").trim(),
         source_platform: canonical.source_platform,
         platform: canonical.source_platform,
         chat_turn_id: String(item.chat_turn_id ?? ""),
@@ -12953,15 +13124,18 @@ ${cardFeedbackBarHtml()}`;
       const count = state.delights.length;
       const hasItem = Boolean(state.delight);
       const busy = delightFeedbackInFlight;
-      const safeUrl = hasItem ? delightContentUrl(state.delight) : "";
+      const sourceLink = delightSourceLink(state.delight);
       document.querySelectorAll('[data-delight="prev"], [data-delight="next"]').forEach((button) => {
         button.disabled = busy || count <= 1;
       });
       const view = document.querySelector('[data-delight="view"]');
       if (view) {
-        view.disabled = busy || !safeUrl;
+        view.textContent = sourceLink.label;
+        view.dataset.sourceLinkState = sourceLink.state;
+        view.disabled = busy || sourceLink.state === "missing";
         view.setAttribute("aria-disabled", view.disabled ? "true" : "false");
-        view.title = safeUrl ? "阅读安全的原文链接" : "后端没有返回 HTTP(S) 原文链接";
+        view.title = sourceLink.explanation;
+        view.setAttribute("aria-label", `${sourceLink.statusLabel}，${sourceLink.label}`);
       }
       const liked = state.delight?.state === "liked";
       document.querySelectorAll('[data-delight="like"], [data-delight="dislike"], [data-delight="dismiss"], [data-delight="chat"], [data-delight="watch-later"], [data-delight="favorite"]').forEach((button) => {
@@ -14692,19 +14866,26 @@ ${cardFeedbackBarHtml()}`;
     safeBind("#loadMoreBtn", "click", appendMore);
     ensureDelightThumbAnchor();
     safeBind("#delightThumb", "click", (event) => {
-      if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();
+      const sourceLink = delightSourceLink(state.delight);
+      if (delightFeedbackInFlight || sourceLink.state !== "exact") {
+        event.preventDefault();
+        return;
+      }
       void respondDelight(state.delight, "view");
     });
     safeBind("#delightThumb", "auxclick", (event) => {
       if (event.button !== 1) return;
-      if (delightFeedbackInFlight || !delightContentUrl(state.delight)) event.preventDefault();
+      const sourceLink = delightSourceLink(state.delight);
+      if (delightFeedbackInFlight || sourceLink.state !== "exact") {
+        event.preventDefault();
+        return;
+      }
       void respondDelight(state.delight, "view");
     });
     safeBind("#delightThumb", "keydown", (event) => {
       if (event.currentTarget?.getAttribute("href")) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
-      respondDelight(state.delight, "view");
     });
     safeBind("#delightCommentInput", "keydown", (event) => {
       if (event.key === "Enter") respondDelight(state.delight, "send-comment");

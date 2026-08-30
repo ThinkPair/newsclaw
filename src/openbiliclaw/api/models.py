@@ -261,6 +261,14 @@ class RecommendationOut(BaseModel):
     media: str | None = None
     publisher_name: str | None = None
     technical_provider: str | None = None
+    # ``title`` remains the canonical provider value for audit/history.  The
+    # display alias removes only deterministic provider boilerplate such as
+    # ``【headline】lead paragraph``.
+    display_title: str | None = None
+    # ``exact`` means the source supplied a safe HTTP(S) address. ``search`` is
+    # an explicitly labelled lookup route, never an asserted original link.
+    source_link_status: Literal["exact", "search", "missing"] | None = None
+    source_lookup_url: str | None = None
     # NewsClaw's first deterministic card-tag projection.  Optional fields are
     # omitted for non-news items so older multi-source clients retain the same
     # response shape.
@@ -752,6 +760,9 @@ class PendingNotificationOut(BaseModel):
     publisher_name: str | None = None
     technical_provider: str | None = None
     original_url: str | None = None
+    display_title: str | None = None
+    source_link_status: Literal["exact", "search", "missing"] | None = None
+    source_lookup_url: str | None = None
 
 
 class PendingNotificationResponse(BaseModel):
@@ -796,6 +807,9 @@ class PendingDelightOut(BaseModel):
     media: str | None = None
     publisher_name: str | None = None
     technical_provider: str | None = None
+    display_title: str | None = None
+    source_link_status: Literal["exact", "search", "missing"] | None = None
+    source_lookup_url: str | None = None
     topic_group: str | None = None
     franchise_key: str | None = None
     style_key: str | None = None

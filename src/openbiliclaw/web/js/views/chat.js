@@ -18,6 +18,7 @@ import {
   fetchPendingProbes,
   fetchPendingAvoidanceProbes,
   ackNotification,
+  reportClick,
   fetchDelightBatch,
   respondToDelight,
   markDelightSent,
@@ -47,6 +48,9 @@ import {
   getCoverImageAttrs,
   getSourceLabel,
   buildContentUrl,
+  getRecommendationSourceLink,
+  buildRecommendationClickPayload,
+  normalizeRecommendation,
 } from "../view-models.js";
 import { openContentUrl } from "../app-launch.js";
 import { state, patchState } from "../state.js";
@@ -108,6 +112,7 @@ let pendingConfirmations = {
 // Messages overlay state
 let overlayOpen = false;
 let notifications = [];
+let newsNotifications = [];
 let delightMsgs = [];
 const pendingProbeActions = new Map();
 
@@ -732,6 +737,33 @@ function renderOverlay() {
   header.appendChild(closeBtn);
   panel.appendChild(header);
 
+  // High-confidence news notifications. Source navigation remains truthful:
+  // only exact URLs consume the notification as viewed, while a title search
+  // is a reversible lookup and leaves the notification pending.
+  for (const n of newsNotifications) {
+    const sourceLink = getRecommendationSourceLink(n);
+    const card = document.createElement("div");
+    card.className = "message-card is-news-notification";
+    card.dataset.notificationBvid = n.bvid;
+    const sourceAction = sourceLink.state === "missing"
+      ? `<button type="button" class="message-action-btn primary" data-news-notification="missing" data-source-link-state="missing" disabled aria-disabled="true">${esc(sourceLink.label)}</button>`
+      : `<button type="button" class="message-action-btn primary" data-news-notification="${esc(sourceLink.state === "exact" ? "view" : "search")}" data-source-link-state="${esc(sourceLink.state)}">${esc(sourceLink.label)}</button>`;
+    card.innerHTML = `
+      <div class="message-card-type">待通知候选</div>
+      <div class="message-card-title">${esc(n.title)}</div>
+      <div class="message-card-body">${esc(n.reason || "这条推荐达到了通知阈值。")}</div>
+      <div class="message-card-actions">
+        <button type="button" class="message-action-btn secondary" data-news-notification="dismiss">标记已通知</button>
+        ${sourceAction}
+      </div>`;
+    card.querySelectorAll("[data-news-notification]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void handleNewsNotificationAction(n, button.dataset.newsNotification, card);
+      });
+    });
+    panel.appendChild(card);
+  }
+
   // Probe notifications
   for (const n of notifications) {
     const domain = n.domain || n.title || "";
@@ -765,7 +797,7 @@ function renderOverlay() {
     panel.appendChild(card);
   }
 
-  if (notifications.length === 0) {
+  if (newsNotifications.length === 0 && notifications.length === 0) {
     const emptyState = document.createElement("div");
     emptyState.className = "messages-empty-state";
     emptyState.innerHTML = `
@@ -881,10 +913,35 @@ function renderOverlay() {
   }
 }
 
+async function handleNewsNotificationAction(item, action, card) {
+  const sourceLink = getRecommendationSourceLink(item);
+  if (action === "search") {
+    if (sourceLink.state === "search" && sourceLink.url) openContentUrl(sourceLink.url);
+    return;
+  }
+  if (action === "missing") return;
+  if (action === "view") {
+    if (sourceLink.state !== "exact" || !sourceLink.url) return;
+    openContentUrl(sourceLink.url);
+    void reportClick(buildRecommendationClickPayload(item, sourceLink.url)).catch(() => {});
+  }
+  card?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  try {
+    await ackNotification(item.bvid);
+    newsNotifications = newsNotifications.filter((candidate) => candidate.bvid !== item.bvid);
+    updateBadgeCount();
+    renderOverlay();
+  } catch {
+    card?.querySelectorAll("button").forEach((button) => {
+      button.disabled = button.dataset.newsNotification === "missing";
+    });
+  }
+}
+
 function updateBadgeCount() {
-  const msgs = { notifications: [...notifications], delights: [] };
+  const msgs = { notifications: [...newsNotifications, ...notifications], delights: [] };
   patchState({ messages: msgs });
-  setUnreadCount(notifications.length);
+  setUnreadCount(newsNotifications.length + notifications.length);
 }
 
 // ── Load ─────────────────────────────────────────────────────
@@ -983,7 +1040,7 @@ async function refreshAfterChatTurn() {
 export async function loadNotifications({ includeDelights = false } = {}) {
   try {
     const [notifData, probeData, avoidanceProbeData, delightData] = await Promise.all([
-      fetchPendingNotifications().catch(() => ({})),
+      fetchPendingNotifications().catch(() => null),
       fetchPendingProbes().catch(() => []),
       fetchPendingAvoidanceProbes().catch(() => []),
       includeDelights ? fetchDelightBatch().catch(() => []) : Promise.resolve(delightMsgs),
@@ -996,6 +1053,23 @@ export async function loadNotifications({ includeDelights = false } = {}) {
         : []),
     ];
     notifications = mergeProbeNotifications(probes, notifications);
+    if (notifData !== null) {
+      const pendingNews = notifData?.item;
+      newsNotifications = pendingNews
+        ? [{
+            ...normalizeRecommendation({
+              ...pendingNews,
+              id: pendingNews.recommendation_id,
+              content_id: pendingNews.article_id || pendingNews.content_id || pendingNews.bvid,
+              source_platform: pendingNews.source_platform || "news",
+            }),
+            recommendation_id: Number(pendingNews.recommendation_id ?? 0) || null,
+            bvid: String(pendingNews.bvid || pendingNews.article_id || ""),
+            title: String(pendingNews.display_title || pendingNews.title || "有一条值得通知你的推荐"),
+            reason: String(pendingNews.reason || "这条推荐达到了通知阈值。"),
+          }]
+        : [];
+    }
     if (includeDelights) {
       delightMsgs = normalizeNewsDelightCandidates(delightData);
     }

@@ -135,7 +135,8 @@ class TestMobileWebViewModels:
 
             const required = [
               "buildVideoUrl", "buildYouTubeUrl", "buildTwitterUrl",
-              "buildContentUrl", "buildRecommendationClickPayload",
+              "normalizeHttpContentUrl", "buildContentUrl", "getRecommendationSourceLink",
+              "buildRecommendationClickPayload",
               "normalizeRecommendation", "normalizeDelightCandidate",
               "getDelightUiState", "getDelightActionState",
               "buildFeedbackPayload", "validateCommentInput", "getCommentSubmitUiState",

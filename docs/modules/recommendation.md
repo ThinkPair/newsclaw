@@ -24,6 +24,19 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 移除，待确认或已拒绝候选也不会参与排序、评估或文案。删除研究方向后，下一次对应
 调用立即失效。普通 OpenBiliClaw 模式完全保留原画像摘要与推荐行为，也不会读取 P4 表。
 
+### NewsClaw 事实级展示去重
+
+仅在 `NEWSCLAW_MODE=1` 且请求范围属于新闻时，`RecommendationEngine` 在候选排序、
+选择和推荐历史写入之前调用 `news.presentation.news_display_duplicate_key()`。该跨模块
+只读投影使用同媒体、同发布日期、精简标题、规范化导语、完整规范化正文和安全原文
+URL 组成事实指纹；规范化只做 NFKC、大小写和空白折叠，保留小数点、百分号、正负号、
+币种等事实符号。正文为空、原文 URL 不同，或正文任意位置发生变化时不合并。
+
+引擎用最近 1000 条推荐历史防止相同事实换 ID 后跨批次重现，并把新闻候选读取窗口
+有界扩大到至少 80 条，避免去重后换批/追加突然变短。该步骤不删除或改写
+`content_cache` 原始证据；普通 OpenBiliClaw 来源不进入此路径。API 仍在最终输出层保留
+同一保守规则作为防御，并以最终可见列表记录批次事件和触发补货。
+
 ## 已实现功能
 
 | 任务 | 状态 | 说明 |
@@ -32,6 +45,7 @@ runtime 使用公开 `drain_pending_expression_copy(profile, limit<=60, max_extr
 | 6.1 推荐排序 | ✅ | 从 `content_cache` 选未推荐内容、按分数排序、以 canonical `item_key` 写入推荐历史 |
 | 6.2 朋友式推荐表达 | ✅ | 用 LLM 生成朋友式推荐理由和个性化 topic，并在 CLI 中真实展示；`recommendation.*` 的分类和短文案调用在未显式指定时统一用 `reasoning_effort=""`，避免 DeepSeek thinking 拉长文案回填 |
 | 6.3 推荐持久化 | ✅ | 推荐记录已补齐展示状态、结构化反馈字段和反馈更新时间 |
+| NewsClaw 事实级展示去重 | ✅ | 新闻候选在选择和推荐历史写入前复用 `news.presentation` 的完整事实指纹，跨批历史防重并扩大有界候选窗口；只抑制完全相同的卡片，空正文、不同 URL 和任何事实变化均保留，原始证据不删除 |
 | 候选排序统一 | ✅ | freshly discovered 与 cache backfill 现在共享同一套 tier / relevance / recency 排序口径 |
 | 9.1 反馈处理 | ✅ | CLI、本地 API、插件 popup 与移动 Web 已统一写回推荐反馈与 `feedback` 事件；推荐点击会携带 `content_id / content_url / source_platform`，跨源内容不会被记成 B 站点击；推荐反馈事件同样保留候选真实 `source_platform`，旧记录缺来源时兼容回退 `bilibili` |
 | 9.2 画像更新 | ✅ | 反馈累计到阈值后会自动触发偏好层重分析与画像重建 |

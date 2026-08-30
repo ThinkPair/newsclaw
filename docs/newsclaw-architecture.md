@@ -90,6 +90,22 @@ The inherited column names are private schema aliases, not video-domain
 semantics. The action-level persistence and replay contract is recorded in
 [the backend closure matrix](newsclaw-backend-closure-matrix.md).
 
+The recommendation API adds a non-canonical presentation layer without
+rewriting that evidence: `display_title` removes only a bounded, substantial
+`【title】lead`/`[title]lead` provider shape (short section-tag prefixes remain
+intact), while `source_link_status` distinguishes an
+exact provider URL from a title-search fallback or a completely missing
+navigation path. Tushare `news` and `major_news` do not promise URL fields, so
+their empty `canonical_url` remains empty. A generated `source_lookup_url` is a
+user-initiated media-plus-title search route, not evidence and not an asserted
+original; missing media or title yields no ambiguous fallback.
+Before the 20-card NewsClaw view limit is applied, a conservative presentation
+dedupe folds only rows from the same media and publication day whose compact
+headline, dateline-normalized lead, complete normalized body and exact URL match
+after removing a calendar-year formatting variant. Empty-body rows, changed
+lead/body facts, different URLs, media or dates remain visible, and the durable
+rows are never deleted.
+
 ## Source contracts
 
 Each source has a durable status record containing enablement, configured

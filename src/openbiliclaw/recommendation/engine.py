@@ -40,6 +40,7 @@ from openbiliclaw.llm.json_utils import (
 from openbiliclaw.llm.news_prompts import newsclaw_mode_enabled
 from openbiliclaw.llm.prompt_cache import PromptLayerRenderCache, profile_prompt_layers
 from openbiliclaw.llm.task_options import without_core_memory_kwargs
+from openbiliclaw.news.presentation import NewsDisplayDuplicateKey, news_display_duplicate_key
 from openbiliclaw.saved_sync.identity import content_storage_key
 from openbiliclaw.soul.tone import ToneProfile, build_tone_profile
 from openbiliclaw.sources.platforms import normalize_source_platform, source_family
@@ -825,6 +826,14 @@ class RecommendationEngine:
         scope = normalize_source_platform(source_platform)
         multiplier = 4 if excluded_bvids else 3
         candidate_limit = max(limit * multiplier, 40) + len(excluded_bvids)
+        if newsclaw_mode_enabled() and scope in {"", "news"}:
+            # News providers commonly publish repeated dispatch variants. Load
+            # a wider bounded window so removing fact-identical cards before
+            # ranking does not make a ten-card request appear half empty.
+            candidate_limit = max(
+                candidate_limit,
+                max(limit * 8, 80) + len(excluded_bvids),
+            )
         pool_snapshot_started = time.perf_counter()
         snapshot_loader = getattr(self._database, "load_pool_serve_snapshot_async", None)
         curator_snapshot: tuple[list[dict[str, object]], list[dict[str, object]]] | None = None
@@ -895,13 +904,25 @@ class RecommendationEngine:
         before_temporal_count = len(candidates)
         candidates = self._exclude_temporally_stale_candidates_for_serve(candidates)
         after_temporal_count = len(candidates)
-        after_viewed_count = after_temporal_count
         if after_temporal_count < before_temporal_count:
             logger.info(
                 "serve(/%s) filtered %d temporally stale candidate(s) at the final "
                 "in-memory read boundary",
                 label,
                 before_temporal_count - after_temporal_count,
+            )
+        before_display_dedup_count = len(candidates)
+        candidates = await asyncio.to_thread(
+            self._exclude_news_display_duplicates_for_serve,
+            candidates,
+        )
+        after_viewed_count = len(candidates)
+        if len(candidates) < before_display_dedup_count:
+            logger.info(
+                "serve(/%s) suppressed %d fact-identical news card(s) before "
+                "ranking and persistence",
+                label,
+                before_display_dedup_count - len(candidates),
             )
         pool_snapshot_ms = (time.perf_counter() - pool_snapshot_started) * 1000.0
         servable_pool_count = pool_readiness["available"]
@@ -5617,6 +5638,47 @@ class RecommendationEngine:
         if not viewed_bvids:
             return candidates
         return [item for item in candidates if item.bvid not in viewed_bvids]
+
+    def _exclude_news_display_duplicates_for_serve(
+        self,
+        candidates: list[DiscoveredContent],
+    ) -> list[DiscoveredContent]:
+        """Suppress fact-identical NewsClaw cards before selection and writes.
+
+        Previously served identities seed ``seen`` so a provider variant cannot
+        reappear on a later reshuffle under a different article ID.  The helper
+        is display-only: it neither deletes nor rewrites canonical content rows.
+        Any unsupported history adapter fails open, preserving legacy serving.
+        """
+
+        if not newsclaw_mode_enabled():
+            return candidates
+
+        seen: set[NewsDisplayDuplicateKey] = set()
+        get_history = getattr(self._database, "get_recommendations", None)
+        if callable(get_history):
+            try:
+                history_rows = get_history(limit=1000)
+            except Exception:
+                logger.debug(
+                    "news display dedupe: recommendation history lookup failed",
+                    exc_info=True,
+                )
+            else:
+                for row in history_rows:
+                    key = news_display_duplicate_key(row)
+                    if key is not None:
+                        seen.add(key)
+
+        kept: list[DiscoveredContent] = []
+        for item in candidates:
+            key = news_display_duplicate_key(item)
+            if key is not None and key in seen:
+                continue
+            kept.append(item)
+            if key is not None:
+                seen.add(key)
+        return kept
 
     @classmethod
     def _exclude_disliked_topic_candidates(

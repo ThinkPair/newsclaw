@@ -119,7 +119,8 @@ buttons and never hold the key.
 ## Data flow
 
 ```text
-Tushare / RSS → news evidence → normalized, deduplicated local batch → evaluation/ranking → workbench
+Tushare / RSS → news evidence → normalized local batch → evaluation/ranking → fact-identical display suppression → workbench
+                                      └→ compact title + exact/search/missing source state; canonical evidence stays intact
                                       └→ Beijing-today news → scoped queue + bounded daily budget
                                                                → copy-ready → protected reconciliation → Today Pick
                                       │

@@ -11,15 +11,15 @@
 | 关于新闻爪 | `bindAboutButton` | 无 | 前端弹层 | 显示独立产品说明 | 缺 DOM 时进入 fatal 状态 | 闭环；无上游 GitHub 业务跳转 |
 | 主题、色相、强调色、回到顶部 | `cycle/setTheme*` / `initBackToTop` | 无 | `localStorage` + DOM | 立即换肤 / 滚动 | 非法色相夹到 0–360 | 闭环 |
 | 手机二维码、复制链接 | `openMobileQrDrawer` / clipboard handler | `GET /api/qr-info` | 不落库；只保存已看入口标记 | 仅非 loopback 且后端报告 LAN 可用时生成二维码并启用复制 | `127.0.0.1` 监听、状态读取失败或仍是 loopback 时禁用复制并明示说明 | 闭环；正式启动当前不宣称手机可直连 |
-| 消息、待聊、后台动态、加载更多 | `renderMessages` / `refreshDesktopPendingConfirmations` / `loadActivityPage` | `GET /notifications/pending`、`/chat/pending-confirmations`、`/activity-feed` | 服务端消息 / 对话 / 活动记录 | 徽标、列表和分页更新 | 保留旧列表并显示重试 / toast | 闭环 |
+| 消息、待聊、后台动态、加载更多 | `renderMessages` / `respondNotification` / `refreshDesktopPendingConfirmations` / `loadActivityPage` | `GET /notifications/pending`、`POST /notifications/sent`、`/chat/pending-confirmations`、`/activity-feed` | 服务端消息 / 对话 / 活动记录 | 待通知新闻按 `exact/search/missing` 显示“阅读原文 / 检索来源 / 暂无原文”；精确原文才写点击并确认，检索只导航，手工标记可单独确认 | 确认失败保留当前卡片和抽屉快照并提示重试；刷新失败不清空旧列表 | 闭环 |
 | 换一批、继续加载、失败后重新加载 | `reshuffle` / `appendMore` / `restartDesktopFailedRecoveries` | `POST /recommendations/reshuffle`、`/append`；`GET /recommendations` | 推荐池 / 前端卡片 | 替换 / 追加；空结果保留现有卡片 | 空池、补货中和请求失败分别提示 | 闭环；NewsClaw 后端强制 `source_platform=news` |
-| 推荐卡“阅读原文” / 配图 | `openRecommendation` / `trackRecommendationClick` | `POST /recommendation-click` | 点击事件落库，作为弱学习信号 | 原链接在新窗口打开，状态行显示已记录 | 无 URL 明示提示；事件失败不阻断外链 | 闭环 |
+| 推荐详情“阅读原文 / 检索来源 / 暂无原文” | `recordOriginalOpen` / `recordSourceSearch` | 精确原文才 `POST /recommendation-click`；检索无写接口 | 精确原文点击作为弱学习信号；检索不写点击、已读、画像或原文证据 | 来源有精确 URL 时直接打开；Tushare 未给 URL 时按“媒体 + 精简标题”打开外部检索并持续提示仍需核验 | 媒体或标题不足时禁用“暂无原文”；精确点击记录失败不阻断外链 | 闭环；`exact/search/missing` 三态不混淆 |
 | 推荐卡喜欢 / 不感兴趣 / 忽略 / 撤销 | `stageRecommendationFeedback` | `POST /feedback` | 幂等 `request_id`，反馈落库并参与画像 | 10 秒可撤销，提交后明示结果 | 回滚按钮和文案，保留当前卡片 | 闭环 |
 | 推荐卡“聊一聊”、发送 / 取消 | `handleCardAction` | `POST /feedback` (`comment`) | 评论线索落库并参与学习 | 状态行 + toast | 草稿恢复，状态行显示原因 | 闭环 |
 | 推荐卡 / 惊喜卡收藏、稍后读、取消 | `desktopSavedMutations.toggle` | `POST /saved/favorite|watch_later`、`/remove` | 本机会员表；news 强制 `local_only_source`，清空旧 sync task 回显 | 按钮状态与“已保存 / 移除到本机” | 按钮回滚，状态行显示失败 | 闭环；不写画像，不同步媒体账号 |
 | 惊喜上 / 下一条、展开摘要 | `setActiveDelight` / excerpt toggle | 无（已加载队列） | 前端索引 / DOM | 卡片和 `x/y` 更新 | 空队列不执行 | 闭环 |
 | 今日首选刷新 | `refreshTodayPick` / 今日队列串行读取 | `GET /api/delight/pending-batch`、`POST /api/delight/trigger` | 北京时间今日 `news` 范围、持久评估预算和后端队列真值 | ready 时替换今日队列；processing/empty/degraded 分别回显 | 保留已加载内容，不用旧闻伪装成功；重叠点击共享最新结果 | 闭环 |
-| 惊喜阅读、喜欢、不感兴趣、看过 / 忽略 | `respondDelight` | `POST /delight/respond`；阅读同时 `/recommendation-click` | 惊喜响应和点击事件落库 | 状态行 / toast，已处理项出队 | 未成功时保留项并显示错误 | 闭环 |
+| 惊喜阅读、来源检索、喜欢、不感兴趣、看过 / 忽略 | `respondDelight` | 精确阅读才 `POST /delight/respond` 与 `/recommendation-click`；来源检索无写接口 | 精确阅读、惊喜响应和点击事件落库；检索不写点击或消费状态 | `exact/search/missing` 显示“阅读原文 / 检索来源 / 暂无原文”，已处理项出队 | 检索只导航且保留当前项；缺失入口禁用；写入未成功时保留并显示错误 | 闭环 |
 | 惊喜“聊一聊” / 发送 | `respondDelight(send-comment)` | `POST /chat/turns`、`GET /chat/turns/{id}` | 对话 turn 落库 | pending → completed 回复 | 草稿恢复、failed / 超时文案 | 闭环 |
 | 内容库稍后读 / 收藏 / 历史 tab，刷新、加载、重试 | `openContentLibraryPage`、`refresh*`、`loadContentHistoryPage` | `GET /saved/{kind}`、`GET /content-history` | 服务端本地会员 / 30 天历史 | 计数、列表、分页回显 | 保留已加载项并提供重试 | 闭环 |
 | 内容库打开、移除、恢复、喜欢 / 不感兴趣 / 聊一聊、交叉收藏 | 卡片事件委托 | `/recommendation-click`、`/saved/*`、`/events` | 打开 / 反馈 / 本机会员分别落库 | 卡片就地更新 | 恢复按钮 / 状态行 / toast | 闭环；news 不显示原生平台同步动作 |
@@ -39,10 +39,10 @@
 | 可见控件 | 事件处理 | API | 持久化 / 状态 | 成功回显 | 失败回显 | 结论 |
 |---|---|---|---|---|---|---|
 | 底栏推荐 / 内容库 / 画像 / 对话，内容库三 tab | hash router / `navigateToTab` | 每 view 读对应 API | hash + view state | 选中态、焦点、返回历史同步 | 子 view 显示重试 | 闭环 |
-| 消息铃、探测回答、打开待聊 | `toggleMessages` 及委托 | `/notifications/*`、`/interest-probes/respond`、`/avoidance-probes/respond`、`/chat/*` | 消息 / 探测 / 对话落库 | 徽标、卡片、对话同步 | 卡片保留并显示失败 | 闭环 |
+| 消息铃、待通知新闻、探测回答、打开待聊 | `toggleMessages` / `handleNewsNotificationAction` 及委托 | `/notifications/*`、`/interest-probes/respond`、`/avoidance-probes/respond`、`/chat/*` | 精确原文阅读或手工标记后确认通知；检索不写点击或已读 | 待通知新闻按 `exact/search/missing` 显示“阅读原文 / 检索来源 / 暂无原文”，徽标、卡片、对话同步 | 确认失败保留卡片；通知刷新失败保留旧项；缺失入口禁用 | 闭环 |
 | 新闻源设置、关闭、验证、立即刷新 | `openMobileSettings` | `GET /news/sources`、`POST /news/sources/probe|refresh` | 健康 / 刷新任务 | 每媒体健康、最后成功、错误 | 离线 / 降级不清空已有内容 | 闭环；手机端为只读来源卡 + 真实任务 |
 | 换一批、追加、下拉 / 失败重试、惊喜上下条 | recommend handlers | `/recommendations*`、`/delight/*` | 推荐池 / 前端队列 | 卡片替换 / 追加 | 保留已加载内容、明示重试 | 闭环 |
-| 打开原文、喜欢 / 不感兴趣 / 忽略 / 评论 | recommendation / feedback handlers | `/recommendation-click`、`/feedback`、`/events` | 点击 / 反馈事件落库 | 卡片状态与 toast | 回滚、草稿保留、重试 | 闭环 |
+| 阅读原文、检索来源、喜欢 / 不感兴趣 / 忽略 / 评论 | recommendation / feedback handlers | 精确原文才 `/recommendation-click`；检索无写接口；反馈使用 `/feedback`、`/events` | 精确原文点击 / 反馈事件落库；检索不写点击、已读或画像 | `exact/search/missing` 三态与卡片状态、toast 一致 | 缺失入口禁用；反馈回滚、草稿保留、重试 | 闭环 |
 | 收藏 / 稍后读 / 移除 / 交叉收藏 | saved handlers | `/saved/{kind}`、`/remove`、`/status` | 本机会员；强制 `unsupported/local_only_source` | “仅保存在本机新闻爪” | 保留卡片并显示失败 | 闭环；旧 sync task 字段被清空，不会恢复平台任务 |
 | 历史刷新 / 重试 / 加载 / 打开 / 恢复 | history handlers | `/content-history`、`/saved/*` | 30 天历史 / 本机会员 | 分页、恢复状态 | 局部重试 | 闭环 |
 | 画像编辑全部按钮、认知加载更多、探测回答 | profile handlers | `/profile-summary`、`/profile-edit-state`、`/profile-edit`、probe API | 画像落库 | 重读真值 | 保留编辑面并提供重试 | 闭环 |
