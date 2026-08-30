@@ -2965,7 +2965,13 @@
 .workbench-view-tabs button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .workbench-toolbar .recommendation-actions { display: flex; gap: 6px; }
 .workbench-toolbar .recommendation-actions .icon-btn { width: 38px; height: 38px; }
-.workbench-toolbar #reshuffleBtn[aria-disabled="true"] { opacity: .55; }
+.workbench-toolbar #reshuffleBtn[aria-disabled="true"],
+.workbench-toolbar #todayRefreshBtn[aria-disabled="true"] { opacity: .55; }
+.workbench-toolbar #todayRefreshBtn.is-loading { animation: today-refresh-spin .9s linear infinite; }
+@keyframes today-refresh-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .workbench-toolbar #todayRefreshBtn.is-loading { animation: none; }
+}
 .workbench-panel[hidden] { display: none !important; }
 .judgment-workbench .recommendation-filter-controls {
   margin: 0 0 10px;

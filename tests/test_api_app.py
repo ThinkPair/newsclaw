@@ -12070,6 +12070,7 @@ class TestBackendAPI:
                 "title": "News article",
                 "delight_score": 0.98,
                 "source_platform": "news",
+                "published_at": datetime.now(UTC).isoformat(),
             },
         ]
 

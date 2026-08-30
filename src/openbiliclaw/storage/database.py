@@ -29161,6 +29161,8 @@ class Database:
         min_delight_score: float = 0.85,
         limit: int = 20,
         include_liked: bool = False,
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Return up to ``limit`` un-notified delight candidates ordered by score.
 
@@ -29185,6 +29187,11 @@ class Database:
         positive feedback must not remove the card (v0.3.63 contract). New
         delivery paths (WS push, counts, CLI) keep the default False so an
         already-liked item is never re-pushed as a fresh surprise.
+
+        ``published_after`` / ``published_before`` are optional UTC ISO-8601
+        bounds applied in SQL before ordering and limiting.  NewsClaw uses
+        them to make its "today" queue a real calendar-day contract instead
+        of filtering a score-sorted historical page after the fact.
         """
         feedback_clause = (
             "COALESCE(feedback_type, '') IN ('', 'like')"
@@ -29192,6 +29199,19 @@ class Database:
             else "COALESCE(feedback_type, '') = ''"
         )
         admission_sql, admission_params = self._pool_admission_sql()
+        publication_clauses: list[str] = []
+        publication_params: list[str] = []
+        if published_after:
+            publication_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
+            )
+            publication_params.append(published_after)
+        if published_before:
+            publication_clauses.append(
+                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
+            )
+            publication_params.append(published_before)
+        publication_sql = "\n              ".join(publication_clauses)
         cursor = self.conn.execute(
             f"""
             SELECT *
@@ -29206,10 +29226,11 @@ class Database:
                   TRIM(COALESCE(pool_topic_label, ''))
               AND {feedback_clause}
               AND COALESCE(pool_status, 'fresh') IN ('fresh', 'shown')
+              {publication_sql}
               {_delight_unseen_guard_sql()}
             ORDER BY delight_score DESC, relevance_score DESC, discovered_at DESC
             """,
-            (min_delight_score, *admission_params),
+            (min_delight_score, *admission_params, *publication_params),
         )
         temporal_now = datetime.now(UTC)
         rows = [

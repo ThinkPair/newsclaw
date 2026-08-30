@@ -119,6 +119,8 @@
       delight: null,
       delightLoadState: "loading",
       delightLoadError: "",
+      delightPendingCount: 0,
+      delightLastRefreshAt: "",
       degraded: false,
       newsclawMode: null,
       config: null,
@@ -830,6 +832,23 @@
       return String(candidate?.source_platform ?? "").trim().toLowerCase() === NEWS_DELIGHT_PLATFORM;
     }
 
+    function chinaDateKey(value = Date.now()) {
+      const date = value instanceof Date ? value : new Date(value);
+      if (!Number.isFinite(date.getTime())) return "";
+      // China Standard Time is fixed UTC+8 and has no daylight-saving shift.
+      return new Date(date.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    }
+
+    function isTodayNewsDelightItem(item, now = Date.now()) {
+      if (!isNewsDelightItem(item)) return false;
+      const candidate = item?.data && typeof item.data === "object" ? item.data : item;
+      const published = new Date(String(candidate?.published_at || ""));
+      const current = now instanceof Date ? now : new Date(now);
+      if (!Number.isFinite(published.getTime()) || !Number.isFinite(current.getTime())) return false;
+      if (published.getTime() > current.getTime() + 5 * 60 * 1000) return false;
+      return chinaDateKey(published) === chinaDateKey(current);
+    }
+
     function sanitizeLegacyDelightPayload(value, { delightScope = false } = {}) {
       if (Array.isArray(value)) {
         if (!delightScope) return { value, changed: false };
@@ -1047,6 +1066,11 @@
     let autoLoadCooldownTimer = 0;
     let appendMoreInFlight = false;
     let reshuffleInFlight = false;
+    let todayRefreshInFlight = false;
+    let delightQueueRequestGeneration = 0;
+    let todayQueuePollTimer = 0;
+    let todayQueuePollAttempts = 0;
+    let todayQueuePollDate = "";
     let lastAutoLoadAt = 0;
     let recommendationGridBottomReady = false;
     let recommendationGridScrollIntent = false;
@@ -6012,8 +6036,12 @@ ${savedCardFeedbackBarHtml(listKind)}
       const delightPanel = $("#delightWorkbenchPanel");
       const queueTab = $("#workbenchQueueTab");
       const delightTab = $("#workbenchDelightTab");
+      const reshuffleButton = $("#reshuffleBtn");
+      const todayRefreshButton = $("#todayRefreshBtn");
       if (queuePanel) queuePanel.hidden = next !== "recommendations";
       if (delightPanel) delightPanel.hidden = next !== "delight";
+      if (reshuffleButton) reshuffleButton.hidden = next !== "recommendations";
+      if (todayRefreshButton) todayRefreshButton.hidden = next !== "delight";
       [
         [queueTab, next === "recommendations"],
         [delightTab, next === "delight"],
@@ -6025,6 +6053,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       if (focus) (next === "delight" ? delightTab : queueTab)?.focus();
       if (next === "delight") {
         state.recommendationDetailSheetOpen = false;
+        syncTodayRefreshButton();
         _startDelightAutoAdvance();
       }
       else _stopDelightAutoAdvance();
@@ -12835,14 +12864,29 @@ ${cardFeedbackBarHtml()}`;
     function delightEmptyPresentation(loadState, errorMessage = "") {
       const loading = loadState === "loading";
       const failed = loadState === "failed";
+      const processing = loadState === "processing";
       return {
-        title: loading ? "正在读取今日首选" : failed ? "今日首选暂时不可用" : "今天还没有首选",
+        title: loading
+          ? "正在读取今日首选"
+          : processing
+            ? "今天的新材料正在分析"
+            : failed
+              ? "今日首选暂时不可用"
+              : "今天还没有首选",
         reason: loading
           ? "正在从本地后端读取首选，完成前不会把未知状态显示成空队列。"
+          : processing
+            ? "新闻已经抓到本机，正在完成去重、相关性判断和首选生成；不会用昨天的内容补位。"
           : failed
             ? (errorMessage || "读取失败，但这不代表今天没有值得关注的内容。")
             : "今天没有符合首选门槛的新内容；推荐队列仍可正常使用。",
-        status: failed ? "读取失败，可以重新读取。" : loading ? "正在读取…" : "队列为空。",
+        status: failed
+          ? "读取失败，可以重新读取。"
+          : loading
+            ? "正在读取…"
+            : processing
+              ? `正在分析${state.delightPendingCount > 0 ? ` ${state.delightPendingCount} 条候选` : "今日候选"}…`
+              : "队列为空。",
         role: failed ? "alert" : "status",
         retry: failed,
       };
@@ -12911,7 +12955,8 @@ ${cardFeedbackBarHtml()}`;
 
     function setActiveDelight(index = state.delightIndex) {
       const controls = Array.from(document.querySelectorAll("[data-delight]"));
-      const newsOnlyQueue = state.delights.filter(isNewsDelightItem);
+      const newsOnlyQueue = state.delights.filter(isNewsDelightItem)
+        .filter((item) => state.newsclawMode !== true || isTodayNewsDelightItem(item));
       if (newsOnlyQueue.length !== state.delights.length) {
         state.delights = newsOnlyQueue;
         state.delightIndex = Math.min(state.delightIndex, Math.max(0, newsOnlyQueue.length - 1));
@@ -13126,6 +13171,16 @@ ${cardFeedbackBarHtml()}`;
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) _stopDelightAutoAdvance();
         else if (_delightVisibilityObserver) {
+          if (state.newsclawMode === true) {
+            const activeIsToday = !state.delight || isTodayNewsDelightItem(state.delight);
+            const todayQueue = state.delights.filter(isTodayNewsDelightItem);
+            if (!activeIsToday || todayQueue.length !== state.delights.length) {
+              state.delights = todayQueue;
+              state.delightLoadState = "loading";
+              setActiveDelight(0);
+              void fetchDelightQueue();
+            }
+          }
           // 切回时检查 banner 是否在视口内
           const rect = banner.getBoundingClientRect();
           const inView = rect.top < window.innerHeight && rect.bottom > 0;
@@ -13138,8 +13193,20 @@ ${cardFeedbackBarHtml()}`;
       const hasQueuePayload = Array.isArray(payload?.items) || Boolean(payload?.item);
       if (!hasQueuePayload) return false;
       const items = Array.isArray(payload?.items) ? payload.items : payload.item ? [payload.item] : [];
-      const normalized = sortRecommendationsByPriority(items.map(normalizeDelight).filter(Boolean));
-      state.delightLoadState = normalized.length ? "ready" : "empty";
+      const normalized = sortRecommendationsByPriority(
+        items
+          .map(normalizeDelight)
+          .filter(Boolean)
+          .filter((item) => state.newsclawMode !== true || isTodayNewsDelightItem(item))
+      );
+      const backendState = String(payload?.state || "").trim().toLowerCase();
+      state.delightPendingCount = Math.max(0, Number(payload?.pending_count) || 0);
+      state.delightLastRefreshAt = String(payload?.last_refresh_at || "");
+      state.delightLoadState = normalized.length
+        ? "ready"
+        : backendState === "processing"
+          ? "processing"
+          : "empty";
       state.delightLoadError = "";
       const previousActiveBvid = String(state.delight?.bvid || "");
       const existingByBvid = new Map(state.delights.map((item) => [String(item.bvid || ""), item]));
@@ -13155,7 +13222,9 @@ ${cardFeedbackBarHtml()}`;
       const activePosition = previousActiveBvid
         ? state.delights.findIndex((item) => String(item.bvid || "") === previousActiveBvid)
         : -1;
-      if (delightUserEngaged() && state.delight) {
+      const activeStillBelongsToToday = state.newsclawMode !== true
+        || isTodayNewsDelightItem(state.delight);
+      if (delightUserEngaged() && state.delight && activeStillBelongsToToday) {
         // 打字中：只同步队列数据与计数。当前卡还在队列里就更新引用；即便已被
         // 后端消费 / 过期也保留 state.delight——发送必须落在用户正对着的这张卡上。
         if (activePosition >= 0) {
@@ -13219,15 +13288,31 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function fetchDelightQueue() {
-      state.delightLoadState = "loading";
+      const requestGeneration = ++delightQueueRequestGeneration;
+      if (state.delightLoadState !== "processing") state.delightLoadState = "loading";
       state.delightLoadError = "";
       if (!state.delights.length) setActiveDelight(0);
       try {
-        const payload = await requestJsonStrict(ENDPOINTS.delightBatch, { timeoutMs: 15000 });
+        const payload = await requestJsonStrict(ENDPOINTS.delightBatch, {
+          timeoutMs: 15000,
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        });
+        if (requestGeneration !== delightQueueRequestGeneration) return null;
         if (!applyDelights(payload)) throw new Error("今日首选响应格式不完整，请稍后重试。");
+        if (state.newsclawMode === true && String(payload?.state || "").toLowerCase() === "processing") {
+          scheduleTodayQueueProcessingPoll();
+        } else if (state.newsclawMode === true) {
+          stopTodayQueueProcessingPoll();
+        }
+        return payload;
       } catch (error) {
+        if (requestGeneration !== delightQueueRequestGeneration) return null;
         state.delightLoadState = "failed";
         state.delightLoadError = configErrorMessage(error?.details) || error?.message || "读取今日首选失败，请检查本地后端连接。";
+        state.delights = state.delights.filter((item) => (
+          state.newsclawMode !== true || isTodayNewsDelightItem(item)
+        ));
         if (!state.delights.length) setActiveDelight(0);
         else {
           const status = $("#delightStatus");
@@ -13237,6 +13322,131 @@ ${cardFeedbackBarHtml()}`;
           }
           syncDelightControlAvailability();
         }
+        return null;
+      }
+    }
+
+    function syncTodayRefreshButton() {
+      const button = $("#todayRefreshBtn");
+      if (!button) return;
+      button.disabled = todayRefreshInFlight;
+      button.classList.toggle("is-loading", todayRefreshInFlight);
+      button.setAttribute("aria-busy", todayRefreshInFlight ? "true" : "false");
+      button.setAttribute("aria-disabled", todayRefreshInFlight ? "true" : "false");
+      const label = todayRefreshInFlight ? "正在刷新今天新闻" : "刷新今天新闻";
+      button.setAttribute("aria-label", label);
+      button.title = label;
+    }
+
+    function stopTodayQueueProcessingPoll() {
+      if (todayQueuePollTimer) window.clearTimeout(todayQueuePollTimer);
+      todayQueuePollTimer = 0;
+      todayQueuePollAttempts = 0;
+      todayQueuePollDate = "";
+    }
+
+    function scheduleTodayQueueProcessingPoll({ reset = false } = {}) {
+      const currentDate = chinaDateKey();
+      if (reset || todayQueuePollDate !== currentDate) {
+        if (todayQueuePollTimer) window.clearTimeout(todayQueuePollTimer);
+        todayQueuePollTimer = 0;
+        todayQueuePollAttempts = 0;
+        todayQueuePollDate = currentDate;
+      }
+      if (todayQueuePollTimer || todayQueuePollAttempts >= 40) return;
+      todayQueuePollTimer = window.setTimeout(async () => {
+        todayQueuePollTimer = 0;
+        todayQueuePollAttempts += 1;
+        const payload = await fetchDelightQueue();
+        if (String(payload?.state || "").toLowerCase() !== "processing") {
+          stopTodayQueueProcessingPoll();
+        }
+      }, 15000);
+    }
+
+    function setTodayRefreshStatus(message, { error = false } = {}) {
+      const status = $("#delightStatus");
+      if (!status) return;
+      status.setAttribute("role", error ? "alert" : "status");
+      status.textContent = String(message || "");
+    }
+
+    async function refreshTodaySelection() {
+      if (todayRefreshInFlight) {
+        showToast("今天新闻正在刷新，请稍候。");
+        return;
+      }
+      todayRefreshInFlight = true;
+      syncTodayRefreshButton();
+      stopTodayQueueProcessingPoll();
+      state.delights = state.delights.filter(isTodayNewsDelightItem);
+      if (!state.delights.length) state.delightLoadState = "loading";
+      setActiveDelight(Math.min(state.delightIndex, Math.max(0, state.delights.length - 1)));
+      setTodayRefreshStatus("第一步：正在抓取今天的新闻…");
+
+      const requestId = globalThis.crypto?.randomUUID?.()
+        || `today-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      let sourceResult = null;
+      let sourceIssue = null;
+      let sourceAlreadyRunning = false;
+      try {
+        try {
+          sourceResult = await requestJsonStrict("/news/refresh", {
+            method: "POST",
+            timeoutMs: 120000,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: requestId, hours: 36, per_source_limit: 120 }),
+          });
+        } catch (error) {
+          if (error?.status === 409) sourceAlreadyRunning = true;
+          else sourceIssue = error;
+        }
+
+        if (sourceAlreadyRunning) {
+          setTodayRefreshStatus("后台已有刷新在进行，正在等待今天的首选生成…");
+        } else if (sourceIssue?.name === "TimeoutError") {
+          setTodayRefreshStatus("抓取请求仍可能在后台继续，正在读取本机已有的今天结果…");
+        } else if (sourceIssue) {
+          setTodayRefreshStatus("抓取今天新闻失败，正在检查本机是否已有可用结果…", { error: true });
+        } else {
+          const articleCount = Math.max(0, Number(sourceResult?.article_count) || 0);
+          setTodayRefreshStatus(`第二步：已抓取 ${articleCount} 条，正在生成今日首选…`);
+        }
+
+        const payload = await fetchDelightQueue();
+        if (!payload) {
+          throw sourceIssue || new Error("读取今日首选失败，请检查本地后端连接。");
+        }
+        const count = state.delights.length;
+        if (count) {
+          const message = `已更新：今天有 ${count} 条首选。`;
+          setTodayRefreshStatus(message);
+          showToast(message);
+          stopTodayQueueProcessingPoll();
+        } else if (String(payload.state || "").toLowerCase() === "processing") {
+          const pending = Math.max(0, Number(payload.pending_count) || 0);
+          const message = `抓取已完成，正在分析${pending ? ` ${pending} 条候选` : "今天的新材料"}；不会用旧闻补位。`;
+          setTodayRefreshStatus(message);
+          showToast("今天新闻已抓取，正在生成首选");
+          scheduleTodayQueueProcessingPoll({ reset: true });
+        } else if (sourceIssue) {
+          const message = sourceIssue?.name === "TimeoutError"
+            ? "刷新结果仍未知，后台可能继续运行；今天暂时还没有可展示的首选。"
+            : `刷新失败：${sourceIssue?.message || "请稍后重试"}`;
+          setTodayRefreshStatus(message, { error: true });
+          showToast(message);
+        } else {
+          const message = "已刷新：今天暂时没有达到首选门槛的新内容。";
+          setTodayRefreshStatus(message);
+          showToast(message);
+        }
+      } catch (error) {
+        const message = error?.message || "刷新今天新闻失败，请稍后重试。";
+        setTodayRefreshStatus(message, { error: true });
+        showToast(message);
+      } finally {
+        todayRefreshInFlight = false;
+        syncTodayRefreshButton();
       }
     }
 
@@ -13325,7 +13535,7 @@ ${cardFeedbackBarHtml()}`;
       ) void refreshProfile();
       if (event.type === "delight.candidate" && event.bvid) {
         const delight = normalizeDelight(event);
-        if (delight) {
+        if (delight && (state.newsclawMode !== true || isTodayNewsDelightItem(delight))) {
           state.delightLoadState = "ready";
           state.delightLoadError = "";
           const key = String(delight.bvid || "");
@@ -14287,6 +14497,7 @@ ${cardFeedbackBarHtml()}`;
       }
     });
     safeBind("#reshuffleBtn", "click", reshuffle);
+    safeBind("#todayRefreshBtn", "click", () => { void refreshTodaySelection(); });
     safeBind("#loadMoreBtn", "click", appendMore);
     ensureDelightThumbAnchor();
     safeBind("#delightThumb", "click", (event) => {

@@ -1891,6 +1891,58 @@ def _is_masked_proxy_echo(value: str) -> bool:
     return "***" in value
 
 
+def _china_calendar_date(value: object) -> str:
+    """Return the UTC+8 calendar date for a normalized publication time."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (parsed.astimezone(UTC) + timedelta(hours=8)).date().isoformat()
+
+
+def _china_today_window(now: datetime | None = None) -> tuple[str, str, str]:
+    """Return today's China date and its half-open UTC publication bounds."""
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    china_now = current + timedelta(hours=8)
+    start_utc = datetime.combine(china_now.date(), datetime.min.time(), tzinfo=UTC) - timedelta(
+        hours=8
+    )
+    # A small clock-skew allowance is useful for publisher feeds, but a
+    # clearly future-dated row must never be presented as today's news.
+    before_utc = current + timedelta(minutes=5)
+    return (
+        china_now.date().isoformat(),
+        start_utc.isoformat().replace("+00:00", "Z"),
+        before_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _publication_is_china_today(value: object, *, now: datetime | None = None) -> bool:
+    """Reject missing, invalid, stale, and clearly future publication times."""
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        published = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=UTC)
+    published = published.astimezone(UTC)
+    if published > current + timedelta(minutes=5):
+        return False
+    return _china_calendar_date(published) == _china_calendar_date(current)
+
+
 def create_app(
     *,
     memory_manager: Any | None = None,
@@ -10259,7 +10311,10 @@ def create_app(
         )
 
     @app.get("/api/delight/pending-batch")
-    async def pending_delight_batch(limit: int | None = None) -> dict[str, Any]:
+    async def pending_delight_batch(
+        response: Response,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         """Return un-notified delight candidates.
 
         When ``limit`` is omitted the shared
@@ -10290,11 +10345,23 @@ def create_app(
             with suppress(Exception):
                 threshold = float(dynamic_threshold())
         response_limit = max(1, min(100, int(requested_limit)))
-        rows = ctx.database.get_delight_candidates(
-            min_delight_score=threshold,
-            limit=100 if newsclaw_mode else response_limit,
-            include_liked=True,
-        )
+        response.headers["Cache-Control"] = "no-store"
+        request_now = datetime.now(UTC)
+        today_date, published_after, published_before = _china_today_window(request_now)
+        get_candidates = ctx.database.get_delight_candidates
+        candidate_kwargs: dict[str, object] = {
+            "min_delight_score": threshold,
+            "limit": 100 if newsclaw_mode else response_limit,
+            "include_liked": True,
+        }
+        if newsclaw_mode:
+            with suppress(TypeError, ValueError):
+                parameters = inspect.signature(get_candidates).parameters
+                if "published_after" in parameters:
+                    candidate_kwargs["published_after"] = published_after
+                if "published_before" in parameters:
+                    candidate_kwargs["published_before"] = published_before
+        rows = get_candidates(**candidate_kwargs)
         # Reuse the same disliked-topic filter as get_pending_delight by
         # going through the runtime controller's loader if possible.
         controller = ctx.runtime_controller
@@ -10303,6 +10370,11 @@ def create_app(
 
         def passes_filter(row: dict[str, Any]) -> bool:
             if not _delight_source_allowed(row):
+                return False
+            if newsclaw_mode and not _publication_is_china_today(
+                row.get("published_at"),
+                now=request_now,
+            ):
                 return False
             haystack = f"{str(row.get('title', '')).lower()} {str(row.get('tags', '')).lower()}"
             return not any(p and p in haystack for p in disliked_phrases)
@@ -10357,13 +10429,56 @@ def create_app(
             items,
             key=lambda item: -float(item.get("priority_score", -1.0)),
         )[:response_limit]
-        return {"items": items}
+        if not newsclaw_mode:
+            return {"items": items}
+
+        pending_count = 0
+        get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
+        if callable(get_runtime_status):
+            with suppress(Exception):
+                runtime_status = await asyncio.to_thread(get_runtime_status)
+                pending_count = max(
+                    0,
+                    int(
+                        runtime_status.get("candidate_eval_pending", 0)
+                        if isinstance(runtime_status, Mapping)
+                        else 0
+                    ),
+                )
+        refresh_running = False
+        last_refresh_at = ""
+        news_runtime = getattr(app.state, "newsclaw_runtime", None)
+        runtime_state = getattr(news_runtime, "runtime_state", None)
+        if callable(runtime_state):
+            with suppress(Exception):
+                news_state = runtime_state()
+                if isinstance(news_state, Mapping):
+                    refresh_running = bool(news_state.get("refresh_running", False))
+                    last_refresh_at = str(news_state.get("last_refresh", "") or "")
+        queue_state = (
+            "ready"
+            if items
+            else "processing"
+            if refresh_running or pending_count
+            else "empty"
+        )
+        return {
+            "items": items,
+            "scope": "today",
+            "date": today_date,
+            "state": queue_state,
+            "pending_count": pending_count,
+            "last_refresh_at": last_refresh_at,
+        }
 
     @app.get("/api/spotlight/pending-batch")
-    async def pending_spotlight_batch(limit: int | None = None) -> dict[str, Any]:
+    async def pending_spotlight_batch(
+        response: Response,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         """NewsClaw alias of the inherited delight queue."""
 
-        return await pending_delight_batch(limit)
+        return await pending_delight_batch(response, limit)
 
     @app.post("/api/delight/sent", response_model=DelightAckResponse)
     async def mark_delight_sent(payload: DelightAckIn) -> DelightAckResponse:
