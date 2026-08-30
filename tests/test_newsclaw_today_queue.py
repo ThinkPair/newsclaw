@@ -43,8 +43,21 @@ def test_china_today_helpers_observe_utc_boundary_and_reject_bad_times() -> None
     assert not _publication_is_china_today(midnight + timedelta(minutes=6), now=midnight)
 
 
-def _ready_delight(database: Database, bvid: str, *, published_at: str, score: float) -> None:
-    database.cache_content(bvid, title=bvid, relevance_score=score)
+def _ready_delight(
+    database: Database,
+    bvid: str,
+    *,
+    published_at: str,
+    score: float,
+    source_platform: str = "bilibili",
+) -> None:
+    database.cache_content(
+        bvid,
+        title=bvid,
+        relevance_score=score,
+        source_platform=source_platform,
+        content_url=f"https://example.com/{bvid}",
+    )
     database.update_pool_copy(bvid, expression="推荐理由", topic_label="测试主题")
     database.update_delight_score(
         bvid,
@@ -85,6 +98,36 @@ def test_database_applies_publication_window_before_score_limit(tmp_path: Path) 
     )
 
     assert [row["bvid"] for row in rows] == ["today-lower-score"]
+
+
+def test_database_applies_source_scope_before_limit(tmp_path: Path) -> None:
+    database = Database(tmp_path / "source-scope.db")
+    database.initialize()
+    for index in range(110):
+        _ready_delight(
+            database,
+            f"video-{index}",
+            published_at="2026-08-30T01:00:00Z",
+            score=0.99,
+        )
+    _ready_delight(
+        database,
+        "today-news",
+        published_at="2026-08-30T01:30:00Z",
+        score=0.90,
+        source_platform="news",
+    )
+
+    rows = database.get_delight_candidates(
+        min_delight_score=0.85,
+        limit=1,
+        include_liked=True,
+        source_platform="news",
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T03:00:00Z",
+    )
+
+    assert [row["bvid"] for row in rows] == ["today-news"]
 
 
 def test_database_processing_count_is_scoped_to_today_news_and_all_live_stages(
@@ -182,12 +225,15 @@ def test_database_processing_count_is_scoped_to_today_news_and_all_live_stages(
         score_zero_key,
         stale_score_key,
     }
-    assert database.count_delight_processing_candidates(
-        published_after="2026-08-29T16:00:00Z",
-        published_before="2026-08-30T16:00:00Z",
-        source_platform="news",
-        min_delight_score_for_reason=0.85,
-    ) == 6
+    assert (
+        database.count_delight_processing_candidates(
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+            source_platform="news",
+            min_delight_score_for_reason=0.85,
+        )
+        == 6
+    )
 
     database.conn.execute(
         """
@@ -201,12 +247,15 @@ def test_database_processing_count_is_scoped_to_today_news_and_all_live_stages(
         """
     )
     database.conn.commit()
-    assert database.count_delight_processing_candidates(
-        published_after="2026-08-29T16:00:00Z",
-        published_before="2026-08-30T16:00:00Z",
-        source_platform="news",
-        min_delight_score_for_reason=0.85,
-    ) == 3
+    assert (
+        database.count_delight_processing_candidates(
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+            source_platform="news",
+            min_delight_score_for_reason=0.85,
+        )
+        == 3
+    )
 
 
 def test_newsclaw_today_batch_rejects_old_rows_and_reports_processing(monkeypatch) -> None:
@@ -258,7 +307,14 @@ def test_newsclaw_today_batch_rejects_old_rows_and_reports_processing(monkeypatc
 
     class FakeRuntimeController:
         def get_runtime_status(self) -> dict[str, int]:
-            return {"candidate_eval_pending": 99, "candidate_eval_in_flight": 99}
+            return {
+                "candidate_eval_pending": 99,
+                "candidate_eval_in_flight": 99,
+                "candidate_eval_pending_ready": 2,
+                "candidate_eval_evaluating": 1,
+                "candidate_eval_evaluated": 3,
+                "candidate_eval_budget_remaining": 17,
+            }
 
     database = FakeDatabase()
     monkeypatch.setenv("NEWSCLAW_MODE", "1")
@@ -278,6 +334,10 @@ def test_newsclaw_today_batch_rejects_old_rows_and_reports_processing(monkeypatc
     assert [item["bvid"] for item in payload["items"]] == ["today-news"]
     assert payload["state"] == "processing"
     assert payload["pending_count"] == 2
+    assert payload["pending_ready"] == 2
+    assert payload["evaluating"] == 1
+    assert payload["evaluated"] == 3
+    assert payload["budget_remaining"] == 17
     assert database.processing_threshold > 0
     assert database.bounds is not None
     assert database.bounds[0]

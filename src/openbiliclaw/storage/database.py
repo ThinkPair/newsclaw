@@ -1313,6 +1313,16 @@ CREATE INDEX IF NOT EXISTS idx_discovery_candidates_source_status
     ON discovery_candidates(source_platform, status);
 CREATE INDEX IF NOT EXISTS idx_discovery_candidates_content_id
     ON discovery_candidates(source_platform, content_id);
+-- Conservative daily reservations for time-sensitive evaluator lanes.  A
+-- reservation is never refunded after claim: crashes and retries therefore
+-- fail closed on LLM spend instead of silently exceeding the daily ceiling.
+CREATE TABLE IF NOT EXISTS candidate_eval_daily_budgets (
+    lane_key        TEXT NOT NULL,
+    budget_date     TEXT NOT NULL,
+    reserved_count  INTEGER NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (lane_key, budget_date)
+);
 -- Bangumi anonymous API discovery pacing, cursors and diagnostics.
 CREATE TABLE IF NOT EXISTS bangumi_discovery_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7712,6 +7722,66 @@ class Database:
         )
         return int(cursor.rowcount)
 
+    def retire_discovery_candidates_outside_scope(
+        self,
+        *,
+        source_platform: str,
+        published_after: str,
+        published_before: str,
+        limit: int = 1_000,
+    ) -> int:
+        """Terminalize bounded, unclaimed queue rows outside one live scope.
+
+        NewsClaw calls this before publishing a new Beijing-today batch.  Rows
+        currently owned by an evaluator are deliberately untouched; completion
+        rechecks the same scope and rejects them safely if midnight moved while
+        the LLM was working.
+        """
+
+        source = str(source_platform or "").strip().lower()
+        after = str(published_after or "").strip()
+        before = str(published_before or "").strip()
+        row_limit = max(0, int(limit))
+        if not source or not after or not before or row_limit <= 0:
+            return 0
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE discovery_candidates
+                SET status = 'trimmed_capacity',
+                    eval_error = 'outside_eval_scope',
+                    claimed_at = NULL,
+                    claim_token = NULL
+                WHERE id IN (
+                    SELECT id
+                    FROM discovery_candidates
+                    WHERE LOWER(TRIM(COALESCE(source_platform, ''))) = ?
+                      AND status IN ('pending_eval', 'evaluated')
+                      AND claim_token IS NULL
+                      AND (
+                            NULLIF(TRIM(COALESCE(published_at, '')), '') IS NULL
+                            OR datetime(NULLIF(TRIM(published_at), '')) IS NULL
+                            OR datetime(NULLIF(TRIM(published_at), '')) < datetime(?)
+                            OR datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)
+                      )
+                    ORDER BY last_seen_at ASC, id ASC
+                    LIMIT ?
+                )
+                  AND status IN ('pending_eval', 'evaluated')
+                  AND claim_token IS NULL
+                """,
+                (source, after, before, row_limit),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def reset_stale_discovery_candidate_evaluations(
         self,
         *,
@@ -7802,12 +7872,123 @@ class Database:
         )
         return int(cursor.rowcount)
 
+    @staticmethod
+    def _discovery_candidate_scope_sql(
+        *,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
+    ) -> tuple[str, tuple[str, ...]]:
+        """Build the shared source/publication boundary for queue lifecycle reads."""
+
+        clauses: list[str] = []
+        params: list[str] = []
+        source = str(source_platform or "").strip().lower()
+        if source:
+            clauses.append("LOWER(TRIM(COALESCE(source_platform, ''))) = ?")
+            params.append(source)
+        if published_after:
+            clauses.append("datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)")
+            params.append(str(published_after))
+        if published_before:
+            clauses.append("datetime(NULLIF(TRIM(published_at), '')) < datetime(?)")
+            params.append(str(published_before))
+        if not clauses:
+            return "", ()
+        return "\n              AND ".join(["", *clauses]), tuple(params)
+
+    def count_discovery_candidates_for_eval_scope(
+        self,
+        *,
+        source_platform: str,
+        published_after: str,
+        published_before: str,
+        capacity_budget_key: str = "",
+        capacity_budget_date: str = "",
+        max_capacity_evaluations: int = 0,
+    ) -> dict[str, int]:
+        """Return active evaluator lifecycle counts for one durable queue scope."""
+
+        self._ensure_fresh_read()
+        if not source_platform or not published_after or not published_before:
+            return {}
+        scope_sql, scope_params = self._discovery_candidate_scope_sql(
+            source_platform=source_platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        if not scope_sql:
+            return {}
+        rows = self._load_temporally_eligible_admission_waiting_rows_on(
+            self.conn,
+            source_platform=source_platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        counts: dict[str, int] = defaultdict(int)
+        for row in rows:
+            counts[str(row.get("status") or "unknown")] += 1
+        ready_row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM discovery_candidates
+            WHERE status = 'pending_eval'
+              AND (
+                    COALESCE(temporal_review_retry_at, '') = ''
+                    OR julianday(temporal_review_retry_at) <= julianday('now')
+              )
+              {scope_sql}
+            """,
+            scope_params,
+        ).fetchone()
+        counts["pending_eval_ready"] = int(ready_row["count"] if ready_row else 0)
+        budget_limit = max(0, int(max_capacity_evaluations or 0))
+        if budget_limit > 0:
+            counts["budget_remaining"] = self.candidate_eval_budget_remaining(
+                lane_key=capacity_budget_key,
+                budget_date=capacity_budget_date,
+                limit=budget_limit,
+            )
+        return dict(counts)
+
+    def candidate_eval_budget_remaining(
+        self,
+        *,
+        lane_key: str,
+        budget_date: str,
+        limit: int,
+    ) -> int:
+        """Return remaining durable reservations for one evaluator lane/day."""
+
+        clean_key = str(lane_key or "").strip()
+        clean_date = str(budget_date or "").strip()
+        clean_limit = max(0, int(limit))
+        if not clean_key or not clean_date or clean_limit <= 0:
+            return 0
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT reserved_count
+            FROM candidate_eval_daily_budgets
+            WHERE lane_key = ? AND budget_date = ?
+            """,
+            (clean_key, clean_date),
+        ).fetchone()
+        reserved = int(row["reserved_count"] if row else 0)
+        return max(0, clean_limit - reserved)
+
     def claim_discovery_candidates_for_eval(
         self,
         *,
         limit: int,
         claim_token: str | None = None,
         preferred_source_platforms: Sequence[str] | None = None,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
+        capacity_budget_key: str = "",
+        capacity_budget_date: str = "",
+        max_capacity_evaluations: int = 0,
     ) -> list[dict[str, Any]]:
         """Claim a mixed-source batch of pending candidates for evaluation.
 
@@ -7823,6 +8004,29 @@ class Database:
         if claim_limit <= 0:
             return []
         self._ensure_fresh_read()
+        scope_values = (source_platform, published_after, published_before)
+        if any(bool(str(value or "").strip()) for value in scope_values) and not all(
+            bool(str(value or "").strip()) for value in scope_values
+        ):
+            logger.warning("refusing a partial discovery candidate claim scope")
+            return []
+        scope_sql, scope_params = self._discovery_candidate_scope_sql(
+            source_platform=source_platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        budget_limit = max(0, int(max_capacity_evaluations or 0))
+        if budget_limit > 0:
+            return self._claim_scoped_candidates_with_capacity_budget(
+                limit=claim_limit,
+                claim_token=claim_token,
+                source_platform=source_platform,
+                published_after=published_after,
+                published_before=published_before,
+                capacity_budget_key=capacity_budget_key,
+                capacity_budget_date=capacity_budget_date,
+                max_capacity_evaluations=budget_limit,
+            )
         platforms = [
             str(platform).strip()
             for platform in (preferred_source_platforms or [])
@@ -7834,10 +8038,12 @@ class Database:
         if platforms:
             placeholders = ", ".join("?" for _ in platforms)
             order_prefix = f"CASE WHEN source_platform IN ({placeholders}) THEN 0 ELSE 1 END, "
-            window_params: tuple[Any, ...] = (*platforms, window_limit)
+            order_params: tuple[Any, ...] = tuple(platforms)
         else:
             order_prefix = ""
-            window_params = (window_limit,)
+            order_params = ()
+        scoped_quality_order = "source_rank DESC, rating_score DESC, " if scope_sql else ""
+        window_params: tuple[Any, ...] = (*order_params, *scope_params, window_limit)
         cursor = self.conn.execute(
             f"""
             SELECT *
@@ -7847,7 +8053,8 @@ class Database:
                     COALESCE(temporal_review_retry_at, '') = ''
                     OR julianday(temporal_review_retry_at) <= julianday('now')
               )
-            ORDER BY {order_prefix}last_seen_at ASC, id ASC
+              {scope_sql}
+            ORDER BY {order_prefix}{scoped_quality_order}last_seen_at ASC, id ASC
             LIMIT ?
             """,
             window_params,
@@ -7929,8 +8136,9 @@ class Database:
                     COALESCE(temporal_review_retry_at, '') = ''
                     OR julianday(temporal_review_retry_at) <= julianday('now')
               )
+              {scope_sql}
             """,
-            (token, *ids),
+            (token, *ids, *scope_params),
         )
         claimed_rows = self.conn.execute(
             f"""
@@ -7947,11 +8155,204 @@ class Database:
             claimed_by_id[candidate_id] for candidate_id in ids if candidate_id in claimed_by_id
         ]
 
+    def _claim_scoped_candidates_with_capacity_budget(
+        self,
+        *,
+        limit: int,
+        claim_token: str | None,
+        source_platform: str,
+        published_after: str,
+        published_before: str,
+        capacity_budget_key: str,
+        capacity_budget_date: str,
+        max_capacity_evaluations: int,
+    ) -> list[dict[str, Any]]:
+        """Atomically reserve one durable daily budget and claim its scoped rows."""
+
+        source = str(source_platform or "").strip().lower()
+        budget_key = str(capacity_budget_key or "").strip()
+        budget_date = str(capacity_budget_date or "").strip()
+        budget_limit = max(0, int(max_capacity_evaluations))
+        if (
+            not source
+            or not published_after
+            or not published_before
+            or not budget_key
+            or not budget_date
+            or budget_limit <= 0
+        ):
+            logger.warning("refusing an incomplete scoped candidate capacity budget")
+            return []
+        scope_sql, scope_params = self._discovery_candidate_scope_sql(
+            source_platform=source,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        if not scope_sql:
+            return []
+        token = str(claim_token or secrets.token_hex(16))
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            budget_row = conn.execute(
+                """
+                SELECT reserved_count
+                FROM candidate_eval_daily_budgets
+                WHERE lane_key = ? AND budget_date = ?
+                """,
+                (budget_key, budget_date),
+            ).fetchone()
+            reserved = int(budget_row["reserved_count"] if budget_row else 0)
+            remaining = max(0, budget_limit - reserved)
+            if remaining <= 0:
+                conn.execute(
+                    f"""
+                    UPDATE discovery_candidates
+                    SET status = 'trimmed_capacity',
+                        eval_error = 'daily_evaluation_budget',
+                        claimed_at = NULL,
+                        claim_token = NULL
+                    WHERE status = 'pending_eval'
+                      AND claim_token IS NULL
+                      {scope_sql}
+                    """,
+                    scope_params,
+                )
+                conn.commit()
+                return []
+
+            # Keep only the best ``remaining`` ready rows alive.  This makes
+            # the durable daily reservation a real upper bound instead of
+            # leaving a large same-day backlog that can keep the UI in an
+            # endless "processing" state after the budget is already spent.
+            conn.execute(
+                f"""
+                UPDATE discovery_candidates
+                SET status = 'trimmed_capacity',
+                    eval_error = 'daily_evaluation_budget',
+                    claimed_at = NULL,
+                    claim_token = NULL
+                WHERE id IN (
+                    SELECT id
+                    FROM discovery_candidates
+                    WHERE status = 'pending_eval'
+                      AND claim_token IS NULL
+                      AND (
+                            COALESCE(temporal_review_retry_at, '') = ''
+                            OR julianday(temporal_review_retry_at) <= julianday('now')
+                      )
+                      {scope_sql}
+                    ORDER BY source_rank DESC, rating_score DESC,
+                             last_seen_at ASC, id ASC
+                    LIMIT -1 OFFSET ?
+                )
+                  AND status = 'pending_eval'
+                  AND claim_token IS NULL
+                """,
+                (*scope_params, remaining),
+            )
+
+            claim_limit = min(max(0, int(limit)), remaining)
+            pending_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM discovery_candidates
+                WHERE status = 'pending_eval'
+                  AND (
+                        COALESCE(temporal_review_retry_at, '') = ''
+                        OR julianday(temporal_review_retry_at) <= julianday('now')
+                  )
+                  {scope_sql}
+                ORDER BY source_rank DESC, rating_score DESC, last_seen_at ASC, id ASC
+                LIMIT ?
+                """,
+                (*scope_params, claim_limit),
+            ).fetchall()
+            ids = [int(row["id"]) for row in pending_rows]
+            if not ids:
+                conn.commit()
+                return []
+            placeholders = ", ".join("?" for _ in ids)
+            conn.execute(
+                f"""
+                UPDATE discovery_candidates
+                SET status = 'evaluating',
+                    claimed_at = CURRENT_TIMESTAMP,
+                    claim_token = ?,
+                    eval_error = CASE
+                        WHEN COALESCE(eval_error, '') LIKE 'temporal_review_due:%'
+                        THEN eval_error
+                        ELSE ''
+                    END,
+                    temporal_review_retry_at = CASE
+                        WHEN COALESCE(eval_error, '') LIKE 'temporal_review_due:%'
+                        THEN datetime(
+                            'now',
+                            '+' || CASE
+                                WHEN COALESCE(temporal_review_attempts, 0) <= 0 THEN 1
+                                WHEN temporal_review_attempts = 1 THEN 2
+                                WHEN temporal_review_attempts = 2 THEN 4
+                                WHEN temporal_review_attempts = 3 THEN 8
+                                WHEN temporal_review_attempts = 4 THEN 16
+                                ELSE 24
+                            END || ' hours'
+                        )
+                        ELSE COALESCE(temporal_review_retry_at, '')
+                    END,
+                    temporal_review_attempts = CASE
+                        WHEN COALESCE(eval_error, '') LIKE 'temporal_review_due:%'
+                        THEN MIN(COALESCE(temporal_review_attempts, 0) + 1, 6)
+                        ELSE COALESCE(temporal_review_attempts, 0)
+                    END
+                WHERE id IN ({placeholders})
+                  AND status = 'pending_eval'
+                  {scope_sql}
+                """,
+                (token, *ids, *scope_params),
+            )
+            claimed_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM discovery_candidates
+                WHERE id IN ({placeholders})
+                  AND status = 'evaluating'
+                  AND claim_token = ?
+                """,
+                (*ids, token),
+            ).fetchall()
+            claimed_by_id = {int(row["id"]): dict(row) for row in claimed_rows}
+            claimed = [
+                claimed_by_id[candidate_id] for candidate_id in ids if candidate_id in claimed_by_id
+            ]
+            if claimed:
+                conn.execute(
+                    """
+                    INSERT INTO candidate_eval_daily_budgets (
+                        lane_key, budget_date, reserved_count, updated_at
+                    )
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(lane_key, budget_date) DO UPDATE SET
+                        reserved_count = reserved_count + excluded.reserved_count,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (budget_key, budget_date, len(claimed)),
+                )
+            conn.commit()
+            return claimed
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_evaluated_discovery_candidates_for_admission(
         self,
         *,
         limit: int,
         preferred_source_platforms: Sequence[str] | None = None,
+        source_platform: str = "",
+        published_after: str = "",
+        published_before: str = "",
     ) -> list[dict[str, Any]]:
         """Return evaluated candidates still waiting for content-cache admission.
 
@@ -7968,6 +8369,12 @@ class Database:
         if admission_limit <= 0:
             return []
         self._ensure_fresh_read()
+        scope_values = (source_platform, published_after, published_before)
+        if any(bool(str(value or "").strip()) for value in scope_values) and not all(
+            bool(str(value or "").strip()) for value in scope_values
+        ):
+            logger.warning("refusing a partial evaluated-admission scope")
+            return []
         platforms = [
             str(platform).strip()
             for platform in (preferred_source_platforms or [])
@@ -7980,14 +8387,20 @@ class Database:
         else:
             order_prefix = ""
             params = ()
+        scope_sql, scope_params = self._discovery_candidate_scope_sql(
+            source_platform=source_platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
         cursor = self.conn.execute(
             f"""
             SELECT *
             FROM discovery_candidates
             WHERE status = 'evaluated'
+              {scope_sql}
             ORDER BY {order_prefix}evaluated_at ASC, last_seen_at ASC, id ASC
             """,
-            params,
+            (*params, *scope_params),
         )
         temporal_now = datetime.now(UTC)
         eligible: list[dict[str, Any]] = []
@@ -8703,19 +9116,13 @@ class Database:
         scope_clauses: list[str] = []
         scope_params: list[str] = []
         if source:
-            scope_clauses.append(
-                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
-            )
+            scope_clauses.append("AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?")
             scope_params.append(source)
         if published_after:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)")
             scope_params.append(published_after)
         if published_before:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)")
             scope_params.append(published_before)
         scope_sql = "\n              ".join(scope_clauses)
         cursor = conn.execute(
@@ -9911,6 +10318,143 @@ class Database:
         )
         return result.rowcount
 
+    def reconcile_newsclaw_pool_after_admission(
+        self,
+        *,
+        target: int,
+        raw_ceiling: int,
+        published_after: str,
+        published_before: str,
+    ) -> int:
+        """Replace overflow after a NewsClaw admission and restore both hard caps.
+
+        The canonical visible set is used for victim selection, so hidden rows
+        cannot masquerade as freed display capacity.  Explicit likes and rows
+        already referenced by recommendations are protected; token-owned raw
+        candidates are protected by the shared raw planner.
+        """
+
+        clean_target = max(0, int(target))
+        clean_raw_ceiling = max(clean_target, int(raw_ceiling))
+        if clean_target <= 0:
+            return 0
+        conn = self.open_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            viewed = self._recent_viewed_content_keys_on(conn)
+            available_rows = self._load_available_pool_candidate_rows_on(
+                conn,
+                _viewed_content_keys=viewed,
+                full_rows=True,
+            )
+            protected_visible = sum(
+                str(row.get("feedback_type") or "").strip().lower() == "like"
+                for row in available_rows
+            )
+            # A user's explicit likes outrank the rotating-pool target.  When
+            # the protected set alone is larger than the configured target,
+            # the only mathematically consistent invariant is to retain that
+            # protected floor and reconcile every replaceable row around it.
+            effective_target = max(clean_target, protected_visible)
+            effective_raw_ceiling = max(clean_raw_ceiling, effective_target)
+            overflow = max(0, len(available_rows) - effective_target)
+            demoted = 0
+            if overflow > 0:
+                candidates = [
+                    row
+                    for row in available_rows
+                    if str(row.get("feedback_type") or "").strip().lower() != "like"
+                ]
+
+                def _victim_key(row: Mapping[str, Any]) -> tuple[int, int, float, float, str]:
+                    platform = str(row.get("source_platform") or "").strip().lower()
+                    published = str(row.get("published_at") or "").strip()
+                    is_today = bool(
+                        published
+                        and self._timestamp_in_half_open_window(
+                            published,
+                            published_after,
+                            published_before,
+                        )
+                    )
+                    return (
+                        0 if platform != "news" else 1,
+                        1 if is_today else 0,
+                        float(row.get("relevance_score") or 0.0),
+                        self._sort_timestamp_score(str(row.get("last_scored_at") or "")),
+                        str(row.get("bvid") or ""),
+                    )
+
+                candidates.sort(key=_victim_key)
+                victims = [str(row.get("bvid") or "") for row in candidates[:overflow]]
+                victims = [bvid for bvid in victims if bvid]
+                if len(victims) < overflow:
+                    raise RuntimeError("NewsClaw pool overflow has no replaceable visible row")
+                demoted = self._apply_content_status_on(conn, victims, status="stale")
+
+            protected_ids = {
+                str(row["bvid"])
+                for row in conn.execute(
+                    """
+                    SELECT bvid FROM content_cache
+                    WHERE LOWER(TRIM(COALESCE(feedback_type, ''))) = 'like'
+                    UNION
+                    SELECT bvid FROM recommendations
+                    """
+                ).fetchall()
+                if str(row["bvid"] or "").strip()
+            }
+            raw_plan = self._plan_raw_trim_on(
+                conn,
+                protected_ids=protected_ids,
+                raw_ceiling=effective_raw_ceiling,
+                raw_source_share_quotas={"news": effective_raw_ceiling},
+                _viewed_content_keys=viewed,
+            )
+            self._apply_raw_trim_on(conn, raw_plan)
+            available_after = len(
+                self._load_available_pool_candidate_rows_on(
+                    conn,
+                    _viewed_content_keys=viewed,
+                )
+            )
+            raw_after = self._count_pool_raw_material_on(
+                conn,
+                _viewed_content_keys=viewed,
+            )
+            if available_after != effective_target:
+                raise RuntimeError(
+                    "NewsClaw pool replacement did not converge: "
+                    f"{available_after}/{effective_target}"
+                )
+            if raw_after > effective_raw_ceiling:
+                raise RuntimeError(
+                    f"NewsClaw raw pool did not converge: {raw_after}/{effective_raw_ceiling}"
+                )
+            conn.commit()
+            return demoted + len(raw_plan.content_bvids) + len(raw_plan.candidate_ids)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _timestamp_in_half_open_window(value: str, after: str, before: str) -> bool:
+        try:
+            instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            start = datetime.fromisoformat(str(after).replace("Z", "+00:00"))
+            end = datetime.fromisoformat(str(before).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=UTC)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        return start.astimezone(UTC) <= instant.astimezone(UTC) < end.astimezone(UTC)
+
     def count_pool_readiness(
         self,
         *,
@@ -10083,19 +10627,13 @@ class Database:
         scope_params: list[str] = []
         platform = str(source_platform or "").strip().lower()
         if platform:
-            scope_clauses.append(
-                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
-            )
+            scope_clauses.append("AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?")
             scope_params.append(platform)
         if published_after:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)")
             scope_params.append(published_after)
         if published_before:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)")
             scope_params.append(published_before)
         scope_sql = "\n              ".join(scope_clauses)
         max_rows = None if limit is None else max(0, int(limit))
@@ -29203,6 +29741,7 @@ class Database:
         min_delight_score: float = 0.85,
         limit: int = 20,
         include_liked: bool = False,
+        source_platform: str = "",
         published_after: str = "",
         published_before: str = "",
     ) -> list[dict[str, Any]]:
@@ -29230,10 +29769,10 @@ class Database:
         delivery paths (WS push, counts, CLI) keep the default False so an
         already-liked item is never re-pushed as a fresh surprise.
 
-        ``published_after`` / ``published_before`` are optional UTC ISO-8601
-        bounds applied in SQL before ordering and limiting.  NewsClaw uses
-        them to make its "today" queue a real calendar-day contract instead
-        of filtering a score-sorted historical page after the fact.
+        ``source_platform`` and the optional UTC ISO-8601 publication bounds
+        are applied in SQL before ordering and limiting.  NewsClaw uses all
+        three so unrelated high-score rows cannot hide today's news inside a
+        bounded result page.
         """
         feedback_clause = (
             "COALESCE(feedback_type, '') IN ('', 'like')"
@@ -29241,6 +29780,12 @@ class Database:
             else "COALESCE(feedback_type, '') = ''"
         )
         admission_sql, admission_params = self._pool_admission_sql()
+        source_clause = ""
+        source_params: list[str] = []
+        clean_source = str(source_platform or "").strip().lower()
+        if clean_source:
+            source_clause = "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
+            source_params.append(clean_source)
         publication_clauses: list[str] = []
         publication_params: list[str] = []
         if published_after:
@@ -29249,9 +29794,7 @@ class Database:
             )
             publication_params.append(published_after)
         if published_before:
-            publication_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
-            )
+            publication_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)")
             publication_params.append(published_before)
         publication_sql = "\n              ".join(publication_clauses)
         cursor = self.conn.execute(
@@ -29268,11 +29811,17 @@ class Database:
                   TRIM(COALESCE(pool_topic_label, ''))
               AND {feedback_clause}
               AND COALESCE(pool_status, 'fresh') IN ('fresh', 'shown')
+              {source_clause}
               {publication_sql}
               {_delight_unseen_guard_sql()}
             ORDER BY delight_score DESC, relevance_score DESC, discovered_at DESC
             """,
-            (min_delight_score, *admission_params, *publication_params),
+            (
+                min_delight_score,
+                *admission_params,
+                *source_params,
+                *publication_params,
+            ),
         )
         temporal_now = datetime.now(UTC)
         rows = [
@@ -29515,19 +30064,13 @@ class Database:
         scope_params: list[str] = []
         platform = str(source_platform or "").strip().lower()
         if platform:
-            scope_clauses.append(
-                "AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?"
-            )
+            scope_clauses.append("AND LOWER(TRIM(COALESCE(source_platform, ''))) = ?")
             scope_params.append(platform)
         if published_after:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) >= datetime(?)")
             scope_params.append(published_after)
         if published_before:
-            scope_clauses.append(
-                "AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)"
-            )
+            scope_clauses.append("AND datetime(NULLIF(TRIM(published_at), '')) < datetime(?)")
             scope_params.append(published_before)
         scope_sql = "\n                  ".join(scope_clauses)
         effective_min_relevance_score = _normalize_admission_min_score(min_relevance_score)

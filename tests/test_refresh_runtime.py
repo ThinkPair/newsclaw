@@ -1069,6 +1069,61 @@ async def test_publish_delight_if_available_includes_publication_fields() -> Non
     assert event_hub.events[0]["observation_points"] == "核验正式文件与行业数据。"
 
 
+async def test_newsclaw_pending_and_websocket_use_same_beijing_today_scope() -> None:
+    class TodayDatabase(_FakeDatabase):
+        def get_delight_candidates(
+            self,
+            *,
+            min_delight_score: float = 0.85,
+            limit: int = 20,
+        ) -> list[dict[str, object]]:
+            del min_delight_score, limit
+            return [
+                {
+                    "bvid": "old-news",
+                    "source_platform": "news",
+                    "title": "旧闻",
+                    "published_at": "2026-08-28T06:00:00Z",
+                    "delight_score": 0.99,
+                },
+                {
+                    "bvid": "today-video",
+                    "source_platform": "bilibili",
+                    "title": "非新闻",
+                    "published_at": "2026-08-30T05:00:00Z",
+                    "delight_score": 0.98,
+                },
+                {
+                    "bvid": "today-news",
+                    "source_platform": "news",
+                    "title": "今日新闻",
+                    "published_at": "2026-08-30T05:00:00Z",
+                    "delight_score": 0.90,
+                    "delight_reason": "今日变化",
+                    "delight_hook": "宏观",
+                },
+            ]
+
+    event_hub = _FakeEventHub()
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=TodayDatabase([]),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        event_hub=event_hub,
+        newsclaw_mode=True,
+    )
+    controller._now = lambda: datetime(2026, 8, 30, 14, 0)  # type: ignore[method-assign]
+
+    pending = controller.get_pending_delight()
+    await controller._publish_delight_if_available()
+
+    assert pending is not None
+    assert pending["bvid"] == "today-news"
+    assert [event["bvid"] for event in event_hub.events] == ["today-news"]
+
+
 def test_load_disliked_topic_phrases_reads_effective_dislikes() -> None:
     controller = ContinuousRefreshController(
         memory_manager=_FakeMemoryManager(),

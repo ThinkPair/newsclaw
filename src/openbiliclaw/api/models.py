@@ -660,6 +660,11 @@ class RuntimeStatusResponse(BaseModel):
     candidate_eval_last_batch_seconds: float = 0.0
     candidate_eval_last_cached: int = 0
     candidate_eval_last_rejected: int = 0
+    candidate_eval_process_pending_at_capacity: bool = False
+    candidate_eval_pending_ready: int = 0
+    candidate_eval_evaluating: int = 0
+    candidate_eval_evaluated: int = 0
+    candidate_eval_budget_remaining: int = 0
     expression_pending_count: int = 0
     expression_batch_state: str = "idle"
     expression_batch_deadline: float = 0.0

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -1169,3 +1171,320 @@ def test_reset_stale_evaluations_default_keeps_fresh_but_releases_null_claimed_a
     counts = db.count_discovery_candidates_by_status()
     assert counts["pending_eval"] == 1
     assert counts["evaluating"] == 1
+
+
+def test_scoped_claim_uses_today_news_only_and_enforces_daily_budget(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    rows = [
+        DiscoveryCandidateWrite(
+            candidate_key="news:spent",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="spent",
+            title="already evaluated",
+            published_at="2026-08-30T01:00:00Z",
+            source_rank=3,
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="news:today-high",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="today-high",
+            title="today high",
+            published_at="2026-08-30T05:00:00Z",
+            source_rank=9,
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="news:today-low",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="today-low",
+            title="today low",
+            published_at="2026-08-30T04:00:00Z",
+            source_rank=1,
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="news:yesterday",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="yesterday",
+            title="yesterday",
+            published_at="2026-08-29T12:00:00Z",
+            source_rank=99,
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="bilibili:today",
+            source_platform="bilibili",
+            source_strategy="search",
+            content_id="today",
+            title="other source",
+            published_at="2026-08-30T05:30:00Z",
+            source_rank=99,
+        ),
+    ]
+    assert db.enqueue_discovery_candidates(rows) == len(rows)
+    db.conn.execute(
+        """
+        UPDATE discovery_candidates
+        SET status = 'rejected_low_score', evaluated_at = '2026-08-30 02:00:00'
+        WHERE candidate_key = 'news:spent'
+        """
+    )
+    db.conn.execute(
+        """
+        INSERT INTO candidate_eval_daily_budgets (
+            lane_key, budget_date, reserved_count
+        ) VALUES ('newsclaw_today', '2026-08-30', 1)
+        """
+    )
+    db.conn.commit()
+
+    kwargs = {
+        "source_platform": "news",
+        "published_after": "2026-08-29T16:00:00Z",
+        "published_before": "2026-08-30T16:00:00Z",
+        "capacity_budget_key": "newsclaw_today",
+        "capacity_budget_date": "2026-08-30",
+        "max_capacity_evaluations": 2,
+    }
+    claimed = db.claim_discovery_candidates_for_eval(limit=30, **kwargs)
+
+    assert [row["candidate_key"] for row in claimed] == ["news:today-high"]
+    assert db.claim_discovery_candidates_for_eval(limit=30, **kwargs) == []
+    statuses = {
+        str(row["candidate_key"]): str(row["status"])
+        for row in db.conn.execute(
+            "SELECT candidate_key, status FROM discovery_candidates"
+        ).fetchall()
+    }
+    assert statuses["news:today-low"] == "trimmed_capacity"
+    assert statuses["news:yesterday"] == "pending_eval"
+    assert statuses["bilibili:today"] == "pending_eval"
+    scoped = db.count_discovery_candidates_for_eval_scope(
+        source_platform="news",
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+    assert scoped.get("pending_eval", 0) == 0
+    assert scoped["evaluating"] == 1
+    assert (
+        db.candidate_eval_budget_remaining(
+            lane_key="newsclaw_today",
+            budget_date="2026-08-30",
+            limit=2,
+        )
+        == 0
+    )
+
+
+def test_scoped_daily_budget_is_atomic_across_connections(tmp_path: Path) -> None:
+    database_path = tmp_path / "concurrent-budget.db"
+    db = Database(database_path)
+    db.initialize()
+    db.enqueue_discovery_candidates(
+        [
+            DiscoveryCandidateWrite(
+                candidate_key=f"news:item-{index}",
+                source_platform="news",
+                source_strategy="news-refresh",
+                content_id=f"item-{index}",
+                title=f"item-{index}",
+                published_at="2026-08-30T05:00:00Z",
+                source_rank=100 - index,
+            )
+            for index in range(60)
+        ]
+    )
+    barrier = threading.Barrier(2)
+    workers = [Database(database_path), Database(database_path)]
+    for worker in workers:
+        worker.initialize()
+    kwargs = {
+        "limit": 20,
+        "source_platform": "news",
+        "published_after": "2026-08-29T16:00:00Z",
+        "published_before": "2026-08-30T16:00:00Z",
+        "capacity_budget_key": "newsclaw_today",
+        "capacity_budget_date": "2026-08-30",
+        "max_capacity_evaluations": 30,
+    }
+
+    def claim(worker: Database, token: str) -> set[int]:
+        barrier.wait()
+        return {
+            int(row["id"])
+            for row in worker.claim_discovery_candidates_for_eval(
+                claim_token=token,
+                **kwargs,
+            )
+        }
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(claim, workers[0], "worker-a")
+            second = executor.submit(claim, workers[1], "worker-b")
+            claimed_a = first.result(timeout=5)
+            claimed_b = second.result(timeout=5)
+    finally:
+        for worker in workers:
+            worker.close()
+
+    assert claimed_a.isdisjoint(claimed_b)
+    assert len(claimed_a | claimed_b) == 30
+    assert (
+        db.candidate_eval_budget_remaining(
+            lane_key="newsclaw_today",
+            budget_date="2026-08-30",
+            limit=30,
+        )
+        == 0
+    )
+
+
+def test_scoped_evaluated_admission_excludes_old_and_non_news_rows(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    rows = [
+        DiscoveryCandidateWrite(
+            candidate_key="news:today",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="today",
+            title="today",
+            published_at="2026-08-30T05:00:00Z",
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="news:old",
+            source_platform="news",
+            source_strategy="news-refresh",
+            content_id="old",
+            title="old",
+            published_at="2026-08-29T12:00:00Z",
+        ),
+        DiscoveryCandidateWrite(
+            candidate_key="bilibili:today",
+            source_platform="bilibili",
+            source_strategy="search",
+            content_id="today-bili",
+            title="other",
+            published_at="2026-08-30T05:00:00Z",
+        ),
+    ]
+    db.enqueue_discovery_candidates(rows)
+    db.conn.execute(
+        """
+        UPDATE discovery_candidates
+        SET status = 'evaluated', relevance_score = 0.9,
+            evaluated_at = '2026-08-30 06:00:00'
+        """
+    )
+    db.conn.commit()
+
+    admitted = db.get_evaluated_discovery_candidates_for_admission(
+        limit=10,
+        source_platform="news",
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+
+    assert [row["candidate_key"] for row in admitted] == ["news:today"]
+
+
+def test_retire_outside_scope_leaves_claimed_and_today_rows_untouched(tmp_path: Path) -> None:
+    db = Database(tmp_path / "retire.db")
+    db.initialize()
+    db.enqueue_discovery_candidates(
+        [
+            DiscoveryCandidateWrite(
+                candidate_key="news:old-pending",
+                source_platform="news",
+                source_strategy="news-refresh",
+                content_id="old-pending",
+                published_at="2026-08-28T05:00:00Z",
+            ),
+            DiscoveryCandidateWrite(
+                candidate_key="news:old-claimed",
+                source_platform="news",
+                source_strategy="news-refresh",
+                content_id="old-claimed",
+                published_at="2026-08-28T06:00:00Z",
+            ),
+            DiscoveryCandidateWrite(
+                candidate_key="news:today",
+                source_platform="news",
+                source_strategy="news-refresh",
+                content_id="today",
+                published_at="2026-08-30T05:00:00Z",
+            ),
+        ]
+    )
+    db.conn.execute(
+        """
+        UPDATE discovery_candidates
+        SET status = 'evaluating', claim_token = 'owned', claimed_at = CURRENT_TIMESTAMP
+        WHERE candidate_key = 'news:old-claimed'
+        """
+    )
+    db.conn.commit()
+
+    retired = db.retire_discovery_candidates_outside_scope(
+        source_platform="news",
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+        limit=10,
+    )
+
+    rows = {
+        str(row["candidate_key"]): dict(row)
+        for row in db.conn.execute(
+            "SELECT candidate_key, status, claim_token FROM discovery_candidates"
+        ).fetchall()
+    }
+    assert retired == 1
+    assert rows["news:old-pending"]["status"] == "trimmed_capacity"
+    assert rows["news:old-claimed"] == {
+        "candidate_key": "news:old-claimed",
+        "status": "evaluating",
+        "claim_token": "owned",
+    }
+    assert rows["news:today"]["status"] == "pending_eval"
+
+
+def test_newsclaw_reconcile_uses_liked_rows_as_protected_target_floor(tmp_path: Path) -> None:
+    db = Database(tmp_path / "protected-floor.db")
+    db.initialize()
+    for index in range(3):
+        bvid = f"liked-{index}"
+        db.cache_content(
+            bvid,
+            title=bvid,
+            source_platform="news",
+            source="news-rss",
+            content_url=f"https://example.com/{bvid}",
+            published_at="2026-08-30T05:00:00Z",
+            relevance_score=0.9,
+            style_key="news",
+            topic_group=f"topic-{index}",
+        )
+        db.update_pool_copy(
+            bvid,
+            expression=f"reason-{index}",
+            topic_label=f"topic-{index}",
+        )
+    db.conn.execute("UPDATE content_cache SET feedback_type = 'like'")
+    db.conn.commit()
+
+    maintained = db.reconcile_newsclaw_pool_after_admission(
+        target=2,
+        raw_ceiling=2,
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+
+    assert maintained == 0
+    assert db.count_pool_candidates() == 3
+    assert {
+        str(row["feedback_type"])
+        for row in db.conn.execute("SELECT feedback_type FROM content_cache").fetchall()
+    } == {"like"}

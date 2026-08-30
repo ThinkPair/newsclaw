@@ -1972,10 +1972,12 @@ def create_app(
     app = FastAPI(title=app_title, default_response_class=JSONResponse)
 
     def _delight_source_allowed(item: dict[str, Any]) -> bool:
-        """Keep legacy delight behavior while isolating NewsClaw to news rows."""
+        """Keep legacy delight behavior while isolating NewsClaw to today's news."""
         if not newsclaw_mode:
             return True
-        return str(item.get("source_platform", "")).strip().lower() == "news"
+        return str(
+            item.get("source_platform", "")
+        ).strip().lower() == "news" and _publication_is_china_today(item.get("published_at"))
 
     # GZip middleware: only compress responses ≥ 500 bytes.
     # ``minimum_size=0`` was previously used as a sledgehammer workaround
@@ -2273,9 +2275,9 @@ def create_app(
 
     if newsclaw_mode:
         # The refresh controller publishes proactive delight events directly
-        # through the shared hub.  Filter at that final boundary so stale rows
-        # left by an older OpenBiliClaw runtime can never reach any WebSocket
-        # client, even before the pending endpoints are queried.
+        # through the shared hub.  Filter source and Beijing publication date at
+        # that final boundary so stale rows left by an older runtime can never
+        # reach any WebSocket client, even before pending endpoints are queried.
         original_publish = getattr(ctx.event_hub, "publish", None)
         if callable(original_publish):
 
@@ -3004,6 +3006,18 @@ def create_app(
                     setattr(runtime_controller, field_name, field_value)
                 except (AttributeError, TypeError):
                     logger.debug("runtime fixture does not accept %s", field_name)
+            coordinator = getattr(runtime_controller, "candidate_eval_coordinator", None)
+            candidate_pipeline = getattr(coordinator, "pipeline", None)
+            if candidate_pipeline is not None:
+                try:
+                    candidate_pipeline.pool_target_count = values["pool_target_count"]
+                    candidate_pipeline.capacity_daily_budget = values["pool_target_count"]
+                    candidate_pipeline.capacity_raw_ceiling = max(
+                        values["pool_target_count"] * 2,
+                        values["pool_target_count"] + 120,
+                    )
+                except (AttributeError, TypeError):
+                    logger.debug("candidate pipeline does not accept NewsClaw target binding")
 
         feedback_threshold = max(
             1,
@@ -3033,11 +3047,103 @@ def create_app(
                 runtime_controller.image_fetch_coordinator = image_fetch_coordinator
             except (AttributeError, TypeError):
                 logger.debug("runtime fixture does not accept image fetch binding")
-            if newsclaw_mode:
+            try:
+                runtime_controller.newsclaw_mode = bool(newsclaw_mode)
+            except (AttributeError, TypeError):
+                logger.debug("runtime fixture does not accept NewsClaw mode binding")
+            candidate_coordinator = getattr(
+                runtime_controller,
+                "candidate_eval_coordinator",
+                None,
+            )
+            if candidate_coordinator is not None:
                 try:
-                    runtime_controller.newsclaw_mode = True
+                    candidate_coordinator.process_pending_at_capacity = bool(newsclaw_mode)
                 except (AttributeError, TypeError):
-                    logger.debug("runtime fixture does not accept NewsClaw mode binding")
+                    logger.debug("candidate evaluator does not accept NewsClaw capacity binding")
+                candidate_pipeline = getattr(candidate_coordinator, "pipeline", None)
+                if candidate_pipeline is not None:
+                    try:
+                        if newsclaw_mode:
+                            from openbiliclaw.discovery.candidate_pipeline import (
+                                CandidateEvalScope,
+                            )
+
+                            def _newsclaw_eval_scope() -> CandidateEvalScope:
+                                _date, after, before = _china_today_window()
+                                return CandidateEvalScope(
+                                    source_platform="news",
+                                    published_after=after,
+                                    published_before=before,
+                                )
+
+                            def _newsclaw_post_admission_maintenance(
+                                source_family: str,
+                                limit: int,
+                            ) -> int:
+                                del limit
+                                if str(source_family or "").strip().lower() != "news":
+                                    return 0
+                                reconcile = getattr(
+                                    ctx.database,
+                                    "reconcile_newsclaw_pool_after_admission",
+                                    None,
+                                )
+                                if not callable(reconcile):
+                                    return 0
+                                _date, after, before = _china_today_window()
+                                target = max(
+                                    1,
+                                    int(
+                                        getattr(candidate_pipeline, "pool_target_count", 300) or 300
+                                    ),
+                                )
+                                raw_ceiling = max(
+                                    target,
+                                    int(
+                                        getattr(
+                                            candidate_pipeline,
+                                            "capacity_raw_ceiling",
+                                            0,
+                                        )
+                                        or max(target * 2, target + 120)
+                                    ),
+                                )
+                                return int(
+                                    reconcile(
+                                        target=target,
+                                        raw_ceiling=raw_ceiling,
+                                        published_after=after,
+                                        published_before=before,
+                                    )
+                                    or 0
+                                )
+
+                            candidate_pipeline.eval_scope_provider = _newsclaw_eval_scope
+                            candidate_pipeline.capacity_budget_key = "newsclaw_today"
+                            lane_target = max(
+                                1,
+                                int(getattr(candidate_pipeline, "pool_target_count", 300) or 300),
+                            )
+                            candidate_pipeline.capacity_daily_budget = lane_target
+                            candidate_pipeline.capacity_raw_ceiling = max(
+                                lane_target * 2,
+                                lane_target + 120,
+                            )
+                            candidate_pipeline.post_admission_maintenance = (
+                                _newsclaw_post_admission_maintenance
+                            )
+                        else:
+                            candidate_pipeline.eval_scope_provider = None
+                            candidate_pipeline.capacity_budget_key = ""
+                            candidate_pipeline.capacity_daily_budget = 0
+                            candidate_pipeline.capacity_raw_ceiling = 0
+                            candidate_pipeline.post_admission_maintenance = None
+                    except (AttributeError, TypeError):
+                        logger.debug(
+                            "candidate pipeline does not accept NewsClaw scoped-lane binding"
+                        )
+            if newsclaw_mode:
                 news_runtime = getattr(app.state, "newsclaw_runtime", None)
                 runtime_settings = getattr(news_runtime, "settings", None)
                 if callable(runtime_settings):
@@ -10207,13 +10313,25 @@ def create_app(
             with suppress(Exception):
                 threshold = float(dynamic_threshold())
 
-        candidates = ctx.database.get_delight_candidates(
-            min_delight_score=threshold,
-            # Old rows may sort ahead of news rows in a fresh NewsClaw clone.
-            # Overscan before filtering so the requested news count can still
-            # be filled.  Legacy mode keeps its exact historical query limit.
-            limit=100 if newsclaw_mode else count,
-        )
+        get_candidates = ctx.database.get_delight_candidates
+        trigger_kwargs: dict[str, object] = {
+            "min_delight_score": threshold,
+            # Compatibility adapters may not expose SQL source/date filters;
+            # keep the bounded overscan for them while the production store
+            # filters before ORDER/LIMIT.
+            "limit": 100 if newsclaw_mode else count,
+        }
+        if newsclaw_mode:
+            _today, trigger_after, trigger_before = _china_today_window()
+            with suppress(TypeError, ValueError):
+                parameters = inspect.signature(get_candidates).parameters
+                if "source_platform" in parameters:
+                    trigger_kwargs["source_platform"] = "news"
+                if "published_after" in parameters:
+                    trigger_kwargs["published_after"] = trigger_after
+                if "published_before" in parameters:
+                    trigger_kwargs["published_before"] = trigger_before
+        candidates = get_candidates(**trigger_kwargs)
         pushed: list[str] = []
         for row in candidates:
             if not _delight_source_allowed(row):
@@ -10358,6 +10476,8 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
             with suppress(TypeError, ValueError):
                 parameters = inspect.signature(get_candidates).parameters
+                if "source_platform" in parameters:
+                    candidate_kwargs["source_platform"] = "news"
                 if "published_after" in parameters:
                     candidate_kwargs["published_after"] = published_after
                 if "published_before" in parameters:
@@ -10436,6 +10556,13 @@ def create_app(
         pending_count = 0
         processing_active = False
         scoped_count_succeeded = False
+        scoped_runtime_status: Mapping[str, Any] = {}
+        get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
+        if callable(get_runtime_status):
+            with suppress(Exception):
+                raw_runtime_status = await asyncio.to_thread(get_runtime_status)
+                if isinstance(raw_runtime_status, Mapping):
+                    scoped_runtime_status = raw_runtime_status
         count_processing = getattr(ctx.database, "count_delight_processing_candidates", None)
         if callable(count_processing):
             try:
@@ -10459,22 +10586,17 @@ def create_app(
             # Compatibility fallback for adapters that do not expose the
             # source/date-scoped counter. Include every live stage so a
             # claimed batch cannot briefly look empty while the LLM is busy.
-            get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
-            if callable(get_runtime_status):
-                with suppress(Exception):
-                    runtime_status = await asyncio.to_thread(get_runtime_status)
-                    if isinstance(runtime_status, Mapping):
-                        processing_counts = [
-                            max(0, int(runtime_status.get(field, 0) or 0))
-                            for field in (
-                                "candidate_eval_pending",
-                                "candidate_eval_in_flight",
-                                "expression_pending_count",
-                                "pool_evaluated_pending_count",
-                            )
-                        ]
-                        pending_count = max(processing_counts, default=0)
-                        processing_active = any(processing_counts)
+            processing_counts = [
+                max(0, int(scoped_runtime_status.get(field, 0) or 0))
+                for field in (
+                    "candidate_eval_pending",
+                    "candidate_eval_in_flight",
+                    "expression_pending_count",
+                    "pool_evaluated_pending_count",
+                )
+            ]
+            pending_count = max(processing_counts, default=0)
+            processing_active = any(processing_counts)
         refresh_running = False
         last_refresh_at = ""
         news_runtime = getattr(app.state, "newsclaw_runtime", None)
@@ -10486,11 +10608,7 @@ def create_app(
                     refresh_running = bool(news_state.get("refresh_running", False))
                     last_refresh_at = str(news_state.get("last_refresh", "") or "")
         queue_state = (
-            "processing"
-            if refresh_running or processing_active
-            else "ready"
-            if items
-            else "empty"
+            "processing" if refresh_running or processing_active else "ready" if items else "empty"
         )
         return {
             "items": items,
@@ -10498,6 +10616,22 @@ def create_app(
             "date": today_date,
             "state": queue_state,
             "pending_count": pending_count,
+            "pending_ready": max(
+                0,
+                int(scoped_runtime_status.get("candidate_eval_pending_ready", 0) or 0),
+            ),
+            "evaluating": max(
+                0,
+                int(scoped_runtime_status.get("candidate_eval_evaluating", 0) or 0),
+            ),
+            "evaluated": max(
+                0,
+                int(scoped_runtime_status.get("candidate_eval_evaluated", 0) or 0),
+            ),
+            "budget_remaining": max(
+                0,
+                int(scoped_runtime_status.get("candidate_eval_budget_remaining", 0) or 0),
+            ),
             "last_refresh_at": last_refresh_at,
         }
 

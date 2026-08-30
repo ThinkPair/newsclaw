@@ -10,6 +10,7 @@ import pytest
 from openbiliclaw.discovery.candidate_pipeline import (
     CandidateEvalClaim,
     CandidateEvalOutcome,
+    CandidateEvalScope,
     DiscoveryCandidatePipeline,
 )
 from openbiliclaw.discovery.candidate_pool import DiscoveryCandidateWrite
@@ -45,8 +46,15 @@ class _FakeStagedPipeline:
         self.admit_limits: list[int] = []
         self.evaluated_pending_admission = 0
         self.admitted_pending_copy = 0
+        self.capacity_lane_enabled = False
 
-    def claim_batch(self, *, limit: int) -> CandidateEvalClaim | None:
+    def claim_batch(
+        self,
+        *,
+        limit: int,
+        at_capacity: bool = False,
+    ) -> CandidateEvalClaim | None:
+        del at_capacity
         count = min(limit, self.pending_eval)
         if count <= 0:
             return None
@@ -125,6 +133,16 @@ class _FakeStagedPipeline:
                 }
             )
 
+    def capacity_work_waiting(self) -> bool:
+        return self.capacity_lane_enabled and (
+            self.pending_eval > 0 or self.evaluated_pending_admission > 0
+        )
+
+    def capacity_evaluated_waiting_count(self) -> int:
+        if not self.capacity_lane_enabled:
+            return 0
+        return self.evaluated_pending_admission
+
     def fail(self, index: int, error: BaseException) -> None:
         batch = self.started[index]
         if not batch.future.done():
@@ -160,6 +178,36 @@ def test_effective_candidate_eval_workers_reserves_one_llm_slot() -> None:
     assert effective_candidate_eval_workers(8, 9) == 3
     assert effective_candidate_eval_workers(8, 1) == 1
     assert effective_candidate_eval_workers(0, 99) == 1
+
+
+def test_newsclaw_status_payload_reports_scoped_queue_and_budget() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=3)
+    pipeline.capacity_work_counts = lambda: {  # type: ignore[attr-defined]
+        "pending_eval_ready": 2,
+        "evaluating": 1,
+        "evaluated": 4,
+        "budget_remaining": 23,
+    }
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=10,
+            target=10,
+            pending_eval=3,
+            evaluating=1,
+            evaluated_pending_admission=4,
+            admitted_pending_copy=0,
+        ),
+        profile_provider=lambda: object(),
+        process_pending_at_capacity=True,
+    )
+
+    status = coordinator.status_payload()
+
+    assert status["candidate_eval_pending_ready"] == 2
+    assert status["candidate_eval_evaluating"] == 1
+    assert status["candidate_eval_evaluated"] == 4
+    assert status["candidate_eval_budget_remaining"] == 23
 
 
 def test_coordinator_uses_pipeline_coalescing_claim() -> None:
@@ -428,6 +476,241 @@ async def test_existing_pending_copy_at_target_avoids_claim_and_admission() -> N
     assert pipeline.admit_limits == []
     await coordinator.stop()
     await task
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_mode_processes_new_candidates_when_display_pool_is_full() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=30)
+    pipeline.available = 10
+    pipeline.capacity_lane_enabled = True
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=pipeline.available,
+            target=10,
+            pending_eval=pipeline.pending_eval,
+            evaluating=pipeline.in_flight * 30,
+            evaluated_pending_admission=pipeline.evaluated_pending_admission,
+            admitted_pending_copy=pipeline.admitted_pending_copy,
+        ),
+        profile_provider=lambda: object(),
+        worker_count=1,
+        batch_size=30,
+        process_pending_at_capacity=True,
+        safety_wake_seconds=0.01,
+    )
+    task = asyncio.create_task(coordinator.run_forever())
+    await pipeline.wait_for_started(1)
+
+    pipeline.finish(0, cached=30)
+    async with asyncio.timeout(2):
+        while not pipeline.completion_limits:
+            await asyncio.sleep(0)
+
+    assert pipeline.completion_limits == [30]
+    assert pipeline.pending_eval == 0
+    assert coordinator.status_payload()["candidate_eval_process_pending_at_capacity"] is True
+    await coordinator.stop()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_newsclaw_mode_admits_evaluated_waiters_when_display_pool_is_full() -> None:
+    pipeline = _FakeStagedPipeline(candidate_count=0)
+    pipeline.available = 10
+    pipeline.evaluated_pending_admission = 5
+    pipeline.capacity_lane_enabled = True
+    coordinator = CandidateEvalCoordinator(
+        pipeline=pipeline,
+        snapshot_provider=lambda: CandidateEvalSnapshot(
+            available=pipeline.available,
+            target=10,
+            pending_eval=pipeline.pending_eval,
+            evaluating=0,
+            evaluated_pending_admission=pipeline.evaluated_pending_admission,
+            admitted_pending_copy=pipeline.admitted_pending_copy,
+        ),
+        profile_provider=lambda: object(),
+        process_pending_at_capacity=True,
+        safety_wake_seconds=0.01,
+    )
+    task = asyncio.create_task(coordinator.run_forever())
+    async with asyncio.timeout(2):
+        while not pipeline.admit_limits:
+            await asyncio.sleep(0)
+
+    assert pipeline.admit_limits == [5]
+    assert pipeline.evaluated_pending_admission == 0
+    assert pipeline.admitted_pending_copy == 5
+    await coordinator.stop()
+    await task
+
+
+def test_newsclaw_pipeline_reconciles_only_after_new_scoped_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = 10
+    reconciled: list[tuple[str, int]] = []
+
+    def reconcile(source_family: str, limit: int) -> int:
+        nonlocal available
+        reconciled.append((source_family, limit))
+        available -= limit
+        return 1
+
+    def admit(*args: object, **kwargs: object) -> str:
+        nonlocal available
+        del args, kwargs
+        available += 1
+        return "cached"
+
+    pipeline = DiscoveryCandidatePipeline(
+        database=object(),
+        discovery_engine=object(),  # type: ignore[arg-type]
+        eval_scope_provider=lambda: CandidateEvalScope(
+            source_platform="news",
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+        ),
+        pool_target_count=10,
+        capacity_raw_ceiling=20,
+        post_admission_maintenance=reconcile,
+    )
+    monkeypatch.setattr(pipeline, "_pool_available_count", lambda: available)
+    monkeypatch.setattr(pipeline, "_pool_raw_count", lambda: available)
+    monkeypatch.setattr(pipeline, "_admit_one", admit)
+
+    cached, rejected = pipeline._admit_rows(  # noqa: SLF001
+        [
+            (
+                {
+                    "id": 1,
+                    "source_platform": "news",
+                    "published_at": "2026-08-30T05:00:00Z",
+                },
+                object(),
+            )
+        ],  # type: ignore[list-item]
+        recently_viewed=set(),
+        admitted_items=[],
+        cache_limit=1,
+    )
+
+    assert (cached, rejected) == (1, 0)
+    assert reconciled == [("news", 1)]
+    assert available == 10
+
+
+def test_newsclaw_pipeline_does_not_reconcile_old_or_non_news_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reconciled: list[tuple[str, int]] = []
+    pipeline = DiscoveryCandidatePipeline(
+        database=object(),
+        discovery_engine=object(),  # type: ignore[arg-type]
+        eval_scope_provider=lambda: CandidateEvalScope(
+            source_platform="news",
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+        ),
+        pool_target_count=10,
+        capacity_raw_ceiling=20,
+        post_admission_maintenance=(lambda family, limit: reconciled.append((family, limit)) or 1),
+    )
+    monkeypatch.setattr(pipeline, "_pool_available_count", lambda: 10)
+    monkeypatch.setattr(pipeline, "_admit_one", lambda *args, **kwargs: "cached")
+
+    cached, rejected = pipeline._admit_rows(  # noqa: SLF001
+        [
+            (
+                {
+                    "id": 1,
+                    "source_platform": "news",
+                    "published_at": "2026-08-29T12:00:00Z",
+                },
+                object(),
+            ),
+            (
+                {
+                    "id": 2,
+                    "source_platform": "bilibili",
+                    "published_at": "2026-08-30T05:00:00Z",
+                },
+                object(),
+            ),
+        ],  # type: ignore[list-item]
+        recently_viewed=set(),
+        admitted_items=[],
+        cache_limit=2,
+    )
+
+    assert (cached, rejected) == (0, 0)
+    assert reconciled == []
+
+
+def test_newsclaw_existing_cache_repair_does_not_evict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reconciled: list[tuple[str, int]] = []
+    pipeline = DiscoveryCandidatePipeline(
+        database=object(),
+        discovery_engine=object(),  # type: ignore[arg-type]
+        eval_scope_provider=lambda: CandidateEvalScope(
+            source_platform="news",
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+        ),
+        pool_target_count=10,
+        capacity_raw_ceiling=20,
+        post_admission_maintenance=(lambda family, limit: reconciled.append((family, limit)) or 1),
+    )
+    monkeypatch.setattr(pipeline, "_pool_available_count", lambda: 10)
+    monkeypatch.setattr(pipeline, "_admit_one", lambda *args, **kwargs: "repaired")
+
+    cached, rejected = pipeline._admit_rows(  # noqa: SLF001
+        [
+            (
+                {
+                    "id": 1,
+                    "source_platform": "news",
+                    "published_at": "2026-08-30T05:00:00Z",
+                },
+                object(),
+            )
+        ],  # type: ignore[list-item]
+        recently_viewed=set(),
+        admitted_items=[],
+        cache_limit=1,
+    )
+
+    assert (cached, rejected) == (1, 0)
+    assert reconciled == []
+
+
+def test_default_pipeline_still_stops_admission_at_display_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = DiscoveryCandidatePipeline(
+        database=object(),
+        discovery_engine=object(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(pipeline, "_pool_full", lambda: True)
+    admitted: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_admit_one",
+        lambda *args, **kwargs: admitted.append("cached") or "cached",
+    )
+
+    cached, rejected = pipeline._admit_rows(  # noqa: SLF001
+        [({"id": 1}, object())],  # type: ignore[list-item]
+        recently_viewed=set(),
+        admitted_items=[],
+        cache_limit=1,
+    )
+
+    assert (cached, rejected) == (0, 0)
+    assert admitted == []
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+from openbiliclaw.api import news_routes as news_routes_module
 from openbiliclaw.api.news_routes import (
     DEFAULT_NEWS_SOURCES,
     NewsBootstrapIn,
@@ -69,6 +70,74 @@ def _runtime(tmp_path: Path) -> NewsRuntime:
         event_ingress=_FakeIngress(),
         request_replenishment=_noop_replenishment,
     )
+
+
+@pytest.mark.asyncio
+async def test_publish_candidates_enqueues_only_beijing_today_and_retires_old_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 30, 6, 0, tzinfo=UTC)
+    monkeypatch.setattr(news_routes_module, "_utc_now", lambda: now)
+
+    class CaptureDatabase(_FakeDatabase):
+        def __init__(self) -> None:
+            self.writes: list[Any] = []
+            self.retire_calls: list[dict[str, object]] = []
+
+        def retire_discovery_candidates_outside_scope(self, **kwargs: object) -> int:
+            self.retire_calls.append(dict(kwargs))
+            return 2
+
+        def enqueue_discovery_candidates(
+            self,
+            writes: object,
+            **_kwargs: object,
+        ) -> int:
+            self.writes = list(writes)  # type: ignore[arg-type]
+            return len(self.writes)
+
+    database = CaptureDatabase()
+    runtime = NewsRuntime(
+        data_path=tmp_path,
+        database=database,
+        soul_engine=_FakeSoul(),
+        event_ingress=_FakeIngress(),
+        request_replenishment=_noop_replenishment,
+    )
+    today = build_article(
+        media="今日来源",
+        provider="RSS",
+        title="今日变化",
+        canonical_url="https://example.com/today",
+        published_at="2026-08-30T05:00:00Z",
+        content_scope="title_only",
+        source_identifier="today",
+    )
+    old = build_article(
+        media="旧来源",
+        provider="RSS",
+        title="昨日变化",
+        canonical_url="https://example.com/old",
+        published_at="2026-08-29T05:00:00Z",
+        content_scope="title_only",
+        source_identifier="old",
+    )
+
+    inserted = await runtime.publish_candidates([old, today])
+    if runtime._background_tasks:
+        await asyncio.gather(*tuple(runtime._background_tasks))
+
+    assert inserted == 1
+    assert [write.title for write in database.writes] == ["今日变化"]
+    assert database.retire_calls == [
+        {
+            "source_platform": "news",
+            "published_after": "2026-08-29T16:00:00Z",
+            "published_before": "2026-08-30T06:05:00Z",
+            "limit": 600,
+        }
+    ]
 
 
 @pytest.mark.asyncio

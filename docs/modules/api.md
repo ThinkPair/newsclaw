@@ -4,6 +4,18 @@
 
 `src/openbiliclaw/api/` 暴露本地 FastAPI 契约，并把 UI 请求编排到 durable storage、Soul、Dialogue 与 runtime。本文记录配置、迁移、推荐和对话等公开端点；通用鉴权见 [api-auth.md](api-auth.md)，初始化端点见 [init.md](init.md)。
 
+## NewsClaw 今日首选与刷新状态
+
+NewsClaw 模式的 `GET /api/delight/pending`、`GET /api/delight/pending-batch`、
+主动 WebSocket 通知和手动触发统一使用 `source_platform=news` 与北京时间当天的
+半开发布时间区间 `[published_after, published_before)`。范围缺失、非法或底层不支持
+时 fail-closed，不能退化成全局候选读取，也不能拿旧闻补“今日”。
+
+批量响应继续区分 `ready / processing / empty / degraded`。运行状态同步公开同一范围内的
+`pending_ready`、`evaluating`、`evaluated` 和 `budget_remaining`，因此刷新按钮可以说明
+是在等待评估、已经没有合格材料，还是来源本身降级，而不是只转动图标。普通产品模式
+不启用该日期范围或满池预算。
+
 ## NewsClaw P4 个人记忆 API
 
 这些端点只在 `NEWSCLAW_MODE` 注册，响应固定声明

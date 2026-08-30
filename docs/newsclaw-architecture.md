@@ -165,6 +165,25 @@ confidence, lifecycle state, and deletion history.
 
 ## Decision workbench and local memory
 
+### Today Pick freshness and replacement contract
+
+“Today” means the Beijing calendar day, not the latest twenty rows and not a visual label.
+All Today Pick exits—single pending, batch, proactive WebSocket, and manual refresh—share
+`source_platform=news` plus the half-open publication window
+`[published_after, published_before)`. Missing or invalid scope fails closed.
+
+The refresh pipeline enqueues only articles in that window for recommendation evaluation;
+the continuous-tracking lane still receives the complete normalized and deduplicated fetch
+batch. At full or near-full capacity, a durable lane/day budget equal to the current pool
+target bounds model evaluation. Reservation and claim are atomic, use the actual claimed
+count, are not refunded after failure, and roll to a new key on the next Beijing day.
+
+There is no pre-eviction. A newly admitted row must finish expression copy and become
+servable before scoped reconciliation may remove a lower-priority row. Repairing an already
+cached row never evicts. Liked, already recommended, and token-owned rows are protected;
+when protected visible rows exceed the configured target, they define the effective floor.
+An empty or still-processing day remains explicit and older articles are never substituted.
+
 NewsClaw's desktop home is a decision workbench rather than a dense reading
 wall. The queue carries only priority, topic, title, source, time and evidence
 level; the selected-item pane owns the explanation and actions. Selection is

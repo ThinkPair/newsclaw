@@ -309,6 +309,10 @@ NewsClaw explicit research (REST / Agent Bridge)
         └─ no automatic profile learning, discovery admission, or recommendation write
 
 NewsClaw judgment workbench
+        → Beijing-today scope (`source_platform=news` + `[published_after, published_before)`)
+             → atomic lane/day budget → scoped claim/evaluation at full capacity
+             → copy-ready/servable commit → protected low-priority reconciliation
+             → Today Pick; honest empty/processing state, never old-news substitution
         → recommendation_tags projection (tags + decision-priority-v2 + why / impact / observations)
         → bounded stable sort → desktop priority queue / Today Pick → one selected detail
         ├─ explicit feedback → durable event → profile learning

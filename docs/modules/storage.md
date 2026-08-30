@@ -4,6 +4,19 @@
 
 `src/openbiliclaw/storage/` 负责本地 SQLite 数据库、schema 初始化、候选池计数和高频读写路径。它不理解 runtime state 或用户画像，只提供确定性的持久化 API。
 
+## NewsClaw 今日候选的持久边界
+
+- `candidate_eval_daily_budgets` 按 lane 和北京时间日期保存满池评估预留数。余量计算、
+  候选 CAS claim 与实际领取数预留位于同一个 `BEGIN IMMEDIATE` 事务；失败、取消或进程
+  崩溃不退款，跨日自然使用新 key。当前每日上限等于运行时推荐池目标，不是隐藏的无限量。
+- claim、admission、计数和状态查询必须共享同一个 `source_platform +
+  [published_after, published_before)` 范围。范围外未领取旧行会有界进入明确终态，不能
+  长期占用今日队列；SQL 在排序与 LIMIT 之前过滤，避免其它来源的高分行遮住今日新闻。
+- 不预先腾坑。新候选只有在推荐文案完成并成为 `servable` 后，才执行同范围的池维护。
+  existing-cache repair 不驱逐任何旧行。维护优先移除低优先级未保护行，并保护 liked、
+  已推荐和 token-owned 行；若受保护可展示数高于配置目标，以该保护数作为有效下限。
+  raw 行数仍受共享 ceiling 限制。
+
 本模块当前承担六类边界：
 
 - 行为、推荐、候选池、聊天和鉴权状态的 SQLite 表结构管理。

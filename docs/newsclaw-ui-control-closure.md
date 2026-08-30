@@ -18,6 +18,7 @@
 | 推荐卡“聊一聊”、发送 / 取消 | `handleCardAction` | `POST /feedback` (`comment`) | 评论线索落库并参与学习 | 状态行 + toast | 草稿恢复，状态行显示原因 | 闭环 |
 | 推荐卡 / 惊喜卡收藏、稍后读、取消 | `desktopSavedMutations.toggle` | `POST /saved/favorite|watch_later`、`/remove` | 本机会员表；news 强制 `local_only_source`，清空旧 sync task 回显 | 按钮状态与“已保存 / 移除到本机” | 按钮回滚，状态行显示失败 | 闭环；不写画像，不同步媒体账号 |
 | 惊喜上 / 下一条、展开摘要 | `setActiveDelight` / excerpt toggle | 无（已加载队列） | 前端索引 / DOM | 卡片和 `x/y` 更新 | 空队列不执行 | 闭环 |
+| 今日首选刷新 | `refreshTodayPick` / 今日队列串行读取 | `GET /api/delight/pending-batch`、`POST /api/delight/trigger` | 北京时间今日 `news` 范围、持久评估预算和后端队列真值 | ready 时替换今日队列；processing/empty/degraded 分别回显 | 保留已加载内容，不用旧闻伪装成功；重叠点击共享最新结果 | 闭环 |
 | 惊喜阅读、喜欢、不感兴趣、看过 / 忽略 | `respondDelight` | `POST /delight/respond`；阅读同时 `/recommendation-click` | 惊喜响应和点击事件落库 | 状态行 / toast，已处理项出队 | 未成功时保留项并显示错误 | 闭环 |
 | 惊喜“聊一聊” / 发送 | `respondDelight(send-comment)` | `POST /chat/turns`、`GET /chat/turns/{id}` | 对话 turn 落库 | pending → completed 回复 | 草稿恢复、failed / 超时文案 | 闭环 |
 | 内容库稍后读 / 收藏 / 历史 tab，刷新、加载、重试 | `openContentLibraryPage`、`refresh*`、`loadContentHistoryPage` | `GET /saved/{kind}`、`GET /content-history` | 服务端本地会员 / 30 天历史 | 计数、列表、分页回显 | 保留已加载项并提供重试 | 闭环 |

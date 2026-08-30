@@ -6132,6 +6132,11 @@ class TestBackendAPI:
             "candidate_eval_last_batch_seconds": 0.0,
             "candidate_eval_last_cached": 0,
             "candidate_eval_last_rejected": 0,
+            "candidate_eval_process_pending_at_capacity": False,
+            "candidate_eval_pending_ready": 0,
+            "candidate_eval_evaluating": 0,
+            "candidate_eval_evaluated": 0,
+            "candidate_eval_budget_remaining": 0,
             "expression_pending_count": 0,
             "expression_batch_state": "idle",
             "expression_batch_deadline": 0.0,
@@ -12132,12 +12137,24 @@ class TestBackendAPI:
                     "type": "delight.candidate",
                     "bvid": "news-push",
                     "source_platform": "news",
+                    "published_at": datetime.now(UTC).isoformat(),
+                }
+            )
+        )
+        old_news_delivered = asyncio.run(
+            app.state.runtime_context.event_hub.publish(
+                {
+                    "type": "delight.candidate",
+                    "bvid": "old-news-push",
+                    "source_platform": "news",
+                    "published_at": (datetime.now(UTC) - timedelta(days=2)).isoformat(),
                 }
             )
         )
 
         assert legacy_delivered is False
         assert news_delivered is True
+        assert old_news_delivered is False
         assert [event["bvid"] for event in event_hub.events] == ["news-1", "news-push"]
 
     def test_newsclaw_startup_marks_filtered_runtime_and_starts_feedback_owner(
@@ -12175,11 +12192,16 @@ class TestBackendAPI:
 
         monkeypatch.setenv("NEWSCLAW_MODE", "1")
         monkeypatch.setattr(api_app, "FeedbackBatchScheduler", FakeFeedbackBatchScheduler)
+        candidate_pipeline = SimpleNamespace()
+        candidate_coordinator = SimpleNamespace(pipeline=candidate_pipeline)
+        runtime_controller = SimpleNamespace(
+            candidate_eval_coordinator=candidate_coordinator,
+        )
         app = create_app(
             memory_manager=object(),
             database=object(),
             soul_engine=object(),
-            runtime_controller=SimpleNamespace(),
+            runtime_controller=runtime_controller,
         )
         restart_modes: list[bool] = []
 
@@ -12196,6 +12218,50 @@ class TestBackendAPI:
         assert restart_modes == [True]
         assert resume_calls == [False]
         assert recovery_calls == ["started"]
+        assert candidate_coordinator.process_pending_at_capacity is True
+        scope = candidate_pipeline.eval_scope_provider()
+        assert scope.source_platform == "news"
+        assert scope.published_after < scope.published_before
+        assert candidate_pipeline.capacity_budget_key == "newsclaw_today"
+        assert candidate_pipeline.capacity_daily_budget == 300
+        assert candidate_pipeline.capacity_raw_ceiling == 600
+        assert callable(candidate_pipeline.post_admission_maintenance)
+
+    def test_normal_mode_clears_newsclaw_candidate_lane_bindings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("NEWSCLAW_MODE", raising=False)
+        candidate_pipeline = SimpleNamespace(
+            eval_scope_provider=lambda: object(),
+            capacity_budget_key="stale",
+            capacity_daily_budget=99,
+            capacity_raw_ceiling=999,
+            post_admission_maintenance=lambda *_args: 1,
+        )
+        candidate_coordinator = SimpleNamespace(
+            pipeline=candidate_pipeline,
+            process_pending_at_capacity=True,
+        )
+        runtime_controller = SimpleNamespace(
+            candidate_eval_coordinator=candidate_coordinator,
+            newsclaw_mode=True,
+        )
+
+        create_app(
+            memory_manager=object(),
+            database=object(),
+            soul_engine=object(),
+            runtime_controller=runtime_controller,
+        )
+
+        assert runtime_controller.newsclaw_mode is False
+        assert candidate_coordinator.process_pending_at_capacity is False
+        assert candidate_pipeline.eval_scope_provider is None
+        assert candidate_pipeline.capacity_budget_key == ""
+        assert candidate_pipeline.capacity_daily_budget == 0
+        assert candidate_pipeline.capacity_raw_ceiling == 0
+        assert candidate_pipeline.post_admission_maintenance is None
 
     def test_newsclaw_hot_reload_marks_rebuilt_runtime_and_resumes_feedback(
         self,

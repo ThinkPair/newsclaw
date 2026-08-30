@@ -97,6 +97,7 @@ class CandidateEvalCoordinator:
         on_admitted: Callable[[int], None] | None = None,
         work_allowed: Any | None = None,
         pre_admit_hook: Callable[[], None] | None = None,
+        process_pending_at_capacity: bool = False,
         safety_wake_seconds: float = 60.0,
         time_fn: Any = time.monotonic,
     ) -> None:
@@ -108,6 +109,11 @@ class CandidateEvalCoordinator:
         # summary here so those Phase 3/4 behaviors are reached under the
         # production (coordinator) assembly, not only the legacy drain.
         self.pre_admit_hook = pre_admit_hook
+        # NewsClaw's daily feed is a continuous intelligence lane: a full
+        # historical display pool must not strand newly fetched news forever.
+        # The default remains False so ordinary OpenBiliClaw inventory and LLM
+        # spending keep their established target gate.
+        self.process_pending_at_capacity = bool(process_pending_at_capacity)
         # The approved inventory-safe design bounds live raw work to 3×30.
         # This constructor clamp protects direct composition roots as well as
         # normal config/API validation.
@@ -198,12 +204,19 @@ class CandidateEvalCoordinator:
                 snapshot = self._snapshot()
                 self._admit_evaluated(snapshot)
                 snapshot = self._snapshot()
-                if self._projected_inventory(snapshot) >= snapshot.target:
+                if self._projected_inventory(snapshot) >= snapshot.target and not (
+                    self.process_pending_at_capacity
+                    and self._capacity_independent_work_waiting(snapshot)
+                ):
                     self.state = "idle"
                 else:
                     coalescing_wait = self._fill_open_slots()
                     snapshot = self._snapshot()
-                    if not self._workers and snapshot.pending_eval <= 0:
+                    if (
+                        not self._workers
+                        and snapshot.pending_eval <= 0
+                        and self._evaluated_waiting_total(snapshot) <= 0
+                    ):
                         supply_cooldown_remaining = self._supply_cooldown_until - now
                         if supply_cooldown_remaining > 0:
                             self.state = "supply_cooldown"
@@ -245,6 +258,20 @@ class CandidateEvalCoordinator:
         """Return stable runtime diagnostics for API and event payloads."""
 
         snapshot = self._snapshot()
+        scoped_counts: dict[str, int] = {}
+        if self.process_pending_at_capacity:
+            count_scoped_work = getattr(self.pipeline, "capacity_work_counts", None)
+            if callable(count_scoped_work):
+                try:
+                    scoped_counts = {
+                        str(key): max(0, int(value or 0))
+                        for key, value in dict(count_scoped_work()).items()
+                    }
+                except Exception:
+                    logger.debug(
+                        "scoped candidate status unavailable",
+                        exc_info=True,
+                    )
         return {
             "candidate_eval_state": self.state,
             "candidate_eval_workers": self.worker_count,
@@ -257,6 +284,14 @@ class CandidateEvalCoordinator:
             "candidate_eval_last_batch_seconds": self.last_batch_seconds,
             "candidate_eval_last_cached": self.last_cached,
             "candidate_eval_last_rejected": self.last_rejected,
+            "candidate_eval_process_pending_at_capacity": self.process_pending_at_capacity,
+            "candidate_eval_pending_ready": scoped_counts.get(
+                "pending_eval_ready",
+                scoped_counts.get("pending_eval", 0),
+            ),
+            "candidate_eval_evaluating": scoped_counts.get("evaluating", 0),
+            "candidate_eval_evaluated": scoped_counts.get("evaluated", 0),
+            "candidate_eval_budget_remaining": scoped_counts.get("budget_remaining", 0),
         }
 
     def _snapshot(self) -> CandidateEvalSnapshot:
@@ -285,13 +320,57 @@ class CandidateEvalCoordinator:
     def _fill_open_slots(self) -> float | None:
         while not self._stopping and len(self._workers) < self.worker_count:
             snapshot = self._snapshot()
-            if self._projected_inventory(snapshot) >= snapshot.target or snapshot.pending_eval <= 0:
+            at_capacity = self._projected_inventory(snapshot) >= snapshot.target
+            if at_capacity and not (
+                self.process_pending_at_capacity
+                and self._capacity_independent_work_waiting(snapshot)
+            ):
                 return None
+            if snapshot.pending_eval <= 0 and not (
+                at_capacity
+                and self.process_pending_at_capacity
+                and self._capacity_independent_work_waiting(snapshot)
+            ):
+                return None
+            unreserved_headroom = max(
+                0,
+                snapshot.target
+                - snapshot.available
+                - self._eligible_pending_inventory(snapshot)
+                - max(0, snapshot.evaluating),
+            )
+            budget_required = self.process_pending_at_capacity and (
+                at_capacity or unreserved_headroom < self.batch_size
+            )
             claim_ready = getattr(self.pipeline, "claim_ready_batch", None)
             if callable(claim_ready):
-                claim = claim_ready(limit=self.batch_size)
+                try:
+                    claim = claim_ready(
+                        limit=self.batch_size,
+                        at_capacity=budget_required,
+                    )
+                except TypeError:
+                    if budget_required:
+                        logger.error(
+                            "candidate pipeline cannot enforce the at-capacity budget; "
+                            "refusing compatibility fallback"
+                        )
+                        return None
+                    claim = claim_ready(limit=self.batch_size)
             else:
-                claim = self.pipeline.claim_batch(limit=self.batch_size)
+                try:
+                    claim = self.pipeline.claim_batch(
+                        limit=self.batch_size,
+                        at_capacity=budget_required,
+                    )
+                except TypeError:
+                    if budget_required:
+                        logger.error(
+                            "candidate pipeline cannot enforce the at-capacity budget; "
+                            "refusing compatibility fallback"
+                        )
+                        return None
+                    claim = self.pipeline.claim_batch(limit=self.batch_size)
             if claim is None:
                 ready_in = getattr(self.pipeline, "eval_ready_in_seconds", None)
                 if callable(ready_in):
@@ -317,6 +396,11 @@ class CandidateEvalCoordinator:
         so any slot the rebalance frees is seated by under-share supply the same
         tick. Never raises into the eval loop.
         """
+        # NewsClaw's scoped lane replaces only after a new item has completed
+        # expression copy and become genuinely servable.  A legacy pre-admit
+        # rebalance would create an empty slot before that success is known.
+        if self.process_pending_at_capacity:
+            return
         hook = self.pre_admit_hook
         if hook is None:
             return
@@ -331,6 +415,17 @@ class CandidateEvalCoordinator:
             if snapshot.evaluated_waiting_total is None
             else max(0, snapshot.evaluated_waiting_total)
         )
+        if (
+            self.process_pending_at_capacity
+            and self._projected_inventory(snapshot) >= snapshot.target
+        ):
+            scoped_waiting = getattr(self.pipeline, "capacity_evaluated_waiting_count", None)
+            if callable(scoped_waiting):
+                try:
+                    waiting_total = max(0, int(scoped_waiting() or 0))
+                except Exception:
+                    logger.debug("scoped evaluated count unavailable", exc_info=True)
+                    waiting_total = 0
         if waiting_total <= 0:
             return
         admit = getattr(self.pipeline, "admit_evaluated", None)
@@ -340,6 +435,11 @@ class CandidateEvalCoordinator:
             0,
             snapshot.target - snapshot.available - self._eligible_pending_inventory(snapshot),
         )
+        if self.process_pending_at_capacity:
+            admission_headroom = max(
+                admission_headroom,
+                min(self.batch_size, waiting_total),
+            )
         cleanup_needed = waiting_total > max(0, snapshot.evaluated_pending_admission)
         if admission_headroom <= 0 and not cleanup_needed:
             return
@@ -361,6 +461,11 @@ class CandidateEvalCoordinator:
                     - snapshot.available
                     - self._eligible_pending_inventory(snapshot),
                 )
+                if self.process_pending_at_capacity:
+                    admission_headroom = max(
+                        admission_headroom,
+                        len(getattr(outcome.claim, "rows", ()) or ()),
+                    )
                 result = await self.pipeline.complete_claim(
                     outcome,
                     admission_limit=admission_headroom,
@@ -602,6 +707,23 @@ class CandidateEvalCoordinator:
         if value is None:
             value = snapshot.admitted_pending_copy
         return max(0, int(value))
+
+    @staticmethod
+    def _evaluated_waiting_total(snapshot: CandidateEvalSnapshot) -> int:
+        value = snapshot.evaluated_waiting_total
+        if value is None:
+            value = snapshot.evaluated_pending_admission
+        return max(0, int(value))
+
+    def _capacity_independent_work_waiting(self, snapshot: CandidateEvalSnapshot) -> bool:
+        scoped_waiting = getattr(self.pipeline, "capacity_work_waiting", None)
+        if callable(scoped_waiting):
+            try:
+                return bool(scoped_waiting())
+            except Exception:
+                logger.debug("scoped capacity work count unavailable", exc_info=True)
+                return False
+        return snapshot.pending_eval > 0 or self._evaluated_waiting_total(snapshot) > 0
 
     @staticmethod
     def _resume_notification(reason: str) -> bool:

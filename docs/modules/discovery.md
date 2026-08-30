@@ -8,6 +8,18 @@ API daemon 的候选 admission 成功后只同步调用轻量 expression `notify
 
 `discovery/` 包负责把用户的 Soul 画像转换成“可被搜索、可被评估、可被推荐”的候选内容集合。
 
+## NewsClaw 满池今日评估 lane
+
+`CandidateEvalScope(source_platform, published_after, published_before)` 是 NewsClaw 今日候选
+从 claim 到 admission 的单一范围合同。scope provider 缺失、抛错或返回非法区间时使用
+不可命中的 fail-closed 范围，绝不回落到全局候选。北京时间日界采用半开区间，完成评估
+时还会再校验一次，避免跨午夜把昨日材料写进今日池。
+
+NewsClaw 可在池已满或只差少量容量时继续处理这个 scoped lane，但必须携带持久 lane/day
+预算；超出预算的低优先级 ready 候选进入明确的 `trimmed_capacity` 终态。普通模式没有
+scope 或每日预算，仍按既有逻辑在满池时停止。入池成功只意味着候选已持久化；可见替换
+必须等 expression copy 完成后再由共享 reconciliation 执行。
+
 它解决的不是“某个平台上有没有内容”，而是“面对跨平台海量内容，系统应该先替这个用户去哪里找、找到之后为什么值得留下、怎样避免候选池被单一平台或单一方向刷满”。
 
 可以把 discovery 理解成推荐前的供给层：

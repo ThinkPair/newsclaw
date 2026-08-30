@@ -1,5 +1,17 @@
 # Runtime Module
 
+## NewsClaw 今日刷新调度
+
+NewsClaw runtime 为 candidate coordinator 开启 `process_pending_at_capacity`，并注入北京时间
+今日的 `news` scope、lane/day 持久预算、当前池目标和共享 raw ceiling。调度器在池已满时
+仍只领取该范围内的今日新闻；预算用尽后停止模型评估，并把真实 remaining/processing
+状态交给 API。正常新闻刷新只把北京时间今日文章送入推荐候选队列，但持续跟踪仍接收
+本轮完整的规范化、去重文章批次，不因首页范围而丢失跨日跟踪证据。
+
+文案生成使新条成为可服务状态后，runtime 才触发 NewsClaw 池维护；维护失败不会伪装
+成功，下一轮可以重新收敛。普通模式会清空这些 NewsClaw-only 绑定，保持原满池停止和
+来源份额维护语义。
+
 NewsClaw 模式的活动流会对推荐与反馈行做 `news` 范围过滤，并为旧库前排混有视频记录的情况扩大有界读取窗口；只有新闻行能进入活动卡片。通知控制器同时接受可选 `source_platform`，把范围下推到数据库候选查询，而不是取一条旧视频后在 API 层丢弃。
 
 每个 **API daemon** runtime generation 只拥有一个 expression copy coordinator：8 条立即、尾批固定 3 秒、单轮最多 60，零进展退避 15 秒，60 秒仅作 safety wake。停止 generation 会取消 collector、gate waiter 与运行中的 provider callback；状态接口暴露 pending/state/deadline/last completed/error。OpenClaw direct composition 不启动 daemon loop，故不创建该 coordinator；它在 inline admission 后同步 drain 最多 4 条 durable copy，且不在同一交互请求内做 split retry：有效 subset 立即入 canonical pool，剩余行保持 pending 供下次请求处理，返回前没有遗留 provider/copy task。参数来自 2026-07-12 生产日志校准。

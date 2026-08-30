@@ -8,7 +8,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from openbiliclaw.config import SchedulerConfig
@@ -1307,16 +1307,35 @@ class ContinuousRefreshController:
         # Pull a small batch and filter disliked topics in Python — there
         # are typically only a handful of high-score candidates and a
         # very short disliked list, so the overhead is negligible.
-        candidates = self.database.get_delight_candidates(
-            min_delight_score=self._dynamic_delight_threshold(),
-            limit=20,
-        )
+        get_candidates = self.database.get_delight_candidates
+        candidate_kwargs: dict[str, object] = {
+            "min_delight_score": self._dynamic_delight_threshold(),
+            "limit": 100 if self.newsclaw_mode else 20,
+        }
+        news_window: tuple[str, str] | None = None
+        if self.newsclaw_mode:
+            news_window = self._newsclaw_today_window()
+            with suppress(TypeError, ValueError):
+                parameters = inspect.signature(get_candidates).parameters
+                if "source_platform" in parameters:
+                    candidate_kwargs["source_platform"] = "news"
+                if "published_after" in parameters:
+                    candidate_kwargs["published_after"] = news_window[0]
+                if "published_before" in parameters:
+                    candidate_kwargs["published_before"] = news_window[1]
+        candidates = get_candidates(**candidate_kwargs)
         if not candidates:
             return None
 
         disliked_phrases = self._load_disliked_topic_phrases()
         candidate: dict[str, Any] | None = None
         for row in candidates:
+            if news_window is not None and not self._newsclaw_today_row(
+                row,
+                published_after=news_window[0],
+                published_before=news_window[1],
+            ):
+                continue
             title = str(row.get("title", "")).lower()
             tags_raw = str(row.get("tags", "")).lower()
             haystack = f"{title} {tags_raw}"
@@ -1380,6 +1399,50 @@ class ContinuousRefreshController:
             )
         )
         return result
+
+    def _newsclaw_today_window(self) -> tuple[str, str]:
+        """Return Beijing today's half-open UTC bounds for every push surface."""
+
+        china_tz = timezone(timedelta(hours=8))
+        current = self._now()
+        if current.tzinfo is None:
+            china_now = current.replace(tzinfo=china_tz)
+        else:
+            china_now = current.astimezone(china_tz)
+        current_utc = china_now.astimezone(UTC)
+        start_china = datetime.combine(
+            china_now.date(),
+            datetime.min.time(),
+            tzinfo=china_tz,
+        )
+        start_utc = start_china.astimezone(UTC)
+        next_midnight_utc = (start_china + timedelta(days=1)).astimezone(UTC)
+        before_utc = min(current_utc + timedelta(minutes=5), next_midnight_utc)
+        return (
+            start_utc.isoformat().replace("+00:00", "Z"),
+            before_utc.isoformat().replace("+00:00", "Z"),
+        )
+
+    @staticmethod
+    def _newsclaw_today_row(
+        row: Mapping[str, object],
+        *,
+        published_after: str,
+        published_before: str,
+    ) -> bool:
+        if str(row.get("source_platform") or "").strip().lower() != "news":
+            return False
+        try:
+            published = datetime.fromisoformat(
+                str(row.get("published_at") or "").strip().replace("Z", "+00:00")
+            )
+            after = datetime.fromisoformat(published_after.replace("Z", "+00:00"))
+            before = datetime.fromisoformat(published_before.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=UTC)
+        return after <= published.astimezone(UTC) < before
 
     def _load_disliked_topic_phrases(self) -> list[str]:
         """Return lowercased *effective* disliked-topic substrings.

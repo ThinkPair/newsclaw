@@ -76,6 +76,49 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _china_today_publication_window(
+    now: datetime | None = None,
+) -> tuple[str, str]:
+    """Return Beijing today's half-open UTC publication window.
+
+    The upper bound stops at ``now + 5 minutes`` instead of blindly accepting
+    the rest of the calendar day, so a bad publisher clock cannot seed future
+    cards into the current queue.
+    """
+
+    current = (now or _utc_now()).astimezone(UTC)
+    china_now = current + timedelta(hours=8)
+    start = datetime.combine(
+        china_now.date(),
+        datetime.min.time(),
+        tzinfo=UTC,
+    ) - timedelta(hours=8)
+    next_midnight = start + timedelta(days=1)
+    before = min(current + timedelta(minutes=5), next_midnight)
+    return (
+        start.isoformat().replace("+00:00", "Z"),
+        before.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _publication_in_window(value: object, *, after: str, before: str) -> bool:
+    """Return whether a publication instant falls inside a UTC half-open window."""
+
+    try:
+        published = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+        start = datetime.fromisoformat(after.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(before.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=UTC)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return start.astimezone(UTC) <= published.astimezone(UTC) < end.astimezone(UTC)
+
+
 def _bounded_text(value: object, *, maximum: int) -> str:
     return " ".join(str(value or "").split()).strip()[:maximum]
 
@@ -1118,13 +1161,36 @@ class NewsRuntime:
         )
 
     async def publish_candidates(self, articles: Iterable[Article]) -> int:
-        writes = [self._candidate(article) for article in articles]
+        published_after, published_before = _china_today_publication_window()
+        article_list = list(articles)
+        writes = [
+            self._candidate(article)
+            for article in article_list
+            if _publication_in_window(
+                article.published_at,
+                after=published_after,
+                before=published_before,
+            )
+        ]
+        target = _as_int(self.settings().get("pool_target_count", 300), 300)
+        retire_outside_scope = getattr(
+            self.database,
+            "retire_discovery_candidates_outside_scope",
+            None,
+        )
+        if callable(retire_outside_scope):
+            await asyncio.to_thread(
+                retire_outside_scope,
+                source_platform="news",
+                published_after=published_after,
+                published_before=published_before,
+                limit=max(target, discovery_candidate_pending_cap(target)),
+            )
         if not writes:
             return 0
         enqueue = getattr(self.database, "enqueue_discovery_candidates", None)
         if not callable(enqueue):
             raise RuntimeError("recommendation candidate queue is unavailable")
-        target = _as_int(self.settings().get("pool_target_count", 300), 300)
         try:
             inserted = int(
                 await asyncio.to_thread(

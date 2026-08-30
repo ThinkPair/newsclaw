@@ -706,6 +706,8 @@ class RuntimeContext:
         registry is empty so no cancel step is required, and remaining
         sync simplifies the FastAPI startup path which is itself sync.
         """
+        newsclaw_mode = os.environ.get("NEWSCLAW_MODE", "").strip() == "1"
+
         from openbiliclaw.bilibili.api import BilibiliAPIClient
         from openbiliclaw.bilibili.auth import resolve_runtime_cookie
         from openbiliclaw.discovery.engine import (
@@ -1491,10 +1493,28 @@ class RuntimeContext:
             new_runtime_controller._update_llm_inventory_state(  # noqa: SLF001
                 int(readiness.get("available", 0))
             )
-            status_counts = self.database.count_discovery_candidates_by_status()
+            if newsclaw_mode:
+                scoped_count = getattr(new_candidate_pipeline, "capacity_work_counts", None)
+                if callable(scoped_count):
+                    try:
+                        status_counts = dict(scoped_count())
+                    except Exception:
+                        logger.exception("NewsClaw scoped candidate snapshot failed closed")
+                        status_counts = {}
+                else:
+                    status_counts = {}
+            else:
+                status_counts = self.database.count_discovery_candidates_by_status()
+            evaluated_waiting = int(status_counts.get("evaluated", 0))
             return CandidateEvalSnapshot(
                 available=int(readiness.get("available", 0)),
-                target=int(new_config.scheduler.pool_target_count),
+                target=int(
+                    getattr(
+                        new_runtime_controller,
+                        "pool_target_count",
+                        new_config.scheduler.pool_target_count,
+                    )
+                ),
                 pending_eval=int(
                     status_counts.get(
                         "pending_eval_ready",
@@ -1502,10 +1522,14 @@ class RuntimeContext:
                     )
                 ),
                 evaluating=int(status_counts.get("evaluating", 0)),
-                evaluated_pending_admission=int(readiness.get("evaluated_pending", 0)),
+                evaluated_pending_admission=(
+                    evaluated_waiting
+                    if newsclaw_mode
+                    else int(readiness.get("evaluated_pending", 0))
+                ),
                 admitted_pending_copy=int(readiness.get("admitted_pending_copy", 0)),
                 admitted_pending_available=int(readiness.get("admitted_pending_available", 0)),
-                evaluated_waiting_total=int(status_counts.get("evaluated", 0)),
+                evaluated_waiting_total=evaluated_waiting,
             )
 
         async def _request_candidate_supply(reason: str) -> dict[str, object]:
@@ -1524,6 +1548,16 @@ class RuntimeContext:
             completed = await new_recommendation_engine.drain_pending_expression_copy(
                 profile=cast("Any", profile), limit=limit
             )
+            if newsclaw_mode:
+                after_copy = _candidate_eval_snapshot()
+                overflow = max(0, after_copy.available - after_copy.target)
+                maintenance = getattr(
+                    new_candidate_pipeline,
+                    "post_admission_maintenance",
+                    None,
+                )
+                if overflow > 0 and callable(maintenance):
+                    await asyncio.to_thread(maintenance, "news", overflow)
             await new_runtime_controller._publish_precompute_replenishment_if_needed(  # noqa: SLF001
                 before_pool_count=before
             )
@@ -1563,7 +1597,11 @@ class RuntimeContext:
             # admission. The coordinator assembly replaces _loop_candidate_eval,
             # so without this the Phase 3/4 hooks are dead code in production.
             # Guarded for controllers/test doubles lacking the helper.
-            pre_admit_hook=getattr(new_runtime_controller, "run_pool_share_maintenance", None),
+            pre_admit_hook=(
+                None
+                if newsclaw_mode
+                else getattr(new_runtime_controller, "run_pool_share_maintenance", None)
+            ),
             safety_wake_seconds=float(
                 getattr(new_config.scheduler, "refresh_check_interval_seconds", 60)
             ),

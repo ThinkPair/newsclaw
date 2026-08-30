@@ -12,6 +12,7 @@
 | 首次设置 | `POST /api/news/bootstrap`，`GET /api/news/bootstrap/status` | 规范化兴趣与避雷词后生成输入摘要；同请求同输入回放，复用同一 `request_id` 改输入返回 409；校验错误 422 | `newsclaw_bootstrap.json` 保存请求、阶段、终态，手工偏好进入事件与画像 | 重启发现孤儿 `running` 会落成可重试的 `failed + recovered_after_restart`；已完成画像只允许原命令回放，不会覆盖 | 闭合 |
 | 旧初始化入口 | `POST /api/init` | NewsClaw 模式固定返回 409 | 返回新闻原生 start/status 地址 | 不会误跑视频账号初始化或覆盖新闻画像 | 闭合 |
 | 推荐 / 换一批 / 追加 | `/api/recommendations`、`/api/recommendations/reshuffle`、`/api/recommendations/append`；Bridge `recommend/reshuffle/append` | 排除集使用 `article_id/content_id/item_key`；读/出池操作没有独立命令回执 | 推荐池与 shown/seen 状态在 SQLite；新闻卡回显文章、媒体、原链和来源 | 单源失败由新闻 runtime 报 degraded；客户端需继续以新闻 scope 调用 | 有限闭合 |
+| 今日首选 / 刷新 | `/api/delight/pending`、`/api/delight/pending-batch`、`/api/delight/trigger`、主动 WebSocket | 单条、批量、推送和触发共享北京时间今日 `news` scope；满池 claim 在事务中预留 lane/day 实际领取数 | scoped 计数与每日预算落 SQLite；copy-ready 后才做受保护池维护 | 预算不因失败/重启退款；跨日新 key；processing/empty/degraded 不以旧闻补位 | 闭合 |
 | 喜欢 / 不喜欢 / 评论 / 忽略 | `POST /api/feedback`；Bridge `submit-feedback` | 事件入口按 `request_id` 去重；同 ID 改推荐、动作或评论返回 409 | 事件先落盘，再幂等修复推荐反馈投影；新闻证据字段随事件保存 | 重启后同一请求返回原 `event_id` 且 `duplicate=true`；画像异步处理失败不撤销事实 | 闭合 |
 | 打开普通新闻 | `POST /api/recommendation-click` | `request_id` 对文章身份和来源做冲突检查 | durable `click` 事件进入历史，回显 `article_id/event_id/duplicate` | 重启重试不会重复学习 | 闭合 |
 | 惊喜卡“看过” | `POST /api/spotlight/respond`，`response=view`；Bridge 同名动作 | 标记是天然幂等的集合更新，不写 click | 只把卡片标为已消费，不形成打开/兴趣证据 | 重载后卡片不会回来，也不会污染打开历史 | 闭合 |

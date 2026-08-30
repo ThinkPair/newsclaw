@@ -9,6 +9,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +78,15 @@ class CandidateEvalOutcome:
     claim: CandidateEvalClaim
     scores: tuple[float, ...]
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class CandidateEvalScope:
+    """Optional durable source/publication scope for a time-sensitive lane."""
+
+    source_platform: str
+    published_after: str
+    published_before: str
 
 
 class PostAdmissionCopyState(StrEnum):
@@ -157,6 +167,22 @@ class DiscoveryCandidatePipeline:
     # first, over-share rows only as an availability fallback). ``None`` keeps
     # the legacy global-cap-only FIFO admission byte-for-byte (invariant 5).
     source_share_targets: Callable[[], dict[str, int]] | None = None
+    # A time-sensitive product lane may scope claims/admission to one source
+    # and publication window.  Normal OpenBiliClaw composition leaves this
+    # unset and keeps the historical mixed-source queue byte-for-byte.
+    eval_scope_provider: Callable[[], CandidateEvalScope | None] | None = None
+    # The budget is reserved durably only when the coordinator is already at
+    # capacity.  Normal below-target work stays governed by existing runtime
+    # demand rather than consuming this emergency lane.
+    capacity_budget_key: str = ""
+    capacity_daily_budget: int = 0
+    # NewsClaw's shared raw-material ceiling. Zero keeps the ordinary
+    # per-source cap derived from ``pool_target_count``.
+    capacity_raw_ceiling: int = 0
+    # A successful scoped admission is reconciled only after expression copy
+    # makes it servable. The same callback may enforce the raw ceiling after
+    # cache persistence; ordinary mode leaves it unset.
+    post_admission_maintenance: Callable[[str, int], int] | None = None
     time_fn: Callable[[], float] = field(default=time.monotonic, repr=False)
     _drain_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
@@ -496,11 +522,21 @@ class DiscoveryCandidatePipeline:
                 state=PostAdmissionCopyState.CALLBACK_FAILED,
             )
 
-    def claim_batch(self, *, limit: int) -> CandidateEvalClaim | None:
+    def claim_batch(
+        self,
+        *,
+        limit: int,
+        at_capacity: bool = False,
+    ) -> CandidateEvalClaim | None:
         """Claim one token-owned batch without performing LLM work."""
 
         claim_limit = max(0, int(limit))
         if claim_limit <= 0:
+            return None
+        if at_capacity and not self._capacity_budget_ready():
+            logger.error(
+                "scoped at-capacity candidate work has no durable daily budget; refusing claim"
+            )
             return None
         token = secrets.token_hex(16)
         claim_fn = self.database.claim_discovery_candidates_for_eval
@@ -509,17 +545,31 @@ class DiscoveryCandidatePipeline:
         # over-supplied backlog that admission won't seat. Empty list / older DB
         # (TypeError) → legacy claim order.
         preferred = self._under_share_platforms()
+        scope_kwargs = self._eval_scope_kwargs(include_budget=at_capacity)
         try:
             rows = list(
                 claim_fn(
                     limit=claim_limit,
                     claim_token=token,
                     preferred_source_platforms=preferred,
+                    **scope_kwargs,
                 )
             )
         except TypeError:
+            if scope_kwargs:
+                logger.error(
+                    "database adapter does not support scoped candidate claims; "
+                    "refusing unscoped fallback"
+                )
+                return None
             try:
-                rows = list(claim_fn(limit=claim_limit, claim_token=token))
+                rows = list(
+                    claim_fn(
+                        limit=claim_limit,
+                        claim_token=token,
+                        **scope_kwargs,
+                    )
+                )
             except TypeError:
                 rows = list(claim_fn(limit=claim_limit))
         if not rows:
@@ -531,7 +581,12 @@ class DiscoveryCandidatePipeline:
         items = tuple(row_to_discovered_content(row) for row in rows)
         return CandidateEvalClaim(token=token, rows=tuple(rows), items=items)
 
-    def claim_ready_batch(self, *, limit: int) -> CandidateEvalClaim | None:
+    def claim_ready_batch(
+        self,
+        *,
+        limit: int,
+        at_capacity: bool = False,
+    ) -> CandidateEvalClaim | None:
         """Claim only when the configured coalescing window is ready."""
 
         batch_size = self._effective_batch_size(limit)
@@ -539,7 +594,7 @@ class DiscoveryCandidatePipeline:
             return None
         if self._waiting_pending_eval_count(batch_size) is not None:
             return None
-        return self.claim_batch(limit=batch_size)
+        return self.claim_batch(limit=batch_size, at_capacity=at_capacity)
 
     def eval_ready_in_seconds(self, *, limit: int) -> float:
         """Return the remaining coalescing delay for the current pending rows."""
@@ -619,6 +674,14 @@ class DiscoveryCandidatePipeline:
             # review lease or terminal rejection after grounding it against
             # older evidence. Only its final durable status can open the gate.
             if str(durable_row.get("status") or "") != EVALUATED:
+                rejected += 1
+                continue
+            if self.eval_scope_provider is not None and not self._row_in_eval_scope(durable_row):
+                self.database.reject_discovery_candidate(
+                    candidate_id,
+                    status="trimmed_capacity",
+                    reason="outside_eval_scope",
+                )
                 rejected += 1
                 continue
             item = row_to_discovered_content(durable_row)
@@ -735,7 +798,7 @@ class DiscoveryCandidatePipeline:
         claim_limit = self._effective_eval_claim_limit(batch_size)
         if batch_size <= 0:
             return {"evaluated": 0, "cached": 0, "rejected": 0}
-        if self._pool_full():
+        if self._pool_full() and not self.capacity_work_waiting():
             return {"evaluated": 0, "cached": 0, "rejected": 0}
 
         recently_viewed = self._recent_viewed_content_keys()
@@ -745,7 +808,7 @@ class DiscoveryCandidatePipeline:
             recently_viewed=recently_viewed,
             admitted_items=admitted_items,
         )
-        if self._pool_full():
+        if self._pool_full() and not self.capacity_work_waiting():
             self.last_admitted_items = list(admitted_items)
             return {"evaluated": 0, "cached": retry_cached, "rejected": retry_rejected}
 
@@ -884,17 +947,34 @@ class DiscoveryCandidatePipeline:
         if not callable(get_rows):
             return 0, 0
         preferred = self._under_share_platforms()
+        scope_kwargs = self._eval_scope_kwargs(include_budget=False)
         try:
             try:
-                rows = list(get_rows(limit=limit, preferred_source_platforms=preferred))
+                rows = list(
+                    get_rows(
+                        limit=limit,
+                        preferred_source_platforms=preferred,
+                        **scope_kwargs,
+                    )
+                )
             except TypeError:
+                if scope_kwargs:
+                    logger.error(
+                        "database adapter does not support scoped evaluated admission; "
+                        "refusing unscoped fallback"
+                    )
+                    return 0, 0
                 rows = list(get_rows(limit=limit))
         except Exception:
             logger.debug("evaluated discovery candidates unavailable", exc_info=True)
             return 0, 0
         if not rows:
             return 0, 0
-        accepted = [(dict(row), row_to_discovered_content(dict(row))) for row in rows]
+        accepted = [
+            (dict(row), row_to_discovered_content(dict(row)))
+            for row in rows
+            if self._row_in_eval_scope(dict(row))
+        ]
         return self._admit_until_full(
             accepted,
             recently_viewed=recently_viewed,
@@ -1101,13 +1181,22 @@ class DiscoveryCandidatePipeline:
         cached = 0
         rejected = 0
         for row, item in accepted:
-            if (cache_limit is not None and cached >= cache_limit) or self._pool_full():
+            if cache_limit is not None and cached >= cache_limit:
+                break
+            replacement_required = self._capacity_replacement_required(row)
+            if replacement_required is None:
                 break
             outcome = self._admit_one(
                 row, item, recently_viewed=recently_viewed, admitted_items=admitted_items
             )
-            if outcome == "cached":
+            if outcome in {"cached", "repaired"}:
                 cached += 1
+                if (
+                    outcome == "cached"
+                    and replacement_required
+                    and not self._maintain_scoped_capacity(row, item)
+                ):
+                    break
             else:
                 rejected += 1
         return cached, rejected
@@ -1137,7 +1226,11 @@ class DiscoveryCandidatePipeline:
         skipped_over_share = 0
         deferred: list[tuple[dict[str, Any], DiscoveredContent]] = []
         for row, item in accepted:
-            if (cache_limit is not None and cached >= cache_limit) or self._pool_full():
+            if cache_limit is not None and cached >= cache_limit:
+                deferred.append((row, item))
+                continue
+            replacement_required = self._capacity_replacement_required(row)
+            if replacement_required is None:
                 deferred.append((row, item))
                 continue
             family = self._row_source_family(row, item)
@@ -1148,19 +1241,34 @@ class DiscoveryCandidatePipeline:
             outcome = self._admit_one(
                 row, item, recently_viewed=recently_viewed, admitted_items=admitted_items
             )
-            if outcome == "cached":
+            if outcome in {"cached", "repaired"}:
                 cached += 1
-                available[family] = int(available.get(family, 0)) + 1
+                if outcome == "cached":
+                    if replacement_required:
+                        if not self._maintain_scoped_capacity(row, item):
+                            break
+                        available = self._available_by_family()
+                    else:
+                        available[family] = int(available.get(family, 0)) + 1
             else:
                 rejected += 1
         for row, item in deferred:
-            if (cache_limit is not None and cached >= cache_limit) or self._pool_full():
+            if cache_limit is not None and cached >= cache_limit:
+                break
+            replacement_required = self._capacity_replacement_required(row)
+            if replacement_required is None:
                 break
             outcome = self._admit_one(
                 row, item, recently_viewed=recently_viewed, admitted_items=admitted_items
             )
-            if outcome == "cached":
+            if outcome in {"cached", "repaired"}:
                 cached += 1
+                if (
+                    outcome == "cached"
+                    and replacement_required
+                    and not self._maintain_scoped_capacity(row, item)
+                ):
+                    break
             else:
                 rejected += 1
         if skipped_over_share:
@@ -1169,6 +1277,73 @@ class DiscoveryCandidatePipeline:
                 skipped_over_share,
             )
         return cached, rejected
+
+    def _capacity_replacement_required(
+        self,
+        row: dict[str, Any],
+    ) -> bool | None:
+        """Return whether post-admission replacement is needed, or deny with None."""
+
+        # Ordinary OpenBiliClaw keeps the established visible-pool gate.  The
+        # exact-count replacement path below exists only for an explicitly
+        # scoped lane (NewsClaw's Beijing-today feed); using it globally would
+        # let test adapters and legacy stores without canonical count support
+        # admit past their configured target.
+        if self.eval_scope_provider is None:
+            return None if self._pool_full() else False
+        if self.pool_target_count <= 0:
+            return None
+        available = self._pool_available_count()
+        target = int(self.pool_target_count)
+        if available < target:
+            return False
+        if available > target:
+            maintenance = self.post_admission_maintenance
+            if maintenance is None or not self._row_in_eval_scope(row):
+                return None
+            family = _source_family(
+                row.get("source_strategy") or row.get("source") or "",
+                row.get("source_platform") or "",
+            )
+            try:
+                maintenance(family, available - target)
+            except Exception:
+                logger.exception("candidate capacity overflow repair failed for %s", family)
+                return None
+            available = self._pool_available_count()
+            if available > target:
+                return None
+            if available < target:
+                return False
+        if self.post_admission_maintenance is None or not self._row_in_eval_scope(row):
+            return None
+        return True
+
+    def _maintain_scoped_capacity(
+        self,
+        row: dict[str, Any],
+        item: DiscoveredContent,
+    ) -> bool:
+        """Enforce the raw cap after cache write; visible replacement follows copy."""
+
+        maintenance = self.post_admission_maintenance
+        if maintenance is None:
+            return False
+        family = self._row_source_family(row, item)
+        target = int(self.pool_target_count)
+        available = self._pool_available_count()
+        if available < target:
+            return False
+        raw_ceiling = self._raw_material_ceiling()
+        if available == target and self._pool_raw_count() <= raw_ceiling:
+            return True
+        overflow = max(0, available - target)
+        try:
+            maintenance(family, overflow)
+        except Exception:
+            logger.exception("candidate post-admission maintenance failed for %s", family)
+            return False
+        return self._pool_available_count() == target and self._pool_raw_count() <= raw_ceiling
 
     def _admit_one(
         self,
@@ -1243,12 +1418,53 @@ class DiscoveryCandidatePipeline:
             self.database.mark_discovery_candidate_cached(int(row["id"]))
             admitted_items.append(item)
             return "cached"
+        if self._content_already_cached(row, item):
+            # ``content_cache`` and the discovery lifecycle are maintained by
+            # older storage adapters in two commits.  A crash between them is
+            # recoverable: repair the durable candidate state instead of
+            # misclassifying the already-persisted row as an admission reject.
+            self.database.mark_discovery_candidate_cached(int(row["id"]))
+            admitted_items.append(item)
+            return "repaired"
         self.database.reject_discovery_candidate(
             int(row["id"]),
             status=REJECTED_CACHE_ADMISSION,
             reason="cache admission skipped",
         )
         return "rejected"
+
+    def _content_already_cached(
+        self,
+        row: dict[str, Any],
+        item: DiscoveredContent,
+    ) -> bool:
+        candidate_keys = {
+            str(row.get("candidate_key") or "").strip(),
+            str(getattr(item, "item_key", "") or "").strip(),
+        }
+        candidate_keys.discard("")
+        get_keys = getattr(self.database, "get_existing_content_cache_item_keys", None)
+        if callable(get_keys) and candidate_keys:
+            try:
+                if candidate_keys & {str(value) for value in get_keys(sorted(candidate_keys))}:
+                    return True
+            except Exception:
+                logger.debug("content-cache idempotence key lookup failed", exc_info=True)
+        identifiers = {
+            str(row.get("bvid") or "").strip(),
+            str(row.get("content_id") or "").strip(),
+            str(getattr(item, "bvid", "") or "").strip(),
+            str(getattr(item, "content_id", "") or "").strip(),
+        }
+        identifiers.discard("")
+        get_ids = getattr(self.database, "get_existing_content_cache_ids", None)
+        if not callable(get_ids) or not identifiers:
+            return False
+        try:
+            return bool(identifiers & {str(value) for value in get_ids(sorted(identifiers))})
+        except Exception:
+            logger.debug("content-cache idempotence identifier lookup failed", exc_info=True)
+            return False
 
     def _share_targets(self) -> dict[str, int] | None:
         """Return per-family visible-pool targets, or ``None`` for legacy mode."""
@@ -1483,7 +1699,139 @@ class DiscoveryCandidatePipeline:
             logger.debug("existing content-cache item-key lookup failed", exc_info=True)
             return set()
 
+    def _eval_scope(self) -> CandidateEvalScope | None:
+        provider = self.eval_scope_provider
+        if provider is None:
+            return None
+        try:
+            scope = provider()
+        except Exception:
+            logger.exception("candidate evaluation scope provider failed")
+            scope = None
+        if scope is None:
+            logger.error("configured candidate evaluation scope is unavailable")
+            return self._invalid_eval_scope()
+        source = str(scope.source_platform or "").strip().lower()
+        if not source or not scope.published_after or not scope.published_before:
+            logger.warning("candidate evaluation scope is incomplete; refusing scoped work")
+            return self._invalid_eval_scope()
+        return CandidateEvalScope(
+            source_platform=source,
+            published_after=str(scope.published_after),
+            published_before=str(scope.published_before),
+        )
+
+    @staticmethod
+    def _invalid_eval_scope() -> CandidateEvalScope:
+        return CandidateEvalScope(
+            source_platform="__invalid_scope__",
+            published_after="9999-12-31T00:00:00Z",
+            published_before="0001-01-01T00:00:00Z",
+        )
+
+    def _capacity_budget_date(self, scope: CandidateEvalScope | None = None) -> str:
+        current_scope = self._eval_scope() if scope is None else scope
+        if current_scope is None:
+            return ""
+        start = self._parse_scope_instant(current_scope.published_after)
+        if start is None:
+            return ""
+        return (start + timedelta(hours=8)).date().isoformat()
+
+    def _capacity_budget_ready(self) -> bool:
+        return bool(
+            str(self.capacity_budget_key or "").strip()
+            and self._capacity_budget_date()
+            and int(self.capacity_daily_budget or 0) > 0
+        )
+
+    def _eval_scope_kwargs(self, *, include_budget: bool) -> dict[str, object]:
+        scope = self._eval_scope()
+        if scope is None:
+            return {}
+        values: dict[str, object] = {
+            "source_platform": scope.source_platform,
+            "published_after": scope.published_after,
+            "published_before": scope.published_before,
+        }
+        if include_budget:
+            values.update(
+                {
+                    "capacity_budget_key": str(self.capacity_budget_key or "").strip(),
+                    "capacity_budget_date": self._capacity_budget_date(scope),
+                    "max_capacity_evaluations": max(0, int(self.capacity_daily_budget)),
+                }
+            )
+        return values
+
+    @staticmethod
+    def _parse_scope_instant(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _row_in_eval_scope(self, row: dict[str, Any]) -> bool:
+        scope = self._eval_scope()
+        if scope is None:
+            return True
+        if str(row.get("source_platform") or "").strip().lower() != scope.source_platform:
+            return False
+        published = self._parse_scope_instant(row.get("published_at"))
+        after = self._parse_scope_instant(scope.published_after)
+        before = self._parse_scope_instant(scope.published_before)
+        return bool(
+            published is not None
+            and after is not None
+            and before is not None
+            and after <= published < before
+        )
+
+    def capacity_work_counts(self) -> dict[str, int]:
+        """Return active counts for the configured time-sensitive lane only."""
+
+        scope = self._eval_scope()
+        count_fn = getattr(self.database, "count_discovery_candidates_for_eval_scope", None)
+        if scope is None or not callable(count_fn):
+            return {}
+        try:
+            counts = count_fn(
+                source_platform=scope.source_platform,
+                published_after=scope.published_after,
+                published_before=scope.published_before,
+                capacity_budget_key=str(self.capacity_budget_key or "").strip(),
+                capacity_budget_date=self._capacity_budget_date(scope),
+                max_capacity_evaluations=max(0, int(self.capacity_daily_budget or 0)),
+            )
+        except Exception:
+            logger.debug("scoped candidate count unavailable", exc_info=True)
+            return {}
+        return {str(key): max(0, int(value or 0)) for key, value in dict(counts).items()}
+
+    def capacity_work_waiting(self) -> bool:
+        """Whether the full-pool lane has scoped work that can still advance."""
+
+        counts = self.capacity_work_counts()
+        return any(int(counts.get(status, 0)) > 0 for status in ("pending_eval", "evaluated"))
+
+    def capacity_evaluated_waiting_count(self) -> int:
+        """Return scoped, already-evaluated rows that need admission."""
+
+        return int(self.capacity_work_counts().get("evaluated", 0))
+
     def _eval_supply_counts(self) -> tuple[int, int]:
+        scoped = self.capacity_work_counts()
+        if self._eval_scope() is not None:
+            return (
+                int(scoped.get("pending_eval_ready", scoped.get("pending_eval", 0)) or 0),
+                int(scoped.get("evaluating", 0) or 0),
+            )
         count_fn = getattr(self.database, "count_discovery_candidates_by_status", None)
         if not callable(count_fn):
             return 0, 0
@@ -1581,6 +1929,9 @@ class DiscoveryCandidatePipeline:
         return pending_count
 
     def _pending_eval_count(self) -> int | None:
+        scoped = self.capacity_work_counts()
+        if self._eval_scope() is not None:
+            return int(scoped.get("pending_eval_ready", scoped.get("pending_eval", 0)) or 0)
         count_fn = getattr(self.database, "count_discovery_candidates_by_status", None)
         if not callable(count_fn):
             return None
@@ -1680,6 +2031,24 @@ class DiscoveryCandidatePipeline:
             return int(count_fn(xhs_self_nickname=self._current_xhs_self_nickname()))
         except TypeError:
             return int(count_fn())
+
+    def _pool_raw_count(self) -> int:
+        count_fn = getattr(self.database, "count_pool_raw_material_candidates", None)
+        if not callable(count_fn):
+            return 0
+        try:
+            return max(0, int(count_fn() or 0))
+        except Exception:
+            logger.debug("raw pool count unavailable", exc_info=True)
+            return self._raw_material_ceiling() + 1
+
+    def _raw_material_ceiling(self) -> int:
+        if self.eval_scope_provider is not None and int(self.capacity_raw_ceiling or 0) > 0:
+            return max(0, int(self.capacity_raw_ceiling))
+        pending_cap = self._max_pending_per_source()
+        if pending_cap is None:
+            return max(0, int(self.pool_target_count))
+        return max(0, int(pending_cap))
 
     def _pool_full(self) -> bool:
         if self.pool_target_count <= 0:

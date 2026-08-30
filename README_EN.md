@@ -37,6 +37,12 @@ and configuration, and does not require another product at runtime.
 - Respect title-, summary-, and full-text evidence levels.
 - Treat one failed source as degraded operation, not a successful global
   refresh.
+- The Today Pick lane only admits news published during the current Beijing
+  calendar day and never backfills the surface with older articles. It keeps a
+  durable, bounded daily evaluation budget even when the pool is full. A new
+  item may replace a lower-priority item only after its copy is ready and it is
+  actually servable; liked, already recommended, and in-flight rows remain
+  protected. A genuinely empty day stays an honest empty or processing state.
 - **Phase 2 continuous tracking is implemented against an explicit acceptance
   contract.** A completed normal refresh reuses the same normalized,
   deduplicated local article batch for due observations, while model comparison
@@ -114,6 +120,8 @@ buttons and never hold the key.
 
 ```text
 Tushare / RSS → news evidence → normalized, deduplicated local batch → evaluation/ranking → workbench
+                                      └→ Beijing-today news → scoped queue + bounded daily budget
+                                                               → copy-ready → protected reconciliation → Today Pick
                                       │
                                       └→ [Phase 2] due observation → local-rule shortlist
                                                                          → structured model check
