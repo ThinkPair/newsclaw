@@ -1974,13 +1974,19 @@ class TestBackendAPI:
         app = create_app(memory_manager=object(), database=object(), soul_engine=object())
         client = TestClient(app)
 
-        response = client.get("/m/")
+        responses = [
+            client.get(path) for path in ("/m?probe=1", "/m/?probe=2", "/m/index.html?probe=3")
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        assert all(response.headers.get("cache-control") == "no-store" for response in responses)
 
-        script = re.search(r'src="(/m/_assets/([0-9a-f]{12})/js/app\.js)"', response.text)
-        stylesheet = re.search(r'href="(/m/_assets/([0-9a-f]{12})/css/app\.css)"', response.text)
+        script = re.search(r'src="(/m/_assets/([0-9a-f]{12})/js/app\.js)"', responses[0].text)
+        stylesheet = re.search(
+            r'href="(/m/_assets/([0-9a-f]{12})/css/app\.css)"', responses[0].text
+        )
         shared = re.search(
             r'src="(/m/_assets/([0-9a-f]{12})/shared/dialogue-confirmation\.js)"',
-            response.text,
+            responses[0].text,
         )
 
         assert script is not None
@@ -1989,10 +1995,14 @@ class TestBackendAPI:
         version = script.group(2)
         assert stylesheet.group(2) == version
         assert shared.group(2) == version
+        assert all(f"/m/_assets/{version}/js/app.js" in item.text for item in responses)
 
         for url in (script.group(1), stylesheet.group(1), shared.group(1)):
             asset_response = client.get(url)
             assert asset_response.status_code == 200
+            assert asset_response.headers.get("cache-control") == (
+                "public, max-age=31536000, immutable"
+            )
 
         dependency = client.get(f"/m/_assets/{version}/js/saved-sync-runtime.js")
         importer = client.get(f"/m/_assets/{version}/js/views/recommend.js")
@@ -2000,6 +2010,29 @@ class TestBackendAPI:
         assert importer.status_code == 200
         assert "export function restoreDialogFocusAfterRender" in dependency.text
         assert "restoreDialogFocusAfterRender" in importer.text
+
+        assert client.get(f"/m/_assets/{version}/index.html").status_code == 404
+        legacy = client.get("/m/js/app.js")
+        assert legacy.status_code == 200
+        assert legacy.headers.get("cache-control") == "no-cache, must-revalidate"
+
+    def test_mobile_web_asset_hash_changes_with_deep_dependency(self, tmp_path: Path) -> None:
+        from openbiliclaw.api.app import _mobile_web_asset_version
+
+        web_dir = tmp_path / "web"
+        (web_dir / "js" / "views").mkdir(parents=True)
+        (web_dir / "css").mkdir()
+        (web_dir / "shared").mkdir()
+        dependency = web_dir / "js" / "views" / "deep.js"
+        dependency.write_text("export const value = 1;", encoding="utf-8")
+
+        first = _mobile_web_asset_version(web_dir)
+        stable = _mobile_web_asset_version(web_dir)
+        dependency.write_text("export const value = 2;", encoding="utf-8")
+        changed = _mobile_web_asset_version(web_dir)
+
+        assert stable == first
+        assert changed != first
 
     def test_mobile_web_manifest_is_installable_and_assets_resolve(self) -> None:
         from fastapi.testclient import TestClient

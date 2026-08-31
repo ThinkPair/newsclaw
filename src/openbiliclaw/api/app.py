@@ -7,6 +7,7 @@ import base64
 import binascii
 import copy
 import datetime as datetime_module
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -276,6 +277,24 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _mobile_web_asset_version(web_dir: Path) -> str:
+    """Hash every file that can participate in the mobile asset graph."""
+    digest = hashlib.sha256()
+    roots = (web_dir / "css", web_dir / "js", web_dir / "shared")
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+            relative = path.relative_to(web_dir).as_posix().encode("utf-8")
+            payload = path.read_bytes()
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return digest.hexdigest()[:12]
+
 
 # A local Ollama chat probe can spend ~31 seconds in its documented cold-load
 # retry window before the model answers. The previous 30-second API cap killed
@@ -21586,42 +21605,38 @@ def create_app(
     if _web_dir.is_dir():
         _favicon_path = _web_dir / "icon-32.png"
 
-        def _mobile_asset_version() -> str:
-            """Return one content hash for the complete mobile module graph.
+        class _ImmutableStaticFiles(_StaticFiles):
+            async def get_response(self, path: str, scope: dict[str, Any]) -> Response:
+                response = await super().get_response(path, scope)
+                if response.status_code == 200:
+                    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                return response
 
-            A module upgrade must never mix a freshly fetched importer with an
-            older cached dependency.  The top-level script alone is not enough:
-            relative imports such as ``views/recommend.js`` and
-            ``saved-sync-runtime.js`` are cached under their own URLs.  Serving
-            the whole graph from one content-addressed prefix keeps every import
-            in the same release namespace.
-            """
-            import hashlib
+        class _RevalidatingStaticFiles(_StaticFiles):
+            async def get_response(self, path: str, scope: dict[str, Any]) -> Response:
+                response = await super().get_response(path, scope)
+                if response.status_code == 200:
+                    response.headers["Cache-Control"] = "no-cache, must-revalidate"
+                return response
 
-            digest = hashlib.sha256()
-            roots = (_web_dir / "css", _web_dir / "js", _shared_web_dir)
-            for root in roots:
-                if not root.is_dir():
-                    continue
-                for path in sorted(
-                    candidate for candidate in root.rglob("*") if candidate.is_file()
-                ):
-                    relative = path.relative_to(_web_dir).as_posix()
-                    digest.update(relative.encode("utf-8"))
-                    digest.update(path.read_bytes())
-            return digest.hexdigest()[:12]
-
-        _mobile_version = _mobile_asset_version()
+        _mobile_version = _mobile_web_asset_version(_web_dir)
         _mobile_asset_prefix = f"/m/_assets/{_mobile_version}"
         _mobile_index_path = _web_dir / "index.html"
 
-        # This mount must precede the generic /m mount.  Every ES-module
-        # dependency then resolves below the same immutable release prefix.
-        app.mount(
-            _mobile_asset_prefix,
-            _StaticFiles(directory=_web_dir),
-            name="mobile-versioned-assets",
-        )
+        # These mounts must precede the generic /m mount.  Every ES-module
+        # dependency then resolves below the same immutable release prefix,
+        # while unrelated pages and manifests are not duplicated under it.
+        for asset_kind, directory in (
+            ("js", _web_dir / "js"),
+            ("css", _web_dir / "css"),
+            ("shared", _shared_web_dir),
+        ):
+            if directory.is_dir():
+                app.mount(
+                    f"{_mobile_asset_prefix}/{asset_kind}",
+                    _ImmutableStaticFiles(directory=directory),
+                    name=f"mobile-versioned-{asset_kind}",
+                )
 
         def _mobile_index_response() -> Response:
             if not _mobile_index_path.is_file():
@@ -21653,13 +21668,21 @@ def create_app(
         def _mobile_index_slash() -> Response:
             return _mobile_index_response()
 
+        @app.get("/m/index.html", include_in_schema=False)
+        def _mobile_index_file() -> Response:
+            return _mobile_index_response()
+
         @app.get("/favicon.ico", include_in_schema=False)
         def _favicon() -> FileResponse:
             if not _favicon_path.is_file():
                 raise HTTPException(status_code=404, detail="favicon not found")
             return FileResponse(_favicon_path, media_type="image/png")
 
-        app.mount("/m", _StaticFiles(directory=_web_dir, html=True), name="mobile-web")
+        app.mount(
+            "/m",
+            _RevalidatingStaticFiles(directory=_web_dir, html=True),
+            name="mobile-web",
+        )
 
     # ── Shared frontend modules ──────────────────────────────────
     # Its own mount rather than a subdirectory of an existing one: `/web` is
@@ -21675,8 +21698,6 @@ def create_app(
         _desktop_index_path = _desktop_dir / "index.html"
 
         def _desktop_asset_version() -> str:
-            import hashlib
-
             digest = hashlib.sha256()
             # Paths are relative to the desktop root except the shared modules,
             # which live outside it — an upgrade that only changed
