@@ -19,6 +19,7 @@
 
 | 子模块 | 状态 | 说明 |
 |------|------|------|
+| NewsClaw 手机 / 扩展闭环审计（2026-08-31） | ✅ | 手机消息抽屉同时读取新闻、探针和网页/PDF 监控通知；换一批失败保留旧卡并显示错误，画像删除等待后端确认且提供恢复/撤销。推荐卡默认收起详细解释，来源入口明确为“查看新闻源状态”。手机抽屉、评论框和扩展连接设置使用 dialog 语义、焦点圈定、Esc 关闭及焦点归还；扩展监控能力探测失败时保留入口并显示降级，不把一次 API 失败解释成功能不存在。 |
 | 统一品牌图标 | ✅ | Chrome / Edge / Brave / Firefox manifest 使用 16 / 32 / 48 / 128px 精确尺寸图标，side panel 顶部品牌标记、普通透明 PWA 图标、专用不透明 `maskable` / Apple 主屏幕图标、32px 根 favicon、首次设置页、桌面 Web、移动 Web 和 GitHub Pages 官网统一从 `assets/brand/openbiliclaw-icon.png` 派生。源图的半透明边缘已去除旧白底消光色；扩展图标、favicon 与 maskable 图标使用满幅品牌粉底，页面头图容器也用品牌粉承接透明圆角。旧字母 `B`、CSS 圆环和官网重复的内联 SVG favicon 已移除；社交分享图、Chrome Web Store 素材与 README / 官网截图通过 `build_social_preview_assets.py`、`capture_chrome_webstore_ui.py --refresh-docs` 和既有构建脚本确定性重建。 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / Linux.do 都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 与 Linux.do 另有只读插件任务源；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / V2EX 都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 通过插件任务源接入初始化 saved/upvoted/subscribed 信号和 discovery search/hot/subreddit/related；V2EX 普通页面只采集被动阅读行为，任务页由独立 dispatcher 执行四个只读 bootstrap scope；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |

@@ -1,6 +1,10 @@
 # NewsClaw 用户可见控件闭环矩阵
 
-> 审计基线：`22fe328`；审计日期：2026-08-17。“持久化 / 状态”一列明确区分了服务端落库、运行时状态和纯前端状态。同一处事件委托产生的同类动态卡片按一行记录。
+> 初始审计基线：`22fe328`（2026-08-17）；2026-08-31 已按四端全功能审计重新核验并补齐失败、并发、焦点与作用域闭环。“持久化 / 状态”一列明确区分服务端落库、运行时状态和纯前端状态。同一处事件委托产生的同类动态卡片按一行记录。
+
+本次复核新增的共同门禁：顶部筛选仅在“新材料”页可见并生效；所有抽屉、菜单和模态框
+支持 Esc、焦点圈定、背景 inert 与关闭后焦点归还；发送、加载和反馈采用 single-flight，
+只有后端确认成功才清空草稿或更新终态；通知加载失败显示错误与重试，不得渲染成空消息。
 
 ## 桌面 Web
 
@@ -11,11 +15,11 @@
 | 关于新闻爪 | `bindAboutButton` | 无 | 前端弹层 | 显示独立产品说明 | 缺 DOM 时进入 fatal 状态 | 闭环；无上游 GitHub 业务跳转 |
 | 主题、色相、强调色、回到顶部 | `cycle/setTheme*` / `initBackToTop` | 无 | `localStorage` + DOM | 立即换肤 / 滚动 | 非法色相夹到 0–360 | 闭环 |
 | 手机二维码、复制链接 | `openMobileQrDrawer` / clipboard handler | `GET /api/qr-info` | 不落库；只保存已看入口标记 | 仅非 loopback 且后端报告 LAN 可用时生成二维码并启用复制 | `127.0.0.1` 监听、状态读取失败或仍是 loopback 时禁用复制并明示说明 | 闭环；正式启动当前不宣称手机可直连 |
-| 消息、待聊、后台动态、加载更多 | `renderMessages` / `respondNotification` / `refreshDesktopPendingConfirmations` / `loadActivityPage` | `GET /notifications/pending`、`POST /notifications/sent`、`/chat/pending-confirmations`、`/activity-feed` | 服务端消息 / 对话 / 活动记录 | 待通知新闻按 `exact/search/missing` 显示“阅读原文 / 检索来源 / 暂无原文”；精确原文才写点击并确认，检索只导航，手工标记可单独确认 | 确认失败保留当前卡片和抽屉快照并提示重试；刷新失败不清空旧列表 | 闭环 |
+| 消息、待聊、后台动态、加载更多 | `renderMessages` / `respondNotification` / `refreshDesktopPendingConfirmations` / `loadActivityPage` | `GET /notifications/pending`、`POST /notifications/ack`、`/chat/pending-confirmations`、`/activity-feed` | 服务端消息 / 对话 / 活动记录；确认使用 `article_id + request_id` | 待通知新闻按 `exact/search/missing` 显示“阅读原文 / 检索来源 / 暂无原文”；精确原文才写点击并确认，检索只导航，手工标记可单独确认 | 确认失败保留当前卡片和抽屉快照并提示重试；通知读取失败显示错误 / 重试而不是“没有消息” | 闭环 |
 | 换一批、继续加载、失败后重新加载 | `reshuffle` / `appendMore` / `restartDesktopFailedRecoveries` | `POST /recommendations/reshuffle`、`/append`；`GET /recommendations` | 推荐池 / 前端卡片 | 替换 / 追加；空结果保留现有卡片 | 空池、补货中和请求失败分别提示 | 闭环；NewsClaw 后端强制 `source_platform=news` |
 | 推荐详情“阅读原文 / 检索来源 / 暂无原文” | `recordOriginalOpen` / `recordSourceSearch` | 精确原文才 `POST /recommendation-click`；检索无写接口 | 精确原文点击作为弱学习信号；检索不写点击、已读、画像或原文证据 | 来源有精确 URL 时直接打开；Tushare 未给 URL 时按“媒体 + 精简标题”打开外部检索并持续提示仍需核验 | 媒体或标题不足时禁用“暂无原文”；精确点击记录失败不阻断外链 | 闭环；`exact/search/missing` 三态不混淆 |
 | 推荐卡喜欢 / 不感兴趣 / 忽略 / 撤销 | `stageRecommendationFeedback` | `POST /feedback` | 幂等 `request_id`，反馈落库并参与画像 | 10 秒可撤销，提交后明示结果 | 回滚按钮和文案，保留当前卡片 | 闭环 |
-| 推荐卡“聊一聊”、发送 / 取消 | `handleCardAction` | `POST /feedback` (`comment`) | 评论线索落库并参与学习 | 状态行 + toast | 草稿恢复，状态行显示原因 | 闭环 |
+| 推荐卡“聊一聊”、发送 / 取消 | `handleCardAction` | `POST /feedback` (`comment`) | 评论线索落库并参与学习；同一输入 single-flight | 后端确认后状态行 + toast 并清空原输入 | 草稿回到发起动作的原输入框，状态行显示原因 | 闭环 |
 | 推荐卡 / 惊喜卡收藏、稍后读、取消 | `desktopSavedMutations.toggle` | `POST /saved/favorite|watch_later`、`/remove` | 本机会员表；news 强制 `local_only_source`，清空旧 sync task 回显 | 按钮状态与“已保存 / 移除到本机” | 按钮回滚，状态行显示失败 | 闭环；不写画像，不同步媒体账号 |
 | 惊喜上 / 下一条、展开摘要 | `setActiveDelight` / excerpt toggle | 无（已加载队列） | 前端索引 / DOM | 卡片和 `x/y` 更新 | 空队列不执行 | 闭环 |
 | 今日首选刷新 | `refreshTodayPick` / 今日队列串行读取 | `GET /api/delight/pending-batch`、`POST /api/delight/trigger` | 北京时间今日 `news` 范围、持久评估预算和后端队列真值 | ready 时替换今日队列；processing/empty/degraded 分别回显 | 保留已加载内容，不用旧闻伪装成功；重叠点击共享最新结果 | 闭环 |
@@ -30,7 +34,7 @@
 | Tushare 三源和每个 RSS 的启停 | `persistNewsSourceSettings` | `PUT /news/sources/{source_id}` | 来源设置文件 | 只提交实际变更的 `{enabled}`，重读单媒体卡片 | 整体保存显示失败，保留未确认草稿 | 闭环；不再一张卡批量覆盖 3 个官方 RSS |
 | 自定义 RSS 每行一个、保存时新增 / 删除 | URL 差集 | `POST /news/sources/rss`、`DELETE /news/sources/{id}` | 来源设置文件 | 重读后每媒体独立卡片 | 非 URL 立即拒绝；网络失败不伪装保存 | 闭环 |
 | 验证全部新闻源、立即刷新 | `runNewsRefresh` | `POST /news/sources/probe` 或 `/news/refresh` | 来源健康 / 刷新任务终态 | 每源健康、最后成功、错误回显 | 单源降级不拖死页面；请求失败显示原因 | 闭环 |
-| 调度、通用、前端、日志可见字段；保存 / 放弃 | form dirty + `buildConfigUpdate` | `PUT /news/settings`、`PUT /config`、`GET /config/apply-status`、`GET /news/sources` | 运行时设置 / 配置文件 / 本地前端设置 | dirty→saving→applying→applied；放弃会重读来源真值 | 超时显示“无法确认是否写入”；应用失败回滚 | 闭环；多端点保存不是跨 API 事务，见限制 |
+| 调度、通用、前端、日志可见字段；保存 / 放弃 | form dirty + `buildConfigUpdate` | `PUT /news/settings`、`PUT /config`、`GET /config/apply-status`、`GET /news/sources` | 运行时设置 / 配置文件 / 本地前端设置 | dirty→saving→applying→applied；各配置域分别显示成功结果并重读真值 | 超时显示“无法确认是否写入”；部分成功逐域报告，失败域保留草稿；应用失败回滚 | 闭环；多端点保存不是跨 API 事务，见限制 |
 | 访问密码保存、开机自启、代理探测 | `lanAuthControl`、`bootAutostartControl`、`runNetworkProxyConfigProbe` | `/auth/admin`、`/autostart/apply`、`/config/probe-service` | 鉴权状态 / Windows 自启 / 无持久探测 | 开关和状态文案回显 | 回滚开关或显示探测错误 | 闭环 |
 | 导出、导入、取消待导入 | `export/stage/cancelMigration*` | `/migration/export`、`/import`、`/pending`、`/status` | 备份文件 / 待应用迁移状态 | `.newsclaw-backup` 下载；导入校验后要求重启 | 校验、环境、空间、忙状态错误明示 | 闭环；可读 `.obcbackup` 仅为兼容 |
 

@@ -36,6 +36,7 @@ OpenClaw bootstrap 与 API/CLI production composition 使用同一组近期供�
 | 推荐消费后的 durable inventory 同步 | ✅ | API 与 OpenClaw composition 都给真实 `RecommendationEngine` 注入 post-commit callback；独立 serve DB worker 把 recommendation + shown 在同一短事务提交成功后，callback 直接携带 `pool_counts_after` 更新共享 gate，不再同步重读共享连接。写失败不触发 callback，callback 失败也不改写 durable 提交结果；API 另在响应关键路径外读取精确 canonical snapshot 收敛广播。 |
 | Agent capability manifest | ✅ | `get_capabilities` / `capabilities` 返回 `agent-bridge/v2`、宿主兼容名和完整 skill 名称；`skill.py` 是唯一注册表，防止核心功能只进 HTTP/UI 而漏进 Agent |
 | Agent skill descriptors | ✅ | 基础 adapter 保持协议中立的 24 个 descriptor 与 async handler；NewsClaw runtime 在 `capabilities` 中追加 2 个研究能力名，DSH 以自己的工具 descriptor 映射对应 Bridge 命令 |
+| NewsClaw DSH 工具完整性 | ✅ | DSH 客户端保留新闻/画像/内容库基础工具，同时映射 2 个按需研究和 7 个网页/PDF 监控命令；三组能力独立注册，P5 扩展后总计 31 个 `newsclaw_*` 工具 |
 | Agent CLI bridge | ✅ | 已提供 `python -m openbiliclaw.integrations.openclaw.cli`，输出稳定 JSON；Hermes / WorkBuddy 可直接复用该命令或从 `integrations.agent` 导入别名 |
 | Agent 主动探针闭环 | ✅ | 可拉取/响应 `interest.probe` 与 `avoidance.probe` 的 confirm/reject/defer/chat；`listen` 默认转发 delight、兴趣和避雷的候选及结果事件 |
 | Workspace skill pack | ✅ | 仓库根目录新增 `skills/openbiliclaw-adapter/SKILL.md`，可被 OpenClaw 直接发现 |

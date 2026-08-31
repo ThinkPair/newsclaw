@@ -23,6 +23,7 @@ Tavily 在这里是 **按需研究提供方**，不是 Tushare/RSS 一类定时�
 | REST | 已实现 | provider 状态/凭据/真实 probe、`/api/research/search`、`/api/research/extract` |
 | Agent Bridge | 已实现 | `research-search` 与 `research-extract`，返回和 REST 一致的研究结果 |
 | Desktop settings | 已实现 | 卡片名为“Tavily 按需研究（不是新闻源）”；支持脱敏状态、保存/删除 Key，以及通过官方 `/usage` 完成不消耗搜索额度的真实连接验证 |
+| DSH 工具映射 | 已实现 | `newsclaw_search_web` / `newsclaw_extract_evidence` 与 7 个监控工具可同时注册；P5 升级不会覆盖按需研究工具 |
 
 ## 数据流与模块边界
 

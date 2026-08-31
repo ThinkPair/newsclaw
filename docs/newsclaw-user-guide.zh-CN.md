@@ -35,7 +35,7 @@
 
 ### DeepSeek Harness 侧栏
 
-在 Harness 会话区右侧显示新闻爪。默认宽 380px，可调 280–560px，并尽量为主会话区保留至少 400px。它还向 Agent 提供 24 个新闻爪工具，用于读推荐、提交反馈、查看画像、对话、管理本地收藏和按需研究。
+在 Harness 会话区右侧显示新闻爪。默认宽 380px，可调 280–560px，并尽量为主会话区保留至少 400px。它还向 Agent 提供 31 个新闻爪工具，用于读推荐、提交反馈、查看画像、对话、管理本地收藏、按需研究和网页/PDF 变化监控。
 
 ## 4. 页面功能
 
@@ -270,12 +270,12 @@ SQLite 文件位置由“数据目录”自动决定。界面中的数据库路�
 
 DSH 侧栏里的设置页只展示三类真实信息：运行状态、新闻来源、插件连接。它不会再通过旧配置接口假装修改 AI、新闻源、推荐或画像。需要调整完整业务配置时，点击“打开电脑端”进入正式桌面 Web。
 
-- `apiUrl`：插件与 24 个 Agent 工具共同使用的后端地址，正式保持 `http://127.0.0.1:8430`。
+- `apiUrl`：插件与 31 个 Agent 工具共同使用的后端地址，正式保持 `http://127.0.0.1:8430`。
 - `timeoutMs`：单个 Agent 工具最长等待时间，推荐 `300000` 毫秒。
 - 开机自启动：这是 DSH 设置页唯一保留的写入项，真实修改 NewsClaw 本机自启动状态。
 - 修改 `apiUrl` 或 `timeoutMs` 后，重新加载插件或重启 Harness 最稳妥。
 
-## 12. DSH 的 24 个 Agent 工具
+## 12. DSH 的 31 个 Agent 工具
 
 ### 推荐与状态
 
@@ -300,6 +300,12 @@ DSH 侧栏里的设置页只展示三类真实信息：运行状态、新闻来�
 `newsclaw_search_web`、`newsclaw_extract_evidence`。
 
 `newsclaw_search_web` 接受问题、`general|news|finance` 主题、可选时间范围和最多 8 条结果；`newsclaw_extract_evidence` 接受问题、1–3 个公开 URL 和每来源最多 3 个片段。两个工具都可显式要求刷新本地缓存，但都不会修改画像、收藏或推荐池。DSH 插件不保存 Tavily Key，实际调用和缓存都由本机 NewsClaw 后端负责。
+
+### 网页 / PDF 变化监控
+
+`list_web_monitors`、`add_web_monitor`、`check_web_monitor`、`set_web_monitor_state`、`get_web_monitor_history`、`list_monitor_notifications`、`act_on_monitor_notification`。
+
+这 7 个工具只管理用户明确添加的公开页面或 PDF，复用后端的基线、版本、差异、租约和通知账本。DSH 自己不抓页面，也不会在没有用户目标时自动添加监控。
 
 写操作会携带稳定的 request ID，同一动作重试不重复学习。Agent 输出会递归遮蔽常见 Token、Key 和 Authorization 字段。
 

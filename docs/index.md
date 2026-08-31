@@ -16,7 +16,7 @@
 - [可选 HTTPS 部署](https-deployment.md) — 公网域名 Caddy 自动证书，以及可信 LAN 的 TLS profile / 本地 CA 流程
 - [OpenClaw 接入最短指南](openclaw-quickstart.md) — 把 OpenBiliClaw 接进 OpenClaw / AI 编码助手
 - [Agent Bridge 能力契约](agent-integration.md) — `agent-bridge/v2` 能力协商、宿主别名与新功能同步清单
-- [NewsClaw 使用指南](newsclaw-user-guide.zh-CN.md) / [架构](newsclaw-architecture.md) / [Phase 3 事件层规格](plans/2026-08-28-newsclaw-event-layer-spec.md) — 新闻爪四端、本地数据、持续跟踪、持久事件投影与失败边界
+- [NewsClaw 使用与讲解说明书](newsclaw-operation-manual.zh-CN.md) / [全功能深度审计](newsclaw-full-function-audit-2026-08-31.md) / [架构](newsclaw-architecture.md) / [Phase 3 事件层规格](plans/2026-08-28-newsclaw-event-layer-spec.md) — 新闻爪四端、全部主要按钮、端到端闭环、本地数据、持续跟踪、持久事件投影与失败边界
 
 ## 🛠️ 我是开发者 / 贡献者
 

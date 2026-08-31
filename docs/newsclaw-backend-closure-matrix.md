@@ -5,6 +5,11 @@
 主。新闻事件统一保存 `source_platform=news`，并在证据可用时同时保存
 `article_id / original_url / media / technical_provider`。
 
+2026-08-31 全功能复核补充检查了“按钮发出请求之后”的数据库、租约、失败和重启语义：
+今日队列不再把 dormant evaluated backlog 永久报成 processing；跟踪检查使用每次领取轮换
+的 `claim_token`；网页监控的非预期运行异常也必须持久失败并进入有界重试；新客户端统一
+使用文章原生通知 ACK。
+
 ## 闭环矩阵
 
 | 动作 | 原生接口 / Bridge | 幂等与冲突 | 持久化与回显 | 重启与失败语义 | 结论 |
@@ -12,7 +17,7 @@
 | 首次设置 | `POST /api/news/bootstrap`，`GET /api/news/bootstrap/status` | 规范化兴趣与避雷词后生成输入摘要；同请求同输入回放，复用同一 `request_id` 改输入返回 409；校验错误 422 | `newsclaw_bootstrap.json` 保存请求、阶段、终态，手工偏好进入事件与画像 | 重启发现孤儿 `running` 会落成可重试的 `failed + recovered_after_restart`；已完成画像只允许原命令回放，不会覆盖 | 闭合 |
 | 旧初始化入口 | `POST /api/init` | NewsClaw 模式固定返回 409 | 返回新闻原生 start/status 地址 | 不会误跑视频账号初始化或覆盖新闻画像 | 闭合 |
 | 推荐 / 换一批 / 追加 | `/api/recommendations`、`/api/recommendations/reshuffle`、`/api/recommendations/append`；Bridge `recommend/reshuffle/append` | 排除集使用 `article_id/content_id/item_key`；读/出池操作没有独立命令回执 | 推荐池与 shown/seen 状态在 SQLite；新闻卡回显文章、媒体、原链和来源 | 单源失败由新闻 runtime 报 degraded；客户端需继续以新闻 scope 调用 | 有限闭合 |
-| 今日首选 / 刷新 | `/api/delight/pending`、`/api/delight/pending-batch`、`/api/delight/trigger`、主动 WebSocket | 单条、批量、推送和触发共享北京时间今日 `news` scope；满池 claim 在事务中预留 lane/day 实际领取数 | scoped 计数与每日预算落 SQLite；copy-ready 后才做受保护池维护 | 预算不因失败/重启退款；跨日新 key；processing/empty/degraded 不以旧闻补位 | 闭合 |
+| 今日首选 / 刷新 | `/api/delight/pending`、`/api/delight/pending-batch`、`/api/delight/trigger`、主动 WebSocket | 单条、批量、推送和触发共享北京时间今日 `news` scope；满池 claim 在事务中预留 lane/day 实际领取数；scope 与 preferred-source SQL 参数按占位顺序绑定 | scoped 计数与每日预算落 SQLite；copy-ready 后才做受保护池维护；raw trim 保护 canonical 可见集合 | 预算不因失败/重启退款；跨日新 key；processing 只表示仍可推进，在库等待用 `degraded + queued_count + blocked_reason`；不以旧闻补位 | 闭合 |
 | 喜欢 / 不喜欢 / 评论 / 忽略 | `POST /api/feedback`；Bridge `submit-feedback` | 事件入口按 `request_id` 去重；同 ID 改推荐、动作或评论返回 409 | 事件先落盘，再幂等修复推荐反馈投影；新闻证据字段随事件保存 | 重启后同一请求返回原 `event_id` 且 `duplicate=true`；画像异步处理失败不撤销事实 | 闭合 |
 | 打开普通新闻 | `POST /api/recommendation-click` | `request_id` 对文章身份和来源做冲突检查 | durable `click` 事件进入历史，回显 `article_id/event_id/duplicate` | 重启重试不会重复学习 | 闭合 |
 | 惊喜卡“看过” | `POST /api/spotlight/respond`，`response=view`；Bridge 同名动作 | 标记是天然幂等的集合更新，不写 click | 只把卡片标为已消费，不形成打开/兴趣证据 | 重载后卡片不会回来，也不会污染打开历史 | 闭合 |
@@ -23,7 +28,7 @@
 | 画像查看 / 手工编辑 | `/api/profile*`；Bridge `get-profile/profile-edit-state/edit-profile` | 手工覆盖操作是确定性写入，但无独立 `request_id` 回执 | override 与画像证据持久化，手工值优先于 AI 推断 | 重启恢复；调用方无法区分一次重试是否为首次应用 | 有限闭合 |
 | 对话 | `POST /api/chat/turns` 与历史接口；Bridge `chat/chat-history` | `turn_id` 对 session/scope/subject/message 做冲突校验；惊喜卡 chat 使用 `delight:<request_id>` | durable turn 保存 pending/completed/failed 和回复 | 完成回放不重复调用 LLM；相同 turn 改消息返回冲突 | 闭合（旧 `/api/chat` 除外） |
 | 兴趣 / 避雷探测 | probe 获取与 respond 接口；对应 Bridge 工具 | 反馈 `request_id` 进入 durable probe event，冲突检查 | 探测终态、画像更新和对话结果持久化 | 重启后回放不重复确认、拒绝或延期 | 闭合 |
-| 消息 | `GET /api/notifications/pending`，`POST /api/notifications/ack` | ACK 以 `request_id + article_id` 持久去重；同 ID 换文章 409 | 消息行标记已发送，回显 `article_id/request_id/duplicate` | 重载不会再次出现；不存在文章 404；旧 `/sent` 仅兼容 | 闭合 |
+| 消息 | `GET /api/notifications/pending`，`POST /api/notifications/ack` | ACK 以 `request_id + article_id` 持久去重；同 ID 换文章 409 | 桌面与手机都使用同一文章原生接口，消息行标记已发送，回显 `article_id/request_id/duplicate` | 重载不会再次出现；不存在文章 404；旧 `/sent` 仅兼容且未知身份也不得假成功 | 闭合 |
 | 来源开关 / RSS | `PUT /api/news/sources/{id}`，RSS 增删接口 | 自定义 RSS 以规范 URL 生成稳定 ID；完全相同添加回放 `duplicate=true`，同 URL 改参数 409 | 原子 JSON + last-good；健康与终态在 source task DB | 重启保留；一个来源坏只降级该来源。删除重试目前返回 404 | 有限闭合 |
 | 刷新 / 探测 / runtime | `/api/news/refresh`、`/probe`、`/runtime` | refresh 使用稳定请求 ID、任务租约和持久终态 | 每源 attempt/health/last success/error 落盘，候选写 SQLite | 限流、超时、无权限、空结果分型；部分成功为 degraded，不伪装全成功 | 闭合 |
 | 新闻设置 / 凭据 | `/api/news/settings`、`/api/news/credentials/tushare` | 参数严格校验；凭据写入是替换操作 | 设置原子写入并保留 last-good；Token 只存本机文件，接口仅返回脱敏状态 | 文件损坏自动回退 last-good；运行时应用回调失败后的自动反向回滚仍有限制 | 有限闭合 |
@@ -72,6 +77,9 @@ Content-Type: application/json
 - 消息新增文章原生、持久、可冲突检测的 ACK，解决“本地移除、重载又回来”。
 - 补齐新闻缓存解析，让反馈、打开、历史和正文证据能读回媒体与技术提供方。
 - 自定义 RSS 添加可安全重试；迁移清单正确标记并恢复 NewsClaw 凭据。
+- 修复今日 scope 与 preferred-source 参数反序导致已评估候选无法入池，以及 raw trim 在精确收敛后再次制造可见缺口。
+- 跟踪租约增加 claim token 围栏；旧执行者不能覆盖接管后的成功、失败或证据。
+- 批次状态、网页监控通用异常、陈旧 RSS 和刷新时间使用真实可恢复语义，不用无限处理中或绿色健康掩盖故障。
 
 ## 剩余限制
 

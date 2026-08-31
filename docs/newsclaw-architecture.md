@@ -66,6 +66,34 @@ ResearchService -> fresh local cache, or Tavily Search / Extract
                             +-- no automatic profile, discovery, or pool write
 ```
 
+## Truthful state and concurrency fences
+
+The user-facing state is derived from work that can still make progress, not
+from the mere existence of historical rows. A Today batch is `processing` only
+while a source refresh, pending/evaluating claim, in-flight evaluator, or copy
+job is active. Evaluated rows waiting for admission are reported as a bounded
+queue with a stable blocked reason; they cannot hold the UI spinner forever.
+
+```text
+today news scope
+  -> pending/evaluating/in-flight/copy work -> processing
+  -> evaluated but not admitted            -> degraded + queued reason
+  -> servable items                         -> ready
+  -> no work and no item                    -> empty
+```
+
+Tracking checks and document-monitor checks use database leases as ownership,
+not merely as timestamps. Every reclaimed tracking check receives a new
+`claim_token`; completion or failure must present the current token, so an old
+worker cannot overwrite the new owner's result. A document monitor converts
+both known fetch/parse failures and unexpected runtime exceptions into the same
+durable failed/retry state instead of leaving a permanent `running` row.
+
+Desktop and mobile clients acknowledge ordinary news notifications through
+`article_id + request_id`. Web/PDF monitor notifications keep their independent
+delivery identity and action ledger. Neither path infers success from removing
+a card locally.
+
 ## Article contract
 
 | Field | Meaning |

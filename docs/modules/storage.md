@@ -21,6 +21,14 @@
 - `get_pool_candidates_needing_copy()` 接受可选的来源与发布时间半开区间；NewsClaw runtime
   只有在来源、开始和结束边界同时存在时才使用该能力。SQL 先做 scope 过滤再排序和 LIMIT，
   所以旧闻、其它来源、缺失或非法时间以及恰好落在结束边界的行都不会进入当日文案批次。
+- `get_evaluated_discovery_candidates_for_admission()` 的绑定顺序固定为 WHERE 中的 scope
+  参数在前、ORDER BY 的 preferred-source 参数在后；两者同时存在时也能读回今日 `news`
+  已评估行。回归用例锁定该顺序，避免再次出现“数据库有结果、刷新却一直处理中”。
+- 推荐池精确收敛后，raw trim 会把当前 canonical 可展示集合加入保护集；裁剪只移除隐藏
+  raw 候选，不能把已经达到的可见目标再次打出缺口。
+- `tracked_observation_checks.claim_token` 是每次领取生成的新围栏令牌。完成和失败写入必须
+  同时匹配 `check_id + tracking_id + claim_token`；租约被接管后，旧执行者不能覆盖新一轮
+  检查结果、证据或重试状态。
 
 本模块当前承担六类边界：
 

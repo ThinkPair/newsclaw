@@ -53,7 +53,7 @@ P5 解决一个具体问题：重要网页或 PDF 更新以后，不让用户重
 
 - 桌面/窄屏 Web：内容库的“网页监控”，支持添加、立即检查、暂停/继续、软移除、折叠版本和进入现有事件档案。
 - 消息：复用既有抽屉，持久显示正文变化、失败和恢复。
-- DSH：内容库紧凑监控页；Agent Bridge 新增 7 个管理/历史/消息工具，总计 29 个工具。
+- DSH：内容库紧凑监控页；Agent Bridge 新增 7 个管理/历史/消息工具，并保留 2 个 Tavily 按需研究工具，总计 31 个工具。
 - 浏览器扩展：只向正式 `newsclaw-api` 读取未读数并打开本机监控页；无目标站点权限。
 - CLI：`newsclaw monitor list/add/check/pause/resume/remove/notifications/read`。
 

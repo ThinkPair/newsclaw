@@ -158,7 +158,8 @@ backend, primary SQLite database,
 system-inferred profile, personal-memory ledger, recommendation pool, saved items, and chat history. On-demand research
 evidence stays in a separate SQLite ledger under the same private data
 directory, so it is not mixed with profile or pool state. The extension never
-reads news pages or cookies. The DSH panel defaults to 380px, supports 280–560px,
+reads news pages or cookies. Logged-in platform work reuses the seven-source task multiplex
+instead of introducing a side queue. The DSH panel defaults to 380px, supports 280–560px,
 and keeps at least 400px for the conversation area.
 
 The complete Phase 2 tracking surface is desktop-only. Mobile/PWA, the browser

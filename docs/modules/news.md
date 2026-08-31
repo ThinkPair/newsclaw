@@ -24,13 +24,14 @@ candidate pool.
 | Tushare Pro major news | Implemented | Injectable `major_news` endpoint client |
 | Tushare CCTV news | Implemented | Injectable day-scoped `cctv_news` endpoint client |
 | RSS 2.0 / Atom | Implemented | Direct feed subscription only, bounded response size, no page crawling |
-| Permission and health probes | Implemented | Separates available, empty, permission denied, rate limited, timeout, and unavailable |
+| Permission and health probes | Implemented | Separates available, empty, permission denied, rate limited, timeout, unavailable, and a reachable-but-stale RSS/Atom feed |
 | Durable source tasks | Implemented | SQLite lease, timeout, pacing, exponential backoff, immutable terminal state, result replay |
 | Stable request/event IDs | Implemented | Caller IDs are preserved when valid; otherwise deterministic IDs are derived |
 | Feedback/event idempotency | Implemented | SQLite first-write ledger rejects event-ID payload conflicts |
 | Semantic dedupe | Implemented | Exact URL/hash/title plus offline headline similarity; local embedding similarity can be injected |
 | From-zero onboarding | Implemented | Explicit manual interests/avoid terms, initial source fetch, cross-source dedupe, candidate callback, four-stage result |
-| Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; the live desktop list/route/empty state and API schema were verified locally, while populated-card and change paths are covered by automated contracts |
+| Continuous observation tracking | Implemented | Reuses a completed normalized refresh batch, deterministic shortlist, bounded structured change verification, durable check/evidence timeline and unread state; each claim carries a generation token so an expired worker cannot overwrite its replacement |
+| Public webpage/PDF monitoring | Implemented | Stores a first text baseline, deterministic later diffs, bounded retry and persistent notification/event projection; a generic extraction/runtime exception completes as a retryable failure instead of leaving a permanent running lease |
 | Durable event projection (Phase 3) | Implemented | Projects completed tracking evidence into stable events, immutable evidence memberships and deduplicated state changes in the same transaction; only confirmed, effective objective changes enter the default feed, while expectations/sentiment/analysis remain secondary |
 | Event workspace projection (Phase 4) | Implemented | Desktop event inbox, safe applied A→B change set, scalar reachable `current_state`, conflict freeze, explicit audit history, evidence drawer, unread state and mobile master/detail all consume the shared backend event truth |
 | News presentation and source navigation | Implemented | Keeps canonical title/body untouched, derives a compact headline only for substantial `【标题】正文` provider rows, conservatively folds same-provider/same-day duplicates only when lead, complete normalized body and exact URL also match, and distinguishes safe provider URLs from an explicitly labelled media-plus-title search fallback across initial, reshuffle and append responses |
@@ -93,7 +94,9 @@ Terminal states are `succeeded`, `empty`, `permission_denied`, `rate_limited`,
 `timed_out`, and `failed`. A replay of the same request returns the persisted
 normalized articles without calling the provider again. One source failure is
 represented as a source-level degraded/unavailable state; it does not imply
-that a multi-source refresh succeeded.
+that a multi-source refresh succeeded. A reachable RSS/Atom feed whose newest
+entry is older than the configured freshness boundary is reported as stale /
+degraded rather than healthy.
 
 ### Idempotency and dedupe
 
@@ -118,6 +121,11 @@ as a valid empty result without a model call. Plausible candidates require a
 bounded structured model comparison against the original and latest verified
 state. Provider failure or invalid structure is retry/degraded, never a false
 “unchanged”.
+
+Every claimed check has a random `claim_token` tied to that lease generation.
+Completion and failure both require the same token. If a stale worker returns
+after another worker has reclaimed the check, its token no longer matches and
+the write fails closed instead of overwriting the newer result.
 
 Only a newly inserted material-change fingerprint creates unread state.
 Unchanged and valid-empty checks remain durable timeline facts without a change

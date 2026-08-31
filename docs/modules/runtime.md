@@ -18,6 +18,15 @@ scope 完整时绕过普通 copy-ready 水位，避免“池已满所以不生�
 
 NewsClaw 模式的活动流会对推荐与反馈行做 `news` 范围过滤，并为旧库前排混有视频记录的情况扩大有界读取窗口；只有新闻行能进入活动卡片。通知控制器同时接受可选 `source_platform`，把范围下推到数据库候选查询，而不是取一条旧视频后在 API 层丢弃。
 
+NewsClaw 的候选来源份额只包含单一 `news` lane，不继承普通 OpenBiliClaw 的 B 站 / 小红书
+份额目标。跟踪任务每次领取使用新的 `claim_token`；旧租约即使迟到完成，也会被存储层围栏
+拒绝。网页/PDF 监控调度除已知网络和解析错误外，也会把其它运行异常落成失败、退避和
+持久通知，不能让检查一直停在 `running` 等待租约过期。
+
+通用 `runtime-status.last_refresh_at` 优先投影 NewsClaw 新闻 runtime 的真实最近刷新时间，
+与设置页和来源页使用同一时钟；RSS 健康同时检查“最近成功”和“最新内容时间”，连接成功
+但多年无更新的 feed 会显示 stale/degraded，而不是绿色健康。
+
 每个 **API daemon** runtime generation 只拥有一个 expression copy coordinator：8 条立即、尾批固定 3 秒、单轮最多 60，零进展退避 15 秒，60 秒仅作 safety wake。停止 generation 会取消 collector、gate waiter 与运行中的 provider callback；状态接口暴露 pending/state/deadline/last completed/error。OpenClaw direct composition 不启动 daemon loop，故不创建该 coordinator；它在 inline admission 后同步 drain 最多 4 条 durable copy，且不在同一交互请求内做 split retry：有效 subset 立即入 canonical pool，剩余行保持 pending 供下次请求处理，返回前没有遗留 provider/copy task。参数来自 2026-07-12 生产日志校准。
 
 > API runtime 启动时创建一套共享 LLM gate 并注入主服务、Soul 与 refresh；在任何 provider 工作可启动前用 canonical database available 初始化 `healthy/refill/empty`，后续 controller readiness、原子维护、推荐池状态与候选 snapshot 持续同步。runtime status 暴露 total/background 以及 refill/maintenance active、waiting 和 inventory state。
@@ -38,7 +47,7 @@ gate 属于 `RuntimeContext` 的稳定部分：热重载构造成功后在同一
 
 NewsClaw 的持续跟踪不新增第二条采集循环。`api.news_routes.NewsRuntime.refresh()` 仍是 Tushare/RSS 抓取、来源健康、规范化和跨来源去重的唯一拥有者；同一轮完成后，把同一个本地批次交给 app-owned 后台任务处理到期的 active 跟踪项，普通刷新立即返回 `tracking.scheduled=true`，不等待模型。手动“立即检查”设置 `force_tracking=true`，会等待同一批次的真实检查回执；这条交互路径把来源重试约束为最多 3 次、单次 20 秒、退避最多 2 秒（包括上游 `Retry-After`），使来源阶段保持在约 64 秒内。单项模型核验有 120 秒上限，加入既有 single-flight 最多等待 130 秒，均受桌面 5 分钟请求预算覆盖。跟踪异常不得阻塞新闻刷新，也不能把来源或模型错误改写成“无变化”。
 
-每个跟踪项先走本地确定性筛选，只有存在相关候选才申请有界结构化模型核验。数据库用 tracker 级 partial unique index 和有效租约保证同一观察点只能有一条 `running` 检查；手动检查撞上后台检查时等待其 durable 终态回执，过期 owner 会先被 fencing，再由新一轮接管。实质变化原子写入检查、证据、最新状态和未读；无变化/有效空结果只推进检查时间并保留历史，不进入变化通知。失败保持已读并按有界退避重试。手动“立即检查”复用相同来源批次，并用强制到期语义只检查指定跟踪项；它不是 Tavily 调用，也不产生画像事件。归档会停止后续领取并取消尚未完成的检查，但不删除历史。
+每个跟踪项先走本地确定性筛选，只有存在相关候选才申请有界结构化模型核验。数据库用 tracker 级 partial unique index、有效租约和每次领取都会轮换的 `claim_token` 保证同一观察点只能有一条有效 `running` 检查；手动检查撞上后台检查时等待其 durable 终态回执，过期 owner 会先被 fencing，再由新一轮接管，旧 owner 的迟到成功或失败均不能落账。实质变化原子写入检查、证据、最新状态和未读；无变化/有效空结果只推进检查时间并保留历史，不进入变化通知。失败保持已读并按有界退避重试。手动“立即检查”复用相同来源批次，并用强制到期语义只检查指定跟踪项；它不是 Tavily 调用，也不产生画像事件。归档会停止后续领取并取消尚未完成的检查，但不删除历史。
 
 本节是 Phase 2 的实现与验收合同。代码、接口、数据库迁移和桌面契约回归已经完成；2026-08-28 已在本机正式桌面服务验证新增接口、内容库路由和空状态。完整入口本阶段仅在桌面 Web，手机/PWA、浏览器扩展和 DSH 不创建独立调度或第二套跟踪状态。真实外部新闻触发的首次自然变化仍需在日常运行中继续观察，但不改变失败不能伪装成“无变化”的既有边界。
 

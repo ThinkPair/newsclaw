@@ -16,6 +16,16 @@ NewsClaw 模式的 `GET /api/delight/pending`、`GET /api/delight/pending-batch`
 是在等待评估、已经没有合格材料，还是来源本身降级，而不是只转动图标。普通产品模式
 不启用该日期范围或满池预算。
 
+`processing` 只表示仍有可推进的 pending、正在评估、在途任务、待生成文案或来源刷新；
+已经评估但尚未入池的 dormant backlog 不再让批次永久停在处理中。此时响应使用
+`state="degraded"`，并公开 `queued_count` 与稳定 `blocked_reason`（例如
+`admission_waiting` 或 `daily_evaluation_budget_exhausted`），客户端可以保留当前内容并给出
+可解释的重试状态。
+
+四端消息确认统一使用 `POST /api/notifications/ack` 的 `article_id + request_id` 合同。
+兼容端点 `/api/notifications/sent` 只在确实找到目标文章时成功；未知身份返回 404，不能把
+一次无法核对的旧客户端请求伪装成已读。
+
 ## NewsClaw P4 个人记忆 API
 
 这些端点只在 `NEWSCLAW_MODE` 注册，响应固定声明
