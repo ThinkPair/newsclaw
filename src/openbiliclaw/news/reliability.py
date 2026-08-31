@@ -362,11 +362,42 @@ class SourceTaskStore:
                 raise RuntimeError("completed source task was not visible")
             return self._task_from_row(row)
 
-    def record_success(self, source_id: str, *, empty: bool = False) -> None:
+    def record_success(
+        self,
+        source_id: str,
+        *,
+        empty: bool = False,
+        stale: bool = False,
+        latest_published_at: str = "",
+    ) -> None:
         """Project a successful fetch into the durable source-health row."""
 
         now = normalize_utc(datetime.now(UTC), allow_empty=False)
         with self._lock, self._connection() as connection:
+            if stale:
+                watermark = normalize_utc(latest_published_at)
+                detail = (
+                    f"Feed has no entries newer than {watermark[:10]}."
+                    if watermark
+                    else "Feed has no current dated entries."
+                )
+                connection.execute(
+                    """
+                    INSERT INTO news_source_health (
+                        source_id, status, available, last_checked_at, last_success_at,
+                        consecutive_failures, error_code, error_message
+                    ) VALUES (?, 'degraded', 1, ?, '', 0, 'stale_feed', ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        status = 'degraded', available = 1,
+                        last_checked_at = excluded.last_checked_at,
+                        consecutive_failures = 0,
+                        error_code = excluded.error_code,
+                        error_message = excluded.error_message
+                    """,
+                    (source_id, now, detail),
+                )
+                return
+            last_success_at = "" if empty else now
             connection.execute(
                 """
                 INSERT INTO news_source_health (
@@ -381,7 +412,7 @@ class SourceTaskStore:
                     END,
                     consecutive_failures = 0, error_code = '', error_message = ''
                 """,
-                (source_id, now, now, 1 if empty else 0),
+                (source_id, now, last_success_at, 1 if empty else 0),
             )
 
     def record_failure(self, source_id: str, error: NewsSourceError) -> None:
@@ -414,11 +445,22 @@ class SourceTaskStore:
                 ),
             )
 
-    def record_probe(self, probe: SourceProbe) -> None:
+    def record_probe(
+        self,
+        probe: SourceProbe,
+        *,
+        stale: bool = False,
+        latest_published_at: str = "",
+    ) -> None:
         """Persist a permission probe even before the first scheduled fetch."""
 
         if probe.available:
-            self.record_success(probe.source_id, empty=probe.status == "empty")
+            self.record_success(
+                probe.source_id,
+                empty=probe.status == "empty",
+                stale=stale,
+                latest_published_at=latest_published_at,
+            )
             return
         error_types: dict[str, type[NewsSourceError]] = {
             "permission_denied": SourcePermissionDenied,
@@ -572,7 +614,14 @@ class SourceRunner:
                         articles=articles,
                     )
                     try:
-                        self._store.record_success(adapter.source_id, empty=not articles)
+                        self._store.record_success(
+                            adapter.source_id,
+                            empty=not articles,
+                            stale=bool(getattr(adapter, "feed_is_stale", False)),
+                            latest_published_at=str(
+                                getattr(adapter, "latest_entry_published_at", "") or ""
+                            ),
+                        )
                     except sqlite3.Error:
                         logger.exception("Failed to project successful news source health")
                     return SourceRunResult(

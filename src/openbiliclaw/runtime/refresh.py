@@ -265,7 +265,7 @@ class SupportsEventDatabase(Protocol):
         min_confidence: float = 0.82,
         source_platform: str = "",
     ) -> dict[str, Any] | None: ...
-    def mark_notification_sent(self, bvid: str) -> None: ...
+    def mark_notification_sent(self, bvid: str) -> bool: ...
     def get_delight_candidate(
         self,
         *,
@@ -1280,13 +1280,15 @@ class ContinuousRefreshController:
             "reason": str(candidate.get("expression", "")),
         }
 
-    def mark_notification_sent(self, bvid: str) -> None:
+    def mark_notification_sent(self, bvid: str) -> bool:
         """Persist notification delivery markers."""
-        self.database.mark_notification_sent(bvid)
+        if not self.database.mark_notification_sent(bvid):
+            return False
         now = self._now().isoformat()
         self._update_discovery_runtime_state(
             lambda state: state.update({"last_notification_at": now})
         )
+        return True
 
     def get_pending_delight(self) -> dict[str, object] | None:
         """Return one proactive delight candidate for browser notification.

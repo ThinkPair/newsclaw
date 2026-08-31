@@ -1390,6 +1390,15 @@ def test_scoped_evaluated_admission_excludes_old_and_non_news_rows(tmp_path: Pat
 
     assert [row["candidate_key"] for row in admitted] == ["news:today"]
 
+    preferred = db.get_evaluated_discovery_candidates_for_admission(
+        limit=10,
+        preferred_source_platforms=["news"],
+        source_platform="news",
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+    assert [row["candidate_key"] for row in preferred] == ["news:today"]
+
 
 def test_retire_outside_scope_leaves_claimed_and_today_rows_untouched(tmp_path: Path) -> None:
     db = Database(tmp_path / "retire.db")
@@ -1528,3 +1537,62 @@ def test_newsclaw_reconcile_recounts_when_hidden_topic_rows_surface(tmp_path: Pa
     ).fetchone()
     assert stale is not None
     assert int(stale["count"]) == 2
+
+
+def test_newsclaw_reconcile_raw_trim_preserves_converged_visible_rows(tmp_path: Path) -> None:
+    db = Database(tmp_path / "raw-trim-visible-protection.db")
+    db.initialize()
+    for index in range(3):
+        bvid = f"news:visible-{index}"
+        db.cache_content(
+            bvid,
+            title=bvid,
+            source="news",
+            source_platform="news",
+            content_id=f"visible-{index}",
+            content_url=f"https://example.com/{bvid}",
+            published_at="2026-08-30T05:00:00Z",
+            relevance_score=0.7 + index / 100,
+            style_key="news_brief",
+            topic_group=f"visible-topic-{index}",
+        )
+        db.update_pool_copy(
+            bvid,
+            expression=f"reason-{index}",
+            topic_label=f"visible-topic-{index}",
+        )
+    for index in range(2):
+        bvid = f"news:hidden-raw-{index}"
+        db.cache_content(
+            bvid,
+            title=bvid,
+            source="news",
+            source_platform="news",
+            content_id=f"hidden-raw-{index}",
+            content_url=f"https://example.com/{bvid}",
+            published_at="2026-08-30T06:00:00Z",
+            relevance_score=0.99,
+            style_key="news_brief",
+            topic_group=f"hidden-topic-{index}",
+        )
+
+    assert db.count_pool_candidates() == 3
+    assert db.count_pool_raw_material_candidates() == 5
+
+    maintained = db.reconcile_newsclaw_pool_after_admission(
+        target=3,
+        raw_ceiling=3,
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+    )
+
+    assert maintained == 2
+    assert db.count_pool_candidates() == 3
+    assert db.count_pool_raw_material_candidates() == 3
+    visible_statuses = {
+        str(row["pool_status"])
+        for row in db.conn.execute(
+            "SELECT pool_status FROM content_cache WHERE bvid LIKE 'news:visible-%'"
+        ).fetchall()
+    }
+    assert visible_statuses == {"fresh"}

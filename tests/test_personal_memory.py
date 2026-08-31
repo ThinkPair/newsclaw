@@ -133,6 +133,66 @@ def test_manual_create_is_idempotent_without_storing_private_content_in_receipt(
     assert json.loads(str(receipt))["target_id"] == first["item"]["memory_id"]
 
 
+def test_item_replay_returns_the_original_operation_snapshot_after_later_changes(
+    tmp_path: Path,
+) -> None:
+    database = _db(tmp_path)
+    created = database.create_personal_memory_item(
+        kind="confirmed_fact",
+        title="研究范围",
+        content="宏观政策",
+        request_id="snapshot-create",
+    )["item"]
+    first_update = database.update_personal_memory_item(
+        created["memory_id"],
+        expected_version=1,
+        request_id="snapshot-update-1",
+        content="宏观政策与金融监管",
+    )
+    database.update_personal_memory_item(
+        created["memory_id"],
+        expected_version=2,
+        request_id="snapshot-update-2",
+        content="宏观政策、金融监管与产业变化",
+    )
+    deleted = database.delete_personal_memory_item(
+        created["memory_id"],
+        expected_version=3,
+        request_id="snapshot-delete",
+    )
+    database.restore_personal_memory_item(
+        created["memory_id"],
+        expected_version=4,
+        request_id="snapshot-restore",
+    )
+
+    create_replay = database.create_personal_memory_item(
+        kind="confirmed_fact",
+        title="研究范围",
+        content="宏观政策",
+        request_id="snapshot-create",
+    )
+    update_replay = database.update_personal_memory_item(
+        created["memory_id"],
+        expected_version=1,
+        request_id="snapshot-update-1",
+        content="宏观政策与金融监管",
+    )
+    delete_replay = database.delete_personal_memory_item(
+        created["memory_id"],
+        expected_version=3,
+        request_id="snapshot-delete",
+    )
+
+    assert create_replay["item"]["version"] == 1
+    assert create_replay["item"]["content"] == "宏观政策"
+    assert update_replay["item"] == first_update["item"]
+    assert update_replay["replayed"] is True
+    assert delete_replay["item"] == deleted["item"]
+    assert delete_replay["item"]["status"] == "deleted"
+    assert database.get_personal_memory_item(created["memory_id"])["version"] == 5
+
+
 def test_request_id_cannot_be_reused_for_a_different_target_or_payload(tmp_path: Path) -> None:
     database = _db(tmp_path)
     first = database.create_personal_memory_item(
@@ -253,9 +313,7 @@ def test_candidate_requires_sanitized_traceable_evidence(tmp_path: Path) -> None
             proposal_reason="聊天推断",
             source_type="chat",
             source_ref="chat:turn-1",
-            evidence=[
-                {"type": "chat", "ref": "chat:turn-1", "authorization": "secret"}
-            ],
+            evidence=[{"type": "chat", "ref": "chat:turn-1", "authorization": "secret"}],
         )
     with pytest.raises(ValueError, match="local path"):
         database.propose_personal_memory_candidate(
@@ -301,6 +359,85 @@ def test_accept_candidate_is_atomic_versioned_and_the_only_inference_promotion(
         "create_from_candidate",
         "accept_candidate",
     }
+
+
+def test_candidate_replay_returns_the_original_linked_memory_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = _db(tmp_path)
+    candidate = _candidate(database)
+    accepted = database.resolve_personal_memory_candidate(
+        candidate["candidate_id"],
+        decision="accept",
+        expected_version=1,
+        request_id="snapshot-accept",
+    )
+    database.update_personal_memory_item(
+        accepted["item"]["memory_id"],
+        expected_version=1,
+        request_id="snapshot-linked-update",
+        content="用户同时关注黄金政策传导与价格验证",
+    )
+
+    replay = database.resolve_personal_memory_candidate(
+        candidate["candidate_id"],
+        decision="accept",
+        expected_version=1,
+        request_id="snapshot-accept",
+    )
+
+    assert replay["replayed"] is True
+    assert replay["candidate"] == accepted["candidate"]
+    assert replay["item"] == accepted["item"]
+    assert replay["item"]["version"] == 1
+
+
+def test_noop_candidate_replay_preserves_the_linked_memory_version_it_observed(
+    tmp_path: Path,
+) -> None:
+    database = _db(tmp_path)
+    candidate = _candidate(database)
+    accepted = database.resolve_personal_memory_candidate(
+        candidate["candidate_id"],
+        decision="accept",
+        expected_version=1,
+        request_id="noop-snapshot-accept",
+    )
+    linked_v2 = database.update_personal_memory_item(
+        accepted["item"]["memory_id"],
+        expected_version=1,
+        request_id="noop-snapshot-linked-v2",
+        content="用户关注黄金政策传导并观察价格验证",
+    )["item"]
+    first_noop = database.resolve_personal_memory_candidate(
+        candidate["candidate_id"],
+        decision="accept",
+        expected_version=2,
+        request_id="noop-snapshot-resolution",
+    )
+    database.update_personal_memory_item(
+        linked_v2["memory_id"],
+        expected_version=2,
+        request_id="noop-snapshot-linked-v3",
+        content="用户关注黄金政策传导、价格验证与政策失效条件",
+    )
+
+    replay = database.resolve_personal_memory_candidate(
+        candidate["candidate_id"],
+        decision="accept",
+        expected_version=2,
+        request_id="noop-snapshot-resolution",
+    )
+
+    assert first_noop["changed"] is False
+    assert replay["replayed"] is True
+    assert replay["item"] == linked_v2
+    receipt = database.conn.execute(
+        "SELECT response_json FROM personal_memory_requests WHERE request_id = ?",
+        ("noop-snapshot-resolution",),
+    ).fetchone()[0]
+    assert linked_v2["content"] not in str(receipt)
+    assert json.loads(str(receipt))["resolution_memory_version"] == 2
 
 
 def test_candidate_cannot_overwrite_manual_memory_without_exact_target_confirmation(

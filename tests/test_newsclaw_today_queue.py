@@ -234,6 +234,19 @@ def test_database_processing_count_is_scoped_to_today_news_and_all_live_stages(
         )
         == 6
     )
+    assert database.get_delight_processing_stage_counts(
+        published_after="2026-08-29T16:00:00Z",
+        published_before="2026-08-30T16:00:00Z",
+        source_platform="news",
+        min_delight_score_for_reason=0.85,
+    ) == {
+        "pending_ready": 1,
+        "evaluating": 1,
+        "evaluated": 1,
+        "in_flight": 1,
+        "expression_pending": 4,
+        "total": 6,
+    }
 
     database.conn.execute(
         """
@@ -254,6 +267,15 @@ def test_database_processing_count_is_scoped_to_today_news_and_all_live_stages(
             source_platform="news",
             min_delight_score_for_reason=0.85,
         )
+        == 3
+    )
+    assert (
+        database.get_delight_processing_stage_counts(
+            published_after="2026-08-29T16:00:00Z",
+            published_before="2026-08-30T16:00:00Z",
+            source_platform="news",
+            min_delight_score_for_reason=0.85,
+        )["total"]
         == 3
     )
 
@@ -342,3 +364,50 @@ def test_newsclaw_today_batch_rejects_old_rows_and_reports_processing(monkeypatc
     assert database.bounds is not None
     assert database.bounds[0]
     assert database.bounds[1]
+
+
+def test_newsclaw_today_batch_reports_dormant_evaluated_backlog_as_degraded(
+    monkeypatch,
+) -> None:
+    class FakeDatabase:
+        def get_delight_candidates(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "bvid": "today-news",
+                    "title": "今日新闻",
+                    "source_platform": "news",
+                    "published_at": datetime.now(UTC).isoformat(),
+                    "delight_score": 0.91,
+                }
+            ]
+
+        def count_delight_processing_candidates(self, **_kwargs: object) -> int:
+            return 7
+
+    class FakeRuntimeController:
+        def get_runtime_status(self) -> dict[str, int]:
+            return {
+                "candidate_eval_pending_ready": 1,
+                "candidate_eval_evaluating": 0,
+                "candidate_eval_in_flight": 0,
+                "candidate_eval_evaluated": 7,
+                "candidate_eval_budget_remaining": 0,
+                "expression_pending_count": 0,
+                "pool_available_count": 299,
+                "pool_target_count": 300,
+            }
+
+    monkeypatch.setenv("NEWSCLAW_MODE", "1")
+    app = create_app(
+        memory_manager=object(),
+        database=FakeDatabase(),
+        soul_engine=object(),
+        runtime_controller=FakeRuntimeController(),
+    )
+
+    payload = TestClient(app).get("/api/delight/pending-batch").json()
+
+    assert payload["state"] == "degraded"
+    assert payload["pending_count"] == 7
+    assert payload["queued_count"] == 7
+    assert payload["blocked_reason"] == "daily_evaluation_budget_exhausted"

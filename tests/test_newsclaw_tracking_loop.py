@@ -805,7 +805,38 @@ def test_expired_check_lease_is_reclaimable_without_a_second_row(tmp_path: Path)
     assert reclaimed_acquired is True
     assert reclaimed["check_id"] == first["check_id"]
     assert reclaimed["attempt_count"] == 2
+    assert reclaimed["claim_token"] != first["claim_token"]
     assert _scalar(database, "SELECT COUNT(*) FROM tracked_observation_checks") == 1
+
+    with pytest.raises(ValueError, match="lease was superseded"):
+        database.complete_tracked_observation_check(
+            check_id=str(first["check_id"]),
+            tracking_id=tracking_id,
+            claim_token=str(first["claim_token"]),
+            completed_at=(_NOW + timedelta(minutes=12)).isoformat(),
+            outcome="valid_empty",
+            matched_count=0,
+            changes=[],
+        )
+    with pytest.raises(ValueError, match="lease was superseded"):
+        database.fail_tracked_observation_check(
+            check_id=str(first["check_id"]),
+            tracking_id=tracking_id,
+            claim_token=str(first["claim_token"]),
+            completed_at=(_NOW + timedelta(minutes=12)).isoformat(),
+            error="stale worker",
+        )
+
+    completed, _item = database.complete_tracked_observation_check(
+        check_id=str(reclaimed["check_id"]),
+        tracking_id=tracking_id,
+        claim_token=str(reclaimed["claim_token"]),
+        completed_at=(_NOW + timedelta(minutes=12)).isoformat(),
+        outcome="valid_empty",
+        matched_count=0,
+        changes=[],
+    )
+    assert completed["status"] == "valid_empty"
 
 
 def test_tracker_check_claim_is_single_flight_and_fences_expired_owner(

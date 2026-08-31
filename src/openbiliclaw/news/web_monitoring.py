@@ -13,6 +13,7 @@ import codecs
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import socket
 import sys
@@ -31,6 +32,8 @@ import httpx
 from pypdf import PdfReader
 
 from openbiliclaw.proc import no_window_kwargs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -51,7 +54,7 @@ MAX_FETCH_SECONDS = 30.0
 _HTML_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 _GENERIC_BINARY_MIME_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
 _META_CHARSET_RE = re.compile(
-    br"<meta\b[^>]{0,2048}?\bcharset\s*=\s*['\"]?\s*([a-zA-Z0-9._:-]+)",
+    rb"<meta\b[^>]{0,2048}?\bcharset\s*=\s*['\"]?\s*([a-zA-Z0-9._:-]+)",
     re.IGNORECASE,
 )
 
@@ -387,8 +390,8 @@ class _VisibleTextParser(HTMLParser):
         normalized = tag.lower()
         if self._suppressed_tags:
             if normalized in self._suppressed_tags:
-                index = len(self._suppressed_tags) - 1 - self._suppressed_tags[::-1].index(
-                    normalized
+                index = (
+                    len(self._suppressed_tags) - 1 - self._suppressed_tags[::-1].index(normalized)
                 )
                 del self._suppressed_tags[index:]
             return
@@ -657,8 +660,7 @@ class WebDocumentFetcher:
                     current_origin = (
                         parsed_current.scheme,
                         parsed_current.hostname or "",
-                        parsed_current.port
-                        or (443 if parsed_current.scheme == "https" else 80),
+                        parsed_current.port or (443 if parsed_current.scheme == "https" else 80),
                     )
                     conditional_headers: dict[str, str] = {}
                     if current_origin == initial_origin:
@@ -968,14 +970,10 @@ def _compare_oversized_line_sets(previous: str, current: str) -> DocumentDiff:
     if new_line_end < 0:
         new_line_end = len(current)
     removed = tuple(
-        line[:600]
-        for line in previous[old_start:old_line_end].split("\n", 20)[:20]
-        if line.strip()
+        line[:600] for line in previous[old_start:old_line_end].split("\n", 20)[:20] if line.strip()
     )
     added = tuple(
-        line[:600]
-        for line in current[new_start:new_line_end].split("\n", 20)[:20]
-        if line.strip()
+        line[:600] for line in current[new_start:new_line_end].split("\n", 20)[:20] if line.strip()
     )
     if not removed:
         removed = ("（原文在此位置没有内容）",)
@@ -1631,8 +1629,7 @@ class WebMonitorStore:
                     fetched,
                     classification="noise_only",
                     suppression_reason=(
-                        "规范化器由旧版升级，当前正文作为新基线；"
-                        "跨版本差异不作为网页真实变化"
+                        "规范化器由旧版升级，当前正文作为新基线；跨版本差异不作为网页真实变化"
                     ),
                 )
                 status = "noise_only"
@@ -1656,8 +1653,7 @@ class WebMonitorStore:
                         fetched,
                         classification="noise_only",
                         suppression_reason=(
-                            "原始文档字节未变，仅规范化输出发生校准；"
-                            "不作为网页真实变化"
+                            "原始文档字节未变，仅规范化输出发生校准；不作为网页真实变化"
                         ),
                     )
                     status = "noise_only"
@@ -2557,9 +2553,7 @@ class WebMonitorService:
             return await self._wait_for_check_result(monitor_id, reserved_check_id)
         return await asyncio.shield(existing)
 
-    async def _wait_for_check_result(
-        self, monitor_id: str, check_id: str
-    ) -> dict[str, Any]:
+    async def _wait_for_check_result(self, monitor_id: str, check_id: str) -> dict[str, Any]:
         for _ in range(240):
             result = await asyncio.to_thread(self.store.check_result, check_id)
             if result is not None and str(result.get("status")) != "running":
@@ -2605,8 +2599,7 @@ class WebMonitorService:
             monitor = claim.monitor
             current_normalizer = str(monitor.get("current_normalizer_version") or "")
             validators_are_current = (
-                not bool(monitor.get("has_baseline"))
-                or current_normalizer == NORMALIZER_VERSION
+                not bool(monitor.get("has_baseline")) or current_normalizer == NORMALIZER_VERSION
             )
             try:
                 try:
@@ -2615,9 +2608,7 @@ class WebMonitorService:
                         kind=cast("MonitorKind", str(monitor["content_kind"])),
                         etag=str(monitor["etag"] or "") if validators_are_current else "",
                         last_modified=(
-                            str(monitor["last_modified"] or "")
-                            if validators_are_current
-                            else ""
+                            str(monitor["last_modified"] or "") if validators_are_current else ""
                         ),
                     )
                 except MonitorFetchError as error:
@@ -2630,10 +2621,7 @@ class WebMonitorService:
                 ):
                     safe = MonitorFetchError(
                         "unexpected_not_modified",
-                        (
-                            "当前正文基线需要重新建立，"
-                            "不能接受服务器返回的 304 未变化响应"
-                        ),
+                        ("当前正文基线需要重新建立，不能接受服务器返回的 304 未变化响应"),
                         retryable=False,
                     )
                     return await self._finish_claim(self.store.finish_failure, claim, safe)
@@ -2641,6 +2629,22 @@ class WebMonitorService:
             except asyncio.CancelledError:
                 await self._cancel_claim(claim)
                 raise
+            except Exception as error:
+                # A provider/parser bug must not strand a durable check in
+                # ``running``.  Persist only a bounded public message; the
+                # concrete exception type remains available in local logs for
+                # diagnosis without leaking credentials or response bodies to
+                # the UI/notification channel.
+                logger.error(
+                    "Unexpected web monitor failure (%s)",
+                    type(error).__name__,
+                )
+                safe = MonitorFetchError(
+                    "internal_monitor_error",
+                    "网页或 PDF 检查暂时失败",
+                    retryable=True,
+                )
+                return await self._finish_claim(self.store.finish_failure, claim, safe)
 
     async def _finish_claim(self, function: Any, *args: Any) -> dict[str, Any]:
         terminal = asyncio.create_task(asyncio.to_thread(function, *args))

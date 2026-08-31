@@ -390,18 +390,12 @@ async def test_joined_manual_request_id_replays_same_durable_check(tmp_path: Pat
     fetcher = Fetcher()
     service = WebMonitorService(database=database, fetcher=fetcher)
     monitor_id = str(monitor["monitor_id"])
-    primary = service.schedule_check(
-        monitor_id, request_id="manual-primary", manual=True
-    )
+    primary = service.schedule_check(monitor_id, request_id="manual-primary", manual=True)
     await started.wait()
-    joined = service.schedule_check(
-        monitor_id, request_id="manual-joined", manual=True
-    )
+    joined = service.schedule_check(monitor_id, request_id="manual-joined", manual=True)
     release.set()
     first, joined_result = await asyncio.gather(primary, joined)
-    replay = await service.schedule_check(
-        monitor_id, request_id="manual-joined", manual=True
-    )
+    replay = await service.schedule_check(monitor_id, request_id="manual-joined", manual=True)
 
     assert fetcher.calls == 1
     assert first == joined_result == replay
@@ -479,9 +473,7 @@ async def test_service_stop_cancels_owned_check_and_releases_lease(tmp_path: Pat
     assert tuple(check) == ("cancelled", check["finished_at"])
     assert check["finished_at"] != ""
     assert tuple(target) == ("", "", "")
-    replay = await service.schedule_check(
-        monitor_id, request_id="shutdown-check", manual=True
-    )
+    replay = await service.schedule_check(monitor_id, request_id="shutdown-check", manual=True)
     assert replay["status"] == replay["check"]["status"] == "cancelled"
     assert fetcher.calls == 1
     database.close()
@@ -511,6 +503,48 @@ async def test_pause_during_fetch_returns_cancelled_result_instead_of_500(tmp_pa
 
     assert result["status"] == result["check"]["status"] == "cancelled"
     assert result["monitor"]["status"] == "paused"
+    database.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_fetch_failure_is_sanitized_and_durably_retried(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database, store, monitor = _store(tmp_path)
+
+    class Fetcher:
+        async def fetch(self, **_kwargs: object) -> FetchedDocument:
+            raise RuntimeError("secret upstream response body")
+
+    service = WebMonitorService(database=database, fetcher=Fetcher())
+    monitor_id = str(monitor["monitor_id"])
+    result = await service.check_monitor(
+        monitor_id,
+        request_id="unexpected-fetch-failure",
+        manual=True,
+    )
+
+    assert result["status"] == result["check"]["status"] == "retry_wait"
+    assert result["check"]["error_kind"] == "internal_monitor_error"
+    assert "secret upstream" not in result["check"]["error_message"]
+    assert "Unexpected web monitor failure (RuntimeError)" in caplog.text
+    assert "secret upstream" not in caplog.text
+    assert result["monitor"]["status"] == "retry_wait"
+    assert result["monitor"]["lease_token"] == ""
+    replay = await service.check_monitor(
+        monitor_id,
+        request_id="unexpected-fetch-failure",
+        manual=True,
+    )
+    assert replay == result
+    assert (
+        database.conn.execute(
+            "SELECT COUNT(*) FROM web_monitor_checks WHERE status = 'running'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert store.notifications(include_read=True)["items"] == []
     database.close()
 
 
@@ -693,8 +727,7 @@ def test_same_raw_document_never_becomes_a_confirmed_change(tmp_path: Path) -> N
     assert "原始文档字节未变" in current["suppression_reason"]
     assert database.conn.execute("SELECT COUNT(*) FROM news_event_changes").fetchone()[0] == 0
     assert (
-        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0]
-        == 0
+        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0] == 0
     )
     database.close()
 
@@ -735,8 +768,7 @@ def test_normalizer_upgrade_rebaselines_once_without_a_false_change(
     )
     assert database.conn.execute("SELECT COUNT(*) FROM news_event_changes").fetchone()[0] == 0
     assert (
-        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0]
-        == 0
+        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0] == 0
     )
 
     changed = store.claim_check(
@@ -750,8 +782,7 @@ def test_normalizer_upgrade_rebaselines_once_without_a_false_change(
     assert changed_result["status"] == "changed"
     assert database.conn.execute("SELECT COUNT(*) FROM news_event_changes").fetchone()[0] == 1
     assert (
-        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0]
-        == 1
+        database.conn.execute("SELECT COUNT(*) FROM web_monitor_notifications").fetchone()[0] == 1
     )
     assert database.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert database.conn.execute("PRAGMA foreign_key_check").fetchall() == []

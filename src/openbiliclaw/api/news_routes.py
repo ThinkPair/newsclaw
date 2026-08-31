@@ -1093,9 +1093,27 @@ class NewsRuntime:
         adapters, unavailable = self._build_adapters(source_ids=source_ids)
         try:
             probes = await asyncio.gather(*(adapter.probe() for adapter in adapters))
-            for probe in probes:
-                self.task_store.record_probe(probe)
-            results = [asdict(probe) for probe in probes]
+            results: list[dict[str, object]] = []
+            for adapter, probe in zip(adapters, probes, strict=True):
+                self.task_store.record_probe(
+                    probe,
+                    stale=bool(getattr(adapter, "feed_is_stale", False)),
+                    latest_published_at=str(
+                        getattr(adapter, "latest_entry_published_at", "") or ""
+                    ),
+                )
+                result = asdict(probe)
+                health = self.task_store.get_health(adapter.source_id)
+                if health is not None and health.error_code == "stale_feed":
+                    result.update(
+                        {
+                            "status": "stale",
+                            "available": False,
+                            "detail": health.error_message,
+                            "error_code": health.error_code,
+                        }
+                    )
+                results.append(result)
             results.extend(unavailable)
             return {
                 "ok": (
@@ -1312,19 +1330,22 @@ class NewsRuntime:
                 )
             finally:
                 await self._close_adapters(adapters)
-            source_results: list[dict[str, object]] = [
-                {
-                    "source_id": adapter.source_id,
-                    "media": adapter.media,
-                    "provider": adapter.provider,
-                    "status": outcome.status,
-                    "available": outcome.status in {"succeeded", "empty"},
-                    "article_count": len(outcome.articles),
-                    "attempt_count": outcome.attempt_count,
-                    "replayed": outcome.replayed,
-                }
-                for adapter, outcome in zip(adapters, outcomes, strict=True)
-            ]
+            source_results: list[dict[str, object]] = []
+            for adapter, outcome in zip(adapters, outcomes, strict=True):
+                health = self.task_store.get_health(adapter.source_id)
+                stale = health is not None and health.error_code == "stale_feed"
+                source_results.append(
+                    {
+                        "source_id": adapter.source_id,
+                        "media": adapter.media,
+                        "provider": adapter.provider,
+                        "status": "stale" if stale else outcome.status,
+                        "available": outcome.status in {"succeeded", "empty"} and not stale,
+                        "article_count": len(outcome.articles),
+                        "attempt_count": outcome.attempt_count,
+                        "replayed": outcome.replayed,
+                    }
+                )
             source_results.extend(unavailable)
             articles = [article for outcome in outcomes for article in outcome.articles]
             dedupe = SemanticDeduplicator().deduplicate(articles)

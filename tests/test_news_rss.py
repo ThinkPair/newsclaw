@@ -80,6 +80,31 @@ async def test_atom_summary_is_not_claimed_as_full_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rss_exposes_stale_latest_entry_even_when_window_is_empty() -> None:
+    rss = """<?xml version="1.0"?>
+    <rss version="2.0"><channel><title>历史源</title>
+      <item><guid>old-1</guid><title>2016 年的最后一条</title>
+        <pubDate>Mon, 01 Aug 2016 08:00:00 GMT</pubDate>
+      </item>
+    </channel></rss>"""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=rss, headers={"Content-Type": "application/rss+xml"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = RSSAdapter(
+            url="https://example.com/old.xml",
+            media="历史源",
+            http_client=client,
+        )
+        articles = await adapter.fetch(_window())
+
+    assert articles == []
+    assert adapter.latest_entry_published_at == "2016-08-01T08:00:00Z"
+    assert adapter.feed_is_stale is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "expected"),
     [(403, SourcePermissionDenied), (429, SourceRateLimited)],

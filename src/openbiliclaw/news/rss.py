@@ -155,6 +155,8 @@ class RSSAdapter:
         self._source_id = source_id.strip() or f"rss:{suffix}"
         self._timeout_seconds = max(1.0, min(float(timeout_seconds), 120.0))
         self._owns_http = http_client is None
+        self._latest_entry_published_at = ""
+        self._feed_is_stale = False
         self._http = http_client or httpx.AsyncClient(
             trust_env=False,
             follow_redirects=True,
@@ -173,6 +175,18 @@ class RSSAdapter:
     def provider(self) -> str:
         return "RSS/Atom"
 
+    @property
+    def latest_entry_published_at(self) -> str:
+        """Newest dated entry observed in the feed, even outside the fetch window."""
+
+        return self._latest_entry_published_at
+
+    @property
+    def feed_is_stale(self) -> bool:
+        """Whether the feed's newest dated entry is stale by the shared news policy."""
+
+        return self._feed_is_stale
+
     async def aclose(self) -> None:
         """Close only the internally owned HTTP client."""
 
@@ -186,6 +200,9 @@ class RSSAdapter:
         rows = _feed_entries(response.text)
         retrieved_at = datetime.now(UTC)
         articles: list[Article] = []
+        latest_dated_article: Article | None = None
+        self._latest_entry_published_at = ""
+        self._feed_is_stale = False
         for row in rows:
             title = str(row.get("title") or "").strip()
             if not title:
@@ -201,6 +218,11 @@ class RSSAdapter:
                 content_scope=cast("ContentScope", row.get("content_scope") or "title_only"),
                 source_identifier=row.get("guid") or row.get("url") or title,
             )
+            if article.published_at and (
+                latest_dated_article is None
+                or article.published_at > latest_dated_article.published_at
+            ):
+                latest_dated_article = article
             if article.published_at:
                 published = datetime.fromisoformat(article.published_at.replace("Z", "+00:00"))
                 if published < window.start_at.astimezone(
@@ -208,6 +230,12 @@ class RSSAdapter:
                 ) or published > window.end_at.astimezone(UTC):
                     continue
             articles.append(article)
+        if latest_dated_article is not None:
+            self._latest_entry_published_at = latest_dated_article.published_at
+            # Reuse Article's calibrated 30-day policy instead of inventing a
+            # second RSS-only threshold.  A reachable feed whose newest item
+            # is already stale is not a healthy source of current news.
+            self._feed_is_stale = latest_dated_article.freshness == "stale"
         articles.sort(key=lambda article: article.published_at, reverse=True)
         return articles[: window.limit]
 

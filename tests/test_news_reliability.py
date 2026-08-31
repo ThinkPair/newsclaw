@@ -51,6 +51,11 @@ class SlowAdapter(SequenceAdapter):
         return []
 
 
+class StaleFeedAdapter(SequenceAdapter):
+    feed_is_stale = True
+    latest_entry_published_at = "2016-08-01T08:00:00Z"
+
+
 def _window() -> FetchWindow:
     return FetchWindow(
         datetime(2026, 8, 17, 0, 0, tzinfo=UTC),
@@ -128,6 +133,26 @@ async def test_retry_after_is_capped_by_policy_max_backoff(tmp_path) -> None:
 
     assert result.status == "empty"
     assert sleeps == [2]
+
+
+@pytest.mark.asyncio
+async def test_reachable_but_stale_feed_is_degraded_not_healthy(tmp_path) -> None:
+    adapter = StaleFeedAdapter([[]])
+    store = SourceTaskStore(tmp_path / "stale-feed.db")
+    result = await SourceRunner(store).run(
+        adapter,
+        _window(),
+        request_id="stale-feed-refresh",
+    )
+
+    assert result.status == "empty"
+    health = store.get_health(adapter.source_id)
+    assert health is not None
+    assert health.status == "degraded"
+    assert health.available is True
+    assert health.error_code == "stale_feed"
+    assert "2016-08-01" in health.error_message
+    assert health.last_success_at == ""
 
 
 @pytest.mark.asyncio

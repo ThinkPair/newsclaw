@@ -3598,6 +3598,7 @@ def test_tracking_completion_and_event_projection_share_one_transaction(
         database.complete_tracked_observation_check(
             check_id=check["check_id"],
             tracking_id=tracker["tracking_id"],
+            claim_token=check["claim_token"],
             completed_at="2026-08-28T08:10:00+00:00",
             outcome="changed",
             matched_count=1,
@@ -3657,6 +3658,7 @@ def test_tracking_completion_projects_verified_change_with_origin_lineage(
     completed, updated_tracker = database.complete_tracked_observation_check(
         check_id=check["check_id"],
         tracking_id=tracker["tracking_id"],
+        claim_token=check["claim_token"],
         completed_at="2026-08-28T08:10:00+00:00",
         outcome="changed",
         matched_count=1,

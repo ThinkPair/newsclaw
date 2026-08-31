@@ -730,6 +730,7 @@ class NewsTrackingService:
                 check, item = self.database.complete_tracked_observation_check(
                     check_id=str(begun["check_id"]),
                     tracking_id=str(tracker["tracking_id"]),
+                    claim_token=str(begun["claim_token"]),
                     completed_at=_iso(current),
                     outcome="valid_empty",
                     matched_count=0,
@@ -744,6 +745,7 @@ class NewsTrackingService:
             check, item = self.database.complete_tracked_observation_check(
                 check_id=str(begun["check_id"]),
                 tracking_id=str(tracker["tracking_id"]),
+                claim_token=str(begun["claim_token"]),
                 completed_at=_iso(current),
                 outcome=outcome,
                 matched_count=len(related),
@@ -756,6 +758,7 @@ class NewsTrackingService:
             check, item = self.database.fail_tracked_observation_check(
                 check_id=str(begun["check_id"]),
                 tracking_id=str(tracker["tracking_id"]),
+                claim_token=str(begun["claim_token"]),
                 completed_at=_iso(current),
                 error=safe_error_message(error) or type(error).__name__,
             )
@@ -812,6 +815,7 @@ class NewsTrackingService:
                 check, item = self.database.complete_tracked_observation_check(
                     check_id=str(begun["check_id"]),
                     tracking_id=str(tracker["tracking_id"]),
+                    claim_token=str(begun["claim_token"]),
                     completed_at=_iso(current),
                     outcome="valid_empty",
                     matched_count=0,
@@ -827,6 +831,7 @@ class NewsTrackingService:
             check, item = self.database.complete_tracked_observation_check(
                 check_id=str(begun["check_id"]),
                 tracking_id=str(tracker["tracking_id"]),
+                claim_token=str(begun["claim_token"]),
                 completed_at=_iso(current),
                 outcome="changed" if changes else "unchanged",
                 matched_count=len(related),
@@ -839,6 +844,7 @@ class NewsTrackingService:
             check, item = self.database.fail_tracked_observation_check(
                 check_id=str(begun["check_id"]),
                 tracking_id=str(tracker["tracking_id"]),
+                claim_token=str(begun["claim_token"]),
                 completed_at=_iso(current),
                 error=safe_error_message(error) or type(error).__name__,
             )

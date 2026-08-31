@@ -3136,6 +3136,14 @@ def create_app(
                                 lane_target * 2,
                                 lane_target + 120,
                             )
+                            # NewsClaw is a single ``news`` inventory lane. Do
+                            # not inherit OpenBiliClaw's Bilibili/XHS share
+                            # targets: they make every NewsClaw retry look like
+                            # an over-share source and activate irrelevant
+                            # preferred-platform ordering.
+                            candidate_pipeline.source_share_targets = lambda target=lane_target: {
+                                "news": target
+                            }
                             candidate_pipeline.post_admission_maintenance = (
                                 _newsclaw_post_admission_maintenance
                             )
@@ -10032,6 +10040,18 @@ def create_app(
         get_update_status = getattr(ctx.auto_update_service, "get_runtime_status", None)
         if callable(get_update_status):
             payload.update(get_update_status())
+        if newsclaw_mode:
+            news_runtime = getattr(app.state, "newsclaw_runtime", None)
+            get_news_state = getattr(news_runtime, "runtime_state", None)
+            if callable(get_news_state):
+                news_state = await asyncio.to_thread(get_news_state)
+                if isinstance(news_state, Mapping):
+                    news_last_refresh = str(news_state.get("last_refresh", "") or "").strip()
+                    if news_last_refresh:
+                        # ``last_refresh_at`` is user-facing source freshness in
+                        # NewsClaw, not the inherited Bilibili pool controller's
+                        # historical refill timestamp.
+                        payload["last_refresh_at"] = news_last_refresh
         payload.update(feedback_batch_scheduler.status_payload())
         payload.update(chat_reply_scheduler.status_payload())
         payload.update(image_fetch_coordinator.status_payload())
@@ -10574,6 +10594,7 @@ def create_app(
         pending_count = 0
         processing_active = False
         scoped_count_succeeded = False
+        scoped_stage_counts: Mapping[str, Any] = {}
         scoped_runtime_status: Mapping[str, Any] = {}
         get_runtime_status = getattr(ctx.runtime_controller, "get_runtime_status", None)
         if callable(get_runtime_status):
@@ -10596,10 +10617,25 @@ def create_app(
                         )
                     ),
                 )
-                processing_active = pending_count > 0
                 scoped_count_succeeded = True
             except Exception:
                 logger.debug("Failed to count NewsClaw's scoped delight pipeline", exc_info=True)
+        get_stage_counts = getattr(ctx.database, "get_delight_processing_stage_counts", None)
+        if callable(get_stage_counts):
+            try:
+                raw_stage_counts = await asyncio.to_thread(
+                    get_stage_counts,
+                    published_after=published_after,
+                    published_before=published_before,
+                    source_platform="news",
+                    min_delight_score_for_reason=threshold,
+                )
+                if isinstance(raw_stage_counts, Mapping):
+                    scoped_stage_counts = raw_stage_counts
+                    pending_count = max(0, int(scoped_stage_counts.get("total", 0) or 0))
+                    scoped_count_succeeded = True
+            except Exception:
+                logger.debug("Failed to inspect NewsClaw's scoped delight stages", exc_info=True)
         if not scoped_count_succeeded:
             # Compatibility fallback for adapters that do not expose the
             # source/date-scoped counter. Include every live stage so a
@@ -10614,7 +10650,83 @@ def create_app(
                 )
             ]
             pending_count = max(processing_counts, default=0)
-            processing_active = any(processing_counts)
+        pending_ready = max(
+            0,
+            int(
+                scoped_stage_counts.get(
+                    "pending_ready",
+                    scoped_runtime_status.get("candidate_eval_pending_ready", 0),
+                )
+                or 0
+            ),
+        )
+        evaluating = max(
+            0,
+            int(
+                scoped_stage_counts.get(
+                    "evaluating",
+                    scoped_runtime_status.get("candidate_eval_evaluating", 0),
+                )
+                or 0
+            ),
+        )
+        evaluated = max(
+            0,
+            int(
+                scoped_stage_counts.get(
+                    "evaluated",
+                    scoped_runtime_status.get("candidate_eval_evaluated", 0),
+                )
+                or 0
+            ),
+        )
+        budget_remaining = max(
+            0,
+            int(scoped_runtime_status.get("candidate_eval_budget_remaining", 0) or 0),
+        )
+        in_flight = max(
+            0,
+            int(
+                scoped_stage_counts.get(
+                    "in_flight",
+                    scoped_runtime_status.get("candidate_eval_in_flight", 0),
+                )
+                or 0
+            ),
+        )
+        expression_pending = max(
+            0,
+            int(
+                scoped_stage_counts.get(
+                    "expression_pending",
+                    scoped_runtime_status.get("expression_pending_count", 0),
+                )
+                or 0
+            ),
+        )
+        has_stage_diagnostics = bool(scoped_stage_counts) or any(
+            field in scoped_runtime_status
+            for field in (
+                "candidate_eval_pending_ready",
+                "candidate_eval_evaluating",
+                "candidate_eval_in_flight",
+                "expression_pending_count",
+            )
+        )
+        if has_stage_diagnostics:
+            # A pool deficit does not bypass the daily evaluation budget.  The
+            # former OR condition kept NewsClaw in ``processing`` forever at
+            # 299/300 with budget 0 even though no pending candidate could run.
+            pending_can_advance = pending_ready > 0 and budget_remaining > 0
+            processing_active = any(
+                (pending_can_advance, evaluating, in_flight, expression_pending)
+            )
+        else:
+            # Compatibility adapters only expose the aggregate scoped count.
+            # Keep their historical behaviour; production exposes the stage
+            # diagnostics above and therefore never treats a dormant evaluated
+            # backlog as active processing.
+            processing_active = pending_count > 0
         refresh_running = False
         last_refresh_at = ""
         news_runtime = getattr(app.state, "newsclaw_runtime", None)
@@ -10625,8 +10737,25 @@ def create_app(
                 if isinstance(news_state, Mapping):
                     refresh_running = bool(news_state.get("refresh_running", False))
                     last_refresh_at = str(news_state.get("last_refresh", "") or "")
+        queued_count = max(0, evaluated)
+        blocked_reason = ""
+        if (
+            not refresh_running
+            and not processing_active
+            and pending_ready > 0
+            and budget_remaining <= 0
+        ):
+            blocked_reason = "daily_evaluation_budget_exhausted"
+        elif not refresh_running and not processing_active and queued_count > 0:
+            blocked_reason = "admission_waiting"
         queue_state = (
-            "processing" if refresh_running or processing_active else "ready" if items else "empty"
+            "processing"
+            if refresh_running or processing_active
+            else "degraded"
+            if blocked_reason
+            else "ready"
+            if items
+            else "empty"
         )
         return {
             "items": items,
@@ -10634,22 +10763,12 @@ def create_app(
             "date": today_date,
             "state": queue_state,
             "pending_count": pending_count,
-            "pending_ready": max(
-                0,
-                int(scoped_runtime_status.get("candidate_eval_pending_ready", 0) or 0),
-            ),
-            "evaluating": max(
-                0,
-                int(scoped_runtime_status.get("candidate_eval_evaluating", 0) or 0),
-            ),
-            "evaluated": max(
-                0,
-                int(scoped_runtime_status.get("candidate_eval_evaluated", 0) or 0),
-            ),
-            "budget_remaining": max(
-                0,
-                int(scoped_runtime_status.get("candidate_eval_budget_remaining", 0) or 0),
-            ),
+            "queued_count": queued_count,
+            "blocked_reason": blocked_reason,
+            "pending_ready": pending_ready,
+            "evaluating": evaluating,
+            "evaluated": evaluated,
+            "budget_remaining": budget_remaining,
             "last_refresh_at": last_refresh_at,
         }
 
@@ -10991,7 +11110,11 @@ def create_app(
             raise HTTPException(status_code=422, detail="request_id is required.")
         load_content = getattr(ctx.database, "get_content", None)
         row = load_content(identifier) if callable(load_content) else None
-        if require_request_id and row is None:
+        if row is None:
+            raise HTTPException(status_code=404, detail="Notification article was not found.")
+        storage_bvid = str(row.get("bvid") or "").strip()
+        article_id = str(row.get("content_id") or storage_bvid).strip()
+        if not storage_bvid:
             raise HTTPException(status_code=404, detail="Notification article was not found.")
 
         duplicate = False
@@ -11005,7 +11128,7 @@ def create_app(
                     ledger.claim(
                         "notification-ack",
                         payload.request_id,
-                        {"article_id": identifier},
+                        {"article_id": article_id, "bvid": storage_bvid},
                     )
                 )
             except IdempotencyConflict as error:
@@ -11015,13 +11138,15 @@ def create_app(
                 ) from error
         mark_sent = getattr(ctx.runtime_controller, "mark_notification_sent", None)
         if callable(mark_sent):
-            mark_sent(identifier)
+            marked = mark_sent(storage_bvid)
         else:
-            ctx.database.mark_notification_sent(identifier)
+            marked = ctx.database.mark_notification_sent(storage_bvid)
+        if marked is not True:
+            raise HTTPException(status_code=404, detail="Notification article was not found.")
         return NotificationAckResponse(
             ok=True,
-            bvid=identifier,
-            article_id=identifier if newsclaw_mode else "",
+            bvid=storage_bvid,
+            article_id=article_id if newsclaw_mode else "",
             request_id=payload.request_id,
             duplicate=duplicate,
         )

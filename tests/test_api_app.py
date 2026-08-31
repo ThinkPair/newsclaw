@@ -6578,6 +6578,39 @@ class TestBackendAPI:
         assert payload["last_account_sync_message"] == "B 站登录已失效，请重新登录。"
         assert payload["last_account_sync_severity"] == "warning"
 
+    def test_newsclaw_runtime_status_uses_news_source_refresh_time(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setenv("NEWSCLAW_MODE", "1")
+
+        class FakeRuntimeController:
+            @staticmethod
+            def get_runtime_status() -> dict[str, object]:
+                return {
+                    "initialized": True,
+                    "recommendation_count": 5,
+                    "pending_signal_events": 0,
+                    "unread_count": 0,
+                    "last_refresh_at": "2026-08-17T00:00:00Z",
+                }
+
+        app = create_app(
+            memory_manager=object(),
+            database=object(),
+            soul_engine=object(),
+            runtime_controller=FakeRuntimeController(),
+        )
+        app.state.newsclaw_runtime = SimpleNamespace(
+            runtime_state=lambda: {"last_refresh": "2026-08-31T10:30:00Z"}
+        )
+
+        payload = TestClient(app).get("/api/runtime-status").json()
+
+        assert payload["last_refresh_at"] == "2026-08-31T10:30:00Z"
+
     def test_runtime_status_endpoint_includes_backend_update_summary(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -8077,17 +8110,25 @@ class TestBackendAPI:
     def test_notification_sent_endpoint_marks_delivery(self) -> None:
         from fastapi.testclient import TestClient
 
+        class FakeDatabase:
+            @staticmethod
+            def get_content(content_id: str) -> dict[str, str] | None:
+                if content_id == "BV1ACK":
+                    return {"bvid": content_id, "content_id": content_id}
+                return None
+
         class FakeRuntimeController:
             def __init__(self) -> None:
                 self.marked: list[str] = []
 
-            def mark_notification_sent(self, bvid: str) -> None:
+            def mark_notification_sent(self, bvid: str) -> bool:
                 self.marked.append(bvid)
+                return True
 
         runtime = FakeRuntimeController()
         app = create_app(
             memory_manager=object(),
-            database=object(),
+            database=FakeDatabase(),
             soul_engine=object(),
             runtime_controller=runtime,
         )
@@ -8097,6 +8138,10 @@ class TestBackendAPI:
 
         assert response.status_code == 200
         assert response.json() == {"ok": True, "bvid": "BV1ACK"}
+        assert runtime.marked == ["BV1ACK"]
+
+        missing = client.post("/api/notifications/sent", json={"bvid": "BV1MISSING"})
+        assert missing.status_code == 404
         assert runtime.marked == ["BV1ACK"]
 
     def test_feedback_endpoint_updates_recommendation_and_records_event(self) -> None:
@@ -12710,6 +12755,7 @@ class TestBackendAPI:
         assert candidate_pipeline.capacity_budget_key == "newsclaw_today"
         assert candidate_pipeline.capacity_daily_budget == 300
         assert candidate_pipeline.capacity_raw_ceiling == 600
+        assert candidate_pipeline.source_share_targets() == {"news": 300}
         assert callable(candidate_pipeline.post_admission_maintenance)
 
     def test_normal_mode_clears_newsclaw_candidate_lane_bindings(

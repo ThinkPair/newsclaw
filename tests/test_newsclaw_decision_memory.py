@@ -376,6 +376,7 @@ def test_tracking_api_enforces_news_gate_and_keeps_stopped_rows_queryable(
     db.complete_tracked_observation_check(
         check_id=check["check_id"],
         tracking_id=tracking_id,
+        claim_token=check["claim_token"],
         completed_at="2026-08-28T08:01:00+00:00",
         outcome="changed",
         matched_count=1,
@@ -498,6 +499,7 @@ def test_tracking_api_manual_check_returns_durable_receipt(tmp_path: Path) -> No
             completed, _item = db.complete_tracked_observation_check(
                 check_id=check["check_id"],
                 tracking_id=tracking_id,
+                claim_token=check["claim_token"],
                 completed_at="2026-08-28T08:01:00+00:00",
                 outcome="valid_empty",
                 matched_count=0,

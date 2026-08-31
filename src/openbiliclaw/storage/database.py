@@ -4436,6 +4436,159 @@ class Database:
             raise RuntimeError("personal memory idempotency receipt is corrupt")
         return {**decoded, "replayed": True}
 
+    @classmethod
+    def _personal_memory_snapshot_at_version_on(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        target_type: str,
+        target_id: str,
+        version: int,
+    ) -> dict[str, Any] | None:
+        """Recover the exact response snapshot for an idempotent replay.
+
+        Receipts deliberately exclude private memory content.  The versioned
+        revision ledger is therefore the authoritative source for replaying an
+        earlier mutation after the live object has changed again.  A no-op
+        mutation may not have its own revision, so the next revision's before
+        image is the equivalent snapshot.
+        """
+
+        row = conn.execute(
+            """
+            SELECT after_json AS snapshot_json
+            FROM personal_memory_revisions
+            WHERE target_type = ? AND target_id = ? AND version = ?
+            ORDER BY revision_id DESC
+            LIMIT 1
+            """,
+            (target_type, target_id, int(version)),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                """
+                SELECT before_json AS snapshot_json
+                FROM personal_memory_revisions
+                WHERE target_type = ? AND target_id = ? AND version > ?
+                ORDER BY version ASC, revision_id ASC
+                LIMIT 1
+                """,
+                (target_type, target_id, int(version)),
+            ).fetchone()
+        if row is None:
+            return None
+        decoded = cls._personal_memory_decode_json(row["snapshot_json"], fallback={})
+        if not isinstance(decoded, dict) or not decoded:
+            raise RuntimeError("personal memory replay history is corrupt")
+        return dict(decoded)
+
+    @classmethod
+    def _personal_memory_item_replay_on(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        memory_id: str,
+        receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            result_version = int(receipt.get("result_version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("personal memory idempotency receipt is corrupt") from exc
+        if result_version < 1:
+            raise RuntimeError("personal memory idempotency receipt is corrupt")
+        snapshot = cls._personal_memory_snapshot_at_version_on(
+            conn,
+            target_type="memory",
+            target_id=memory_id,
+            version=result_version,
+        )
+        if snapshot is None:
+            row = conn.execute(
+                "SELECT * FROM personal_memory_items WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None or int(row["version"]) != result_version:
+                raise RuntimeError("personal memory replay history is missing")
+            snapshot = cls._personal_memory_item_dict(row)
+        if (
+            str(snapshot.get("memory_id") or "") != memory_id
+            or int(snapshot.get("version") or 0) != result_version
+        ):
+            raise RuntimeError("personal memory replay history is corrupt")
+        return snapshot
+
+    @classmethod
+    def _personal_memory_candidate_replay_on(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        candidate_id: str,
+        receipt: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        try:
+            result_version = int(receipt.get("result_version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("personal memory idempotency receipt is corrupt") from exc
+        if result_version < 1:
+            raise RuntimeError("personal memory idempotency receipt is corrupt")
+        snapshot = cls._personal_memory_snapshot_at_version_on(
+            conn,
+            target_type="candidate",
+            target_id=candidate_id,
+            version=result_version,
+        )
+        if snapshot is None:
+            row = conn.execute(
+                "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None or int(row["version"]) != result_version:
+                raise RuntimeError("personal memory replay history is missing")
+            candidate = cls._personal_memory_candidate_dict(row)
+            if str(candidate.get("resolution_memory_id") or ""):
+                raise RuntimeError("personal memory replay history is missing")
+            return candidate, None
+
+        candidate_snapshot = snapshot.get("candidate", snapshot)
+        if not isinstance(candidate_snapshot, dict):
+            raise RuntimeError("personal memory replay history is corrupt")
+        candidate = dict(candidate_snapshot)
+        if (
+            str(candidate.get("candidate_id") or "") != candidate_id
+            or int(candidate.get("version") or 0) != result_version
+        ):
+            raise RuntimeError("personal memory replay history is corrupt")
+        resolution_id = str(candidate.get("resolution_memory_id") or "")
+        memory_snapshot = snapshot.get("memory")
+        if not resolution_id:
+            return candidate, None
+        resolution_version_raw = receipt.get("resolution_memory_version")
+        if resolution_version_raw is not None:
+            try:
+                resolution_version = int(resolution_version_raw or 0)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("personal memory idempotency receipt is corrupt") from exc
+            if resolution_version < 1:
+                raise RuntimeError("personal memory idempotency receipt is corrupt")
+            item = cls._personal_memory_item_replay_on(
+                conn,
+                memory_id=resolution_id,
+                receipt={"result_version": resolution_version},
+            )
+        elif bool(receipt.get("changed")) and isinstance(memory_snapshot, dict):
+            # Backward compatibility for receipts written before the linked
+            # memory version was recorded: a changing accept revision embeds
+            # the exact linked item snapshot.
+            item = dict(memory_snapshot)
+        else:
+            # A no-op accept can observe a linked memory version that differs
+            # from the original candidate resolution revision.  Without its
+            # version the exact first response cannot be reconstructed safely.
+            raise RuntimeError("personal memory replay history is missing")
+        if str(item.get("memory_id") or "") != resolution_id:
+            raise RuntimeError("personal memory replay history is corrupt")
+        return candidate, item
+
     @staticmethod
     def _record_personal_memory_request_on(
         conn: sqlite3.Connection,
@@ -4564,15 +4717,15 @@ class Database:
                 request_fingerprint=request_fingerprint,
             )
             if replay is not None:
-                replay_row = conn.execute(
-                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
-                    (str(replay.get("target_id") or ""),),
-                ).fetchone()
-                if replay_row is None:
-                    raise RuntimeError("personal memory idempotency target is missing")
+                replay_target_id = str(replay.get("target_id") or "")
+                replay_item = self._personal_memory_item_replay_on(
+                    conn,
+                    memory_id=replay_target_id,
+                    receipt=replay,
+                )
                 conn.rollback()
                 return {
-                    "item": self._personal_memory_item_dict(replay_row),
+                    "item": replay_item,
                     "created": bool(replay.get("created")),
                     "replayed": True,
                 }
@@ -4764,15 +4917,14 @@ class Database:
                 request_fingerprint=request_fingerprint,
             )
             if replay is not None:
-                replay_row = conn.execute(
-                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
-                    (normalized_id,),
-                ).fetchone()
-                if replay_row is None:
-                    raise RuntimeError("personal memory idempotency target is missing")
+                replay_item = self._personal_memory_item_replay_on(
+                    conn,
+                    memory_id=normalized_id,
+                    receipt=replay,
+                )
                 conn.rollback()
                 return {
-                    "item": self._personal_memory_item_dict(replay_row),
+                    "item": replay_item,
                     "updated": bool(replay.get("updated")),
                     "replayed": True,
                 }
@@ -4907,15 +5059,14 @@ class Database:
                 request_fingerprint=request_fingerprint,
             )
             if replay is not None:
-                replay_row = conn.execute(
-                    "SELECT * FROM personal_memory_items WHERE memory_id = ?",
-                    (normalized_id,),
-                ).fetchone()
-                if replay_row is None:
-                    raise RuntimeError("personal memory idempotency target is missing")
+                replay_item = self._personal_memory_item_replay_on(
+                    conn,
+                    memory_id=normalized_id,
+                    receipt=replay,
+                )
                 conn.rollback()
                 return {
-                    "item": self._personal_memory_item_dict(replay_row),
+                    "item": replay_item,
                     "changed": bool(replay.get("changed")),
                     "replayed": True,
                 }
@@ -5269,24 +5420,14 @@ class Database:
                 request_fingerprint=request_fingerprint,
             )
             if replay is not None:
-                replay_candidate = conn.execute(
-                    "SELECT * FROM personal_memory_candidates WHERE candidate_id = ?",
-                    (normalized_id,),
-                ).fetchone()
-                if replay_candidate is None:
-                    raise RuntimeError("personal memory candidate idempotency target is missing")
-                linked_item = None
-                resolution_id = str(replay_candidate["resolution_memory_id"] or "")
-                if resolution_id:
-                    linked_row = conn.execute(
-                        "SELECT * FROM personal_memory_items WHERE memory_id = ?",
-                        (resolution_id,),
-                    ).fetchone()
-                    if linked_row is not None:
-                        linked_item = self._personal_memory_item_dict(linked_row)
+                replay_candidate, linked_item = self._personal_memory_candidate_replay_on(
+                    conn,
+                    candidate_id=normalized_id,
+                    receipt=replay,
+                )
                 conn.rollback()
                 return {
-                    "candidate": self._personal_memory_candidate_dict(replay_candidate),
+                    "candidate": replay_candidate,
                     "item": linked_item,
                     "decision": normalized_decision,
                     "changed": bool(replay.get("changed")),
@@ -5551,6 +5692,9 @@ class Database:
                     "result_status": str(response["candidate"]["status"]),
                     "resolution_memory_id": str(
                         response["candidate"].get("resolution_memory_id") or ""
+                    ),
+                    "resolution_memory_version": int(
+                        response["item"]["version"] if response["item"] is not None else 0
                     ),
                     "decision": normalized_decision,
                     "changed": bool(response["changed"]),
@@ -8400,7 +8544,12 @@ class Database:
               {scope_sql}
             ORDER BY {order_prefix}evaluated_at ASC, last_seen_at ASC, id ASC
             """,
-            (*params, *scope_params),
+            # SQL placeholders from ``scope_sql`` occur in WHERE before the
+            # preferred-platform CASE placeholders in ORDER BY.  Keep the
+            # bound values in that same order; reversing them makes a scoped
+            # NewsClaw retry silently return no evaluated rows whenever source
+            # share preferences are also active.
+            (*scope_params, *params),
         )
         temporal_now = datetime.now(UTC)
         eligible: list[dict[str, Any]] = []
@@ -10411,6 +10560,19 @@ class Database:
                 ).fetchall()
                 if str(row["bvid"] or "").strip()
             }
+            # Raw-material trimming runs after the visible pool has converged.
+            # Protect that canonical visible set so the raw planner cannot
+            # remove one of its members and turn an exact target into a hidden
+            # deficit (the former path rolled the transaction back at 297/300).
+            protected_ids.update(
+                str(row.get("bvid") or "").strip()
+                for row in self._load_available_pool_candidate_rows_on(
+                    conn,
+                    _viewed_content_keys=viewed,
+                    full_rows=True,
+                )
+                if str(row.get("bvid") or "").strip()
+            )
             raw_plan = self._plan_raw_trim_on(
                 conn,
                 protected_ids=protected_ids,
@@ -13886,9 +14048,9 @@ class Database:
             None,
         )
 
-    def mark_notification_sent(self, bvid: str) -> None:
-        """Mark one cached item as already notified."""
-        self._execute_write(
+    def mark_notification_sent(self, bvid: str) -> bool:
+        """Mark one cached item as notified and report whether it still exists."""
+        cursor = self._execute_write(
             """
             UPDATE content_cache
             SET notification_sent = 1,
@@ -13897,6 +14059,7 @@ class Database:
             """,
             (bvid,),
         )
+        return int(cursor.rowcount or 0) == 1
 
     def update_recommendation_content(
         self,
@@ -19208,6 +19371,7 @@ class Database:
                 error             TEXT NOT NULL DEFAULT '',
                 is_read           INTEGER NOT NULL DEFAULT 1,
                 attempt_count     INTEGER NOT NULL DEFAULT 1,
+                claim_token       TEXT NOT NULL DEFAULT '',
                 lease_expires_at  TEXT NOT NULL DEFAULT '',
                 started_at        TEXT NOT NULL DEFAULT '',
                 completed_at      TEXT NOT NULL DEFAULT '',
@@ -19274,6 +19438,25 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tracked_candidates_check
                 ON tracked_observation_candidates(check_id, candidate_record_id);
         """)
+        tracked_check_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(tracked_observation_checks)")
+        }
+        if "claim_token" not in tracked_check_columns:
+            self.conn.execute(
+                "ALTER TABLE tracked_observation_checks "
+                "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+            )
+        # A process restart cannot retain an in-memory owner. Give any legacy
+        # running receipt a token so a completion without the current lease
+        # generation fails closed after this migration.
+        self.conn.execute(
+            """
+            UPDATE tracked_observation_checks
+            SET claim_token = lower(hex(randomblob(16)))
+            WHERE status = 'running' AND claim_token = ''
+            """
+        )
         # Only verified changes are unread.  Repair databases created by an
         # earlier tracking build that exposed terminal failures as updates.
         self.conn.execute(
@@ -20498,7 +20681,8 @@ class Database:
                     SET source_request_id = ?, source_status = ?,
                         lease_expires_at = ?, started_at = ?, completed_at = '',
                         candidate_count = ?, error = '', summary = '',
-                        attempt_count = attempt_count + 1
+                        attempt_count = attempt_count + 1,
+                        claim_token = ?
                     WHERE check_id = ?
                     """,
                     (
@@ -20507,6 +20691,7 @@ class Database:
                         str(lease_expires_at or "").strip(),
                         str(started_at or "").strip(),
                         max(0, int(candidate_count)),
+                        secrets.token_hex(16),
                         str(existing["check_id"]),
                     ),
                 )
@@ -20542,12 +20727,14 @@ class Database:
                     conn.commit()
                     return self._tracked_check_dict(in_flight), False
                 check_id = str(uuid4())
+                claim_token = secrets.token_hex(16)
                 conn.execute(
                     """
                     INSERT INTO tracked_observation_checks (
                         check_id, request_id, tracking_id, source_request_id,
-                        source_status, candidate_count, lease_expires_at, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_status, candidate_count, claim_token,
+                        lease_expires_at, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         check_id,
@@ -20556,6 +20743,7 @@ class Database:
                         str(source_request_id or "").strip(),
                         str(source_status or "").strip(),
                         max(0, int(candidate_count)),
+                        claim_token,
                         str(lease_expires_at or "").strip(),
                         str(started_at or "").strip(),
                     ),
@@ -20631,6 +20819,7 @@ class Database:
         *,
         check_id: str,
         tracking_id: str,
+        claim_token: str,
         completed_at: str,
         outcome: str,
         matched_count: int,
@@ -20645,6 +20834,9 @@ class Database:
             raise ValueError("unsupported tracking check outcome")
         if normalized_outcome != "changed" and changes:
             raise ValueError("only a changed check may append change evidence")
+        normalized_claim_token = str(claim_token or "").strip()
+        if not normalized_claim_token:
+            raise ValueError("tracking check claim_token is required")
         conn = self.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -20654,6 +20846,8 @@ class Database:
             ).fetchone()
             if check is None:
                 raise KeyError(str(check_id or ""))
+            if str(check["claim_token"] or "") != normalized_claim_token:
+                raise ValueError("tracking check lease was superseded")
             tracker = conn.execute(
                 "SELECT * FROM tracked_observations WHERE tracking_id = ?",
                 (str(tracking_id or "").strip(),),
@@ -20960,12 +21154,16 @@ class Database:
         *,
         check_id: str,
         tracking_id: str,
+        claim_token: str,
         completed_at: str,
         error: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Record a bounded retry without advancing the evidence cursor."""
 
         safe_error = " ".join(str(error or "").split()).strip()[:1_000]
+        normalized_claim_token = str(claim_token or "").strip()
+        if not normalized_claim_token:
+            raise ValueError("tracking check claim_token is required")
         conn = self.open_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -20979,6 +21177,8 @@ class Database:
             ).fetchone()
             if check is None or tracker is None:
                 raise KeyError(str(check_id or tracking_id or ""))
+            if str(check["claim_token"] or "") != normalized_claim_token:
+                raise ValueError("tracking check lease was superseded")
             if str(check["status"] or "") != "running":
                 conn.commit()
                 item = self.get_tracked_observation(str(tracking_id))
@@ -29913,6 +30113,72 @@ class Database:
                 min_delight_score_for_reason=min_delight_score_for_reason,
             )
         )
+
+    def get_delight_processing_stage_counts(
+        self,
+        *,
+        published_after: str,
+        published_before: str,
+        source_platform: str = "news",
+        min_delight_score_for_reason: float = _DELIGHT_CLAIM_MIN_SCORE,
+    ) -> dict[str, int]:
+        """Return source/date-scoped counts for each live delight stage."""
+
+        self._ensure_fresh_read()
+        platform = str(source_platform or "").strip().lower()
+        if not platform or not published_after or not published_before:
+            return {
+                "pending_ready": 0,
+                "evaluating": 0,
+                "evaluated": 0,
+                "in_flight": 0,
+                "expression_pending": 0,
+                "total": 0,
+            }
+        discovery_rows = self._load_temporally_eligible_admission_waiting_rows_on(
+            self.conn,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        copy_rows = self._load_admitted_pending_copy_rows_on(
+            self.conn,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+            limit=None,
+        )
+        scoring_rows = self.get_pool_candidates_needing_delight_score(
+            limit=None,
+            min_delight_score_for_reason=min_delight_score_for_reason,
+            source_platform=platform,
+            published_after=published_after,
+            published_before=published_before,
+        )
+        discovery_keys = {
+            str(row.get("candidate_key") or "").strip()
+            for row in discovery_rows
+            if str(row.get("candidate_key") or "").strip()
+        }
+        expression_keys = {
+            str(row.get("item_key") or "").strip()
+            for row in (*copy_rows, *scoring_rows)
+            if str(row.get("item_key") or "").strip()
+        }
+        return {
+            "pending_ready": sum(
+                str(row.get("status") or "") == "pending_eval" for row in discovery_rows
+            ),
+            "evaluating": sum(
+                str(row.get("status") or "") == "evaluating" for row in discovery_rows
+            ),
+            "evaluated": sum(str(row.get("status") or "") == "evaluated" for row in discovery_rows),
+            "in_flight": sum(
+                str(row.get("status") or "") == "evaluating" for row in discovery_rows
+            ),
+            "expression_pending": len(expression_keys),
+            "total": len(discovery_keys | expression_keys),
+        }
 
     def mark_delight_notified(self, bvid: str) -> None:
         """Mark one content item as delight-notified."""
