@@ -1957,6 +1957,7 @@ class TestBackendAPI:
 
         assert response.status_code == 200
         assert response.headers.get("content-type", "").startswith("text/html")
+        assert response.headers.get("cache-control") == "no-store"
         assert '<link rel="manifest" href="manifest.json">' in response.text
         assert '<meta name="mobile-web-app-capable" content="yes">' in response.text
         assert '<meta name="apple-mobile-web-app-capable" content="yes">' in response.text
@@ -1964,6 +1965,41 @@ class TestBackendAPI:
         assert (
             '<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=4">'
         ) in response.text
+
+    def test_mobile_web_index_versions_the_complete_module_graph(self) -> None:
+        import re
+
+        from fastapi.testclient import TestClient
+
+        app = create_app(memory_manager=object(), database=object(), soul_engine=object())
+        client = TestClient(app)
+
+        response = client.get("/m/")
+
+        script = re.search(r'src="(/m/_assets/([0-9a-f]{12})/js/app\.js)"', response.text)
+        stylesheet = re.search(r'href="(/m/_assets/([0-9a-f]{12})/css/app\.css)"', response.text)
+        shared = re.search(
+            r'src="(/m/_assets/([0-9a-f]{12})/shared/dialogue-confirmation\.js)"',
+            response.text,
+        )
+
+        assert script is not None
+        assert stylesheet is not None
+        assert shared is not None
+        version = script.group(2)
+        assert stylesheet.group(2) == version
+        assert shared.group(2) == version
+
+        for url in (script.group(1), stylesheet.group(1), shared.group(1)):
+            asset_response = client.get(url)
+            assert asset_response.status_code == 200
+
+        dependency = client.get(f"/m/_assets/{version}/js/saved-sync-runtime.js")
+        importer = client.get(f"/m/_assets/{version}/js/views/recommend.js")
+        assert dependency.status_code == 200
+        assert importer.status_code == 200
+        assert "export function restoreDialogFocusAfterRender" in dependency.text
+        assert "restoreDialogFocusAfterRender" in importer.text
 
     def test_mobile_web_manifest_is_installable_and_assets_resolve(self) -> None:
         from fastapi.testclient import TestClient

@@ -21586,6 +21586,73 @@ def create_app(
     if _web_dir.is_dir():
         _favicon_path = _web_dir / "icon-32.png"
 
+        def _mobile_asset_version() -> str:
+            """Return one content hash for the complete mobile module graph.
+
+            A module upgrade must never mix a freshly fetched importer with an
+            older cached dependency.  The top-level script alone is not enough:
+            relative imports such as ``views/recommend.js`` and
+            ``saved-sync-runtime.js`` are cached under their own URLs.  Serving
+            the whole graph from one content-addressed prefix keeps every import
+            in the same release namespace.
+            """
+            import hashlib
+
+            digest = hashlib.sha256()
+            roots = (_web_dir / "css", _web_dir / "js", _shared_web_dir)
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                for path in sorted(
+                    candidate for candidate in root.rglob("*") if candidate.is_file()
+                ):
+                    relative = path.relative_to(_web_dir).as_posix()
+                    digest.update(relative.encode("utf-8"))
+                    digest.update(path.read_bytes())
+            return digest.hexdigest()[:12]
+
+        _mobile_version = _mobile_asset_version()
+        _mobile_asset_prefix = f"/m/_assets/{_mobile_version}"
+        _mobile_index_path = _web_dir / "index.html"
+
+        # This mount must precede the generic /m mount.  Every ES-module
+        # dependency then resolves below the same immutable release prefix.
+        app.mount(
+            _mobile_asset_prefix,
+            _StaticFiles(directory=_web_dir),
+            name="mobile-versioned-assets",
+        )
+
+        def _mobile_index_response() -> Response:
+            if not _mobile_index_path.is_file():
+                raise HTTPException(status_code=404, detail="mobile web index not found")
+            html = _mobile_index_path.read_text(encoding="utf-8")
+            html = html.replace(
+                'href="css/app.css"',
+                f'href="{_mobile_asset_prefix}/css/app.css"',
+            )
+            html = html.replace(
+                'src="/shared/dialogue-confirmation.js"',
+                f'src="{_mobile_asset_prefix}/shared/dialogue-confirmation.js"',
+            )
+            html = html.replace(
+                'src="js/app.js"',
+                f'src="{_mobile_asset_prefix}/js/app.js"',
+            )
+            return Response(
+                html,
+                media_type="text/html; charset=utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.get("/m", include_in_schema=False)
+        def _mobile_index_no_slash() -> Response:
+            return _mobile_index_response()
+
+        @app.get("/m/", include_in_schema=False)
+        def _mobile_index_slash() -> Response:
+            return _mobile_index_response()
+
         @app.get("/favicon.ico", include_in_schema=False)
         def _favicon() -> FileResponse:
             if not _favicon_path.is_file():
