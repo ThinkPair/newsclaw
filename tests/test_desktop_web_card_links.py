@@ -76,6 +76,23 @@ def test_saved_item_normalization_accepts_newsclaw_original_url_alias() -> None:
     assert "item.original_url || item.content_url || item.canonical_url || item.url" in core
 
 
+def test_saved_cards_expose_exact_search_and_missing_without_fake_reads() -> None:
+    app_js = APP_JS.read_text(encoding="utf-8")
+    start = app_js.index("function renderSavedList")
+    end = app_js.index("async function refreshTrackedObservations", start)
+    render = app_js[start:end]
+
+    assert 'data-saved-source="exact"' in render
+    assert 'data-saved-source="search"' in render
+    assert 'data-saved-source="missing"' in render
+    assert 'disabled aria-disabled="true" aria-label="暂无原文' in render
+    assert "recommendationSourceLink(item)" in render
+    assert "contentUrl(item)" not in render
+    assert 'if (sourceLink.state === "exact") {' in render
+    assert "trackRecommendationClick(item)" in render
+    assert "搜索结果不会被当作原文或已读记录" in render
+
+
 def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
     app_js = APP_JS.read_text(encoding="utf-8")
 
@@ -90,7 +107,12 @@ def test_saved_message_and_delight_content_opens_use_anchor_semantics() -> None:
     assert 'data-notification-msg="missing" data-source-link-state="missing"' in app_js
     assert "function ensureDelightThumbAnchor()" in app_js
     assert 'document.createElement("a")' in app_js
-    assert "function delightContentUrl(delight)" in app_js
+    assert "function syncDelightThumbLink(delight)" in app_js
+    thumb_start = app_js.index("function syncDelightThumbLink")
+    thumb_end = app_js.index("function applyTurnToDelight", thumb_start)
+    thumb_source = app_js[thumb_start:thumb_end]
+    assert 'sourceLink.state === "exact" && sourceLink.url' in thumb_source
+    assert "contentUrl(" not in thumb_source
     assert 'window.open(msg.content_url, "_blank", "noopener,noreferrer")' not in app_js
 
 
@@ -100,8 +122,10 @@ def test_pending_notification_ack_is_strict_and_updates_the_open_snapshot() -> N
     end = app_js.index("async function refreshWebMonitorNotifications", start)
     responder = app_js[start:end]
 
-    assert "await requestJsonStrict(ENDPOINTS.notificationSent" in responder
-    assert "await requestJson(ENDPOINTS.notificationSent" not in responder
+    assert 'rememberPendingRequestId("notification-ack", articleId)' in responder
+    assert "await requestJsonStrict(ENDPOINTS.notificationAck" in responder
+    assert "article_id: articleId, request_id: pending.requestId" in responder
+    assert "notificationSent" not in responder
     assert "state.messageListSnapshot = state.messageListSnapshot.filter" in responder
     assert "catch (error)" in responder
     assert "标记通知失败" in responder

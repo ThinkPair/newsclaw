@@ -714,12 +714,87 @@ def test_side_drawer_aria_and_flex_allocation_stay_synchronized(
     layout = chromium_page.locator(".layout")
     expect(button).to_have_attribute("aria-expanded", "false")
     expect(drawer).to_have_attribute("aria-hidden", "true")
+    assert drawer.evaluate("element => element.inert") is True
+    assert drawer.evaluate(
+        """element => {
+          element.querySelector('button')?.focus();
+          return element.contains(document.activeElement);
+        }"""
+    ) is False
     closed_width = _rect(layout)["width"]
     button.click()
     expect(button).to_have_attribute("aria-expanded", "true")
     expect(drawer).to_have_attribute("aria-hidden", "false")
+    assert drawer.evaluate("element => element.inert") is False
     chromium_page.wait_for_timeout(400)
     assert _rect(layout)["width"] < closed_width
+
+
+def test_global_search_only_mutates_the_visible_new_materials_page(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, _ = issue_98_server
+    chromium_page.goto(f"{base_url}/web/")
+    search = chromium_page.locator("#searchForm")
+    input_box = chromium_page.locator("#searchInput")
+
+    expect(search).to_be_hidden()
+    expect(input_box).to_be_disabled()
+    chromium_page.evaluate(
+        """() => {
+          const input = document.querySelector('#searchInput');
+          input.value = '隐藏筛选不应生效';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }"""
+    )
+
+    chromium_page.locator("#newMaterialsBtn").click()
+    expect(search).to_be_visible()
+    expect(input_box).to_be_enabled()
+    expect(input_box).to_have_value("")
+    input_box.fill("稳定新闻 1")
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(1)
+
+    chromium_page.locator("#settingsBtn").click()
+    expect(search).to_be_hidden()
+    expect(input_box).to_be_disabled()
+    chromium_page.evaluate(
+        """() => {
+          const input = document.querySelector('#searchInput');
+          input.value = '设置页暗中修改';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          document.querySelector('#searchForm').dispatchEvent(
+            new Event('submit', { bubbles: true, cancelable: true }),
+          );
+        }"""
+    )
+    chromium_page.locator("#newMaterialsBtn").click()
+    expect(input_box).to_have_value("稳定新闻 1")
+    expect(chromium_page.locator("#videoGrid .video-card[data-item-key]")).to_have_count(1)
+
+
+def test_generic_drawer_traps_focus_and_restores_its_opener(
+    issue_98_server: tuple[str, Issue98Stub],
+    chromium_page: Page,
+) -> None:
+    base_url, _ = issue_98_server
+    chromium_page.add_init_script("localStorage.setItem('obc.noticeDismissed', '1')")
+    chromium_page.goto(f"{base_url}/web/")
+
+    opener = chromium_page.locator("#messagesBtn")
+    opener.click()
+    drawer = chromium_page.locator("#messagesDrawer")
+    expect(drawer).to_have_attribute("aria-hidden", "false")
+    assert chromium_page.evaluate("document.querySelector('.app-shell').inert") is True
+    assert chromium_page.evaluate(
+        "document.querySelector('#messagesDrawer').contains(document.activeElement)"
+    ) is True
+
+    chromium_page.keyboard.press("Escape")
+    expect(drawer).to_have_attribute("aria-hidden", "true")
+    assert chromium_page.evaluate("document.querySelector('.app-shell').inert") is False
+    expect(opener).to_be_focused()
 
 
 @pytest.mark.parametrize("delta_x", [9, 10, 49, 50])

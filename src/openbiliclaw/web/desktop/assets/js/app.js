@@ -16,7 +16,7 @@
       runtimeStatus: "/runtime-status",
       activityFeed: "/activity-feed",
       notificationPending: "/notifications/pending",
-      notificationSent: "/notifications/sent",
+      notificationAck: "/notifications/ack",
       delightBatch: "/delight/pending-batch",
       delightRespond: "/delight/respond",
       profile: "/profile-summary",
@@ -88,6 +88,10 @@
       "desktop-web",
     );
     let retainedChatDraft = "";
+    const chatSubmissionInFlight = new Set();
+    let pendingNotificationLoadState = "loading";
+    let pendingNotificationLoadError = "";
+    let pendingNotificationRefreshPromise = null;
     const dialogueCardActionAbortController = new AbortController();
     const CHAT_SCROLL_BOTTOM_TOLERANCE_PX = 48;
     let hasOpenedDialogueChatPage = false;
@@ -112,6 +116,8 @@
       activityItems: [],
       activityCursor: "",
       activityHasMore: false,
+      activityLoading: false,
+      activityError: "",
       profileCognitionCursor: "",
       profileCognitionHasMore: false,
       delights: [],
@@ -2228,26 +2234,27 @@
       const settingsButton = $("#themeNoticeSettings");
       if (!notice || !dismissButton || !settingsButton || notice.dataset.bound === "1") return;
       notice.dataset.bound = "1";
+      document.querySelector(".topbar")?.insertAdjacentElement("afterend", notice);
       let timer = 0;
 
       const clearTimer = () => {
         if (timer) window.clearTimeout(timer);
         timer = 0;
       };
-      const dismiss = () => {
+      const hide = ({ remember = false } = {}) => {
         clearTimer();
-        storageSet(THEME_NOTICE_DISMISSED_KEY, "1");
+        if (remember) storageSet(THEME_NOTICE_DISMISSED_KEY, "1");
         notice.classList.remove("is-visible");
         window.setTimeout(() => { notice.hidden = true; }, 200);
       };
       const scheduleDismiss = () => {
         clearTimer();
-        timer = window.setTimeout(dismiss, THEME_NOTICE_DURATION_MS);
+        timer = window.setTimeout(() => hide(), THEME_NOTICE_DURATION_MS);
       };
 
-      dismissButton.addEventListener("click", dismiss);
+      dismissButton.addEventListener("click", () => hide({ remember: true }));
       settingsButton.addEventListener("click", () => {
-        dismiss();
+        hide({ remember: true });
         openSettingsPage("frontend");
       });
       notice.addEventListener("mouseenter", clearTimer);
@@ -3159,6 +3166,79 @@
       }
     }
 
+    const MODAL_FOCUSABLE_SELECTOR = [
+      'a[href]',
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      'summary',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(",");
+    let activeModalSurface = null;
+
+    function modalSurfaceDialog(surface) {
+      return surface?.querySelector(".drawer-panel, .modal-panel, .mobile-menu-panel") || surface;
+    }
+
+    function modalSurfaceFocusable(surface) {
+      return [...(surface?.querySelectorAll(MODAL_FOCUSABLE_SELECTOR) || [])]
+        .filter((element) => !element.hidden && !element.closest("[hidden]") && element.getClientRects().length > 0);
+    }
+
+    function setModalBackgroundInert(surface, inert) {
+      [...document.body.children].forEach((element) => {
+        if (element === surface || element.id === "toastContainer") return;
+        if (inert) {
+          if (element.dataset.modalInerted === "true") return;
+          element.dataset.modalPreviousInert = element.inert ? "true" : "false";
+          element.dataset.modalInerted = "true";
+          element.inert = true;
+        } else if (element.dataset.modalInerted === "true") {
+          element.inert = element.dataset.modalPreviousInert === "true";
+          delete element.dataset.modalPreviousInert;
+          delete element.dataset.modalInerted;
+        }
+      });
+    }
+
+    function activateModalSurface(surface, opener = document.activeElement) {
+      if (!surface) return;
+      if (activeModalSurface === surface) {
+        surface.setAttribute("aria-hidden", "false");
+        return;
+      }
+      activeModalSurface = surface;
+      surface._modalOpener = opener instanceof HTMLElement ? opener : null;
+      surface.setAttribute("aria-hidden", "false");
+      const dialog = modalSurfaceDialog(surface);
+      if (dialog) {
+        if (!dialog.hasAttribute("role")) dialog.setAttribute("role", "dialog");
+        dialog.setAttribute("aria-modal", "true");
+        if (!dialog.hasAttribute("aria-label") && !dialog.hasAttribute("aria-labelledby")) {
+          const label = surface.getAttribute("aria-label");
+          if (label) dialog.setAttribute("aria-label", label);
+        }
+        if (!dialog.hasAttribute("tabindex")) dialog.tabIndex = -1;
+      }
+      setModalBackgroundInert(surface, true);
+      window.requestAnimationFrame(() => {
+        const target = modalSurfaceFocusable(surface)[0] || dialog;
+        target?.focus({ preventScroll: true });
+      });
+    }
+
+    function deactivateModalSurface(surface, { restoreFocus = true } = {}) {
+      if (!surface) return;
+      surface.setAttribute("aria-hidden", "true");
+      if (activeModalSurface !== surface) return;
+      activeModalSurface = null;
+      setModalBackgroundInert(surface, false);
+      const opener = surface._modalOpener;
+      surface._modalOpener = null;
+      if (restoreFocus && opener?.isConnected) opener.focus({ preventScroll: true });
+    }
+
     function openPanel(id) {
       const panel = document.getElementById(id);
       if (!panel) return;
@@ -3172,6 +3252,7 @@
       }
       panel.classList.remove("is-closing");
       panel.classList.add("is-open");
+      activateModalSurface(panel);
     }
 
     function closePanel(id) {
@@ -3188,6 +3269,7 @@
           panel._closeHandler = null;
         }
         panel.classList.remove("is-open", "is-closing", "from-mobile-menu");
+        deactivateModalSurface(panel);
         if (id === "messagesDrawer") {
           state.messageListSnapshot = null;
           state.messageListDomLocked = false;
@@ -3199,6 +3281,33 @@
       panel.addEventListener("animationend", finishClose, { once: true });
       panel._closeTimer = window.setTimeout(finishClose, 220);
     }
+
+    document.addEventListener("keydown", (event) => {
+      const surface = activeModalSurface;
+      if (!surface || surface.classList.contains("is-closing")) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (surface.id === "mobileMenu") closeMobileMenu();
+        else closePanel(surface.id);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = modalSurfaceFocusable(surface);
+      if (!focusable.length) {
+        event.preventDefault();
+        modalSurfaceDialog(surface)?.focus({ preventScroll: true });
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !surface.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !surface.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
 
     const MAIN_PAGE_IDS = ["homePage", "contentLibraryPage", "profilePage", "chatPage", "settingsPage"];
 
@@ -3232,6 +3341,7 @@
         document.body.classList.remove("event-workspace-open", "new-materials-open");
         eventWorkspaceController?.deactivate();
       }
+      syncGlobalSearchAvailability();
     }
 
     function syncTopbarHeight() {
@@ -3240,19 +3350,36 @@
       document.documentElement.style.setProperty("--topbar-height", `${Math.ceil(topbar.getBoundingClientRect().height)}px`);
     }
 
+    function isNewMaterialsSearchAvailable() {
+      return state.homeMode === "materials" && !document.getElementById("homePage")?.hidden;
+    }
+
+    function syncGlobalSearchAvailability() {
+      const available = isNewMaterialsSearchAvailable();
+      [["searchForm", "searchInput"], ["mobileSearchForm", "mobileSearchInput"]].forEach(([formId, inputId]) => {
+        const form = document.getElementById(formId);
+        const input = document.getElementById(inputId);
+        if (form) {
+          form.hidden = !available;
+          form.setAttribute("aria-hidden", available ? "false" : "true");
+          form.querySelectorAll("button, input").forEach((control) => { control.disabled = !available; });
+        } else if (input) {
+          input.disabled = !available;
+        }
+      });
+    }
+
     function syncHomeSearch() {
-      const eventsMode = state.homeMode === "events";
       const desktopInput = $("#searchInput");
       const mobileInput = $("#mobileSearchInput");
-      const value = eventsMode
-        ? String(eventWorkspaceController?.snapshot?.()?.query || "")
-        : state.query;
-      const placeholder = eventsMode ? "筛选当前已加载的事件" : "筛选当前已加载的新材料";
+      const value = state.query;
+      const placeholder = "筛选当前已加载的新材料";
       [desktopInput, mobileInput].forEach((input) => {
         if (!input) return;
         input.value = value;
         input.placeholder = placeholder;
       });
+      syncGlobalSearchAvailability();
     }
 
     function setHomeMode(value, { persist = true } = {}) {
@@ -3725,16 +3852,19 @@
         const card = document.createElement("article");
         card.className = "video-card saved-card";
         card.dataset.itemKey = item.item_key;
-        const url = contentUrl(item);
+        const sourceLink = recommendationSourceLink(item);
         const savedCoverClass = recommendationCoverClass(item);
         const coverContent = `
             ${recommendationMediaHtml(item)}
             <span class="platform" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}">${escapeHtml(recommendationMediaLabel(item) || platformName(item.source_platform || item.platform || "news"))}</span>
+            <span class="saved-source-state is-${escapeHtml(sourceLink.state)}">${escapeHtml(sourceLink.label)}</span>
           `;
         card.innerHTML = `
-          ${url
-            ? `<a class="cover${savedCoverClass}" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-label="打开 ${escapeHtml(item.title || item.content_id)}">${coverContent}</a>`
-            : `<button class="cover${savedCoverClass}" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}" type="button" aria-label="打开 ${escapeHtml(item.title || item.content_id)}">${coverContent}</button>`}
+          ${sourceLink.state === "exact"
+            ? `<a class="cover${savedCoverClass}" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}" data-saved-source="exact" href="${escapeHtml(sourceLink.url)}" target="_blank" rel="noopener noreferrer" aria-label="阅读原文：${escapeHtml(item.title || item.content_id)}" title="${escapeHtml(sourceLink.explanation)}">${coverContent}</a>`
+            : sourceLink.state === "search"
+              ? `<a class="cover${savedCoverClass}" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}" data-saved-source="search" href="${escapeHtml(sourceLink.url)}" target="_blank" rel="noopener noreferrer" aria-label="检索来源：${escapeHtml(item.title || item.content_id)}" title="${escapeHtml(sourceLink.explanation)}">${coverContent}</a>`
+              : `<button class="cover${savedCoverClass} is-source-missing" data-platform="${escapeHtml(item.source_platform || item.platform || "news")}" data-saved-source="missing" type="button" disabled aria-disabled="true" aria-label="暂无原文：${escapeHtml(item.title || item.content_id)}" title="${escapeHtml(sourceLink.explanation)}">${coverContent}</button>`}
           <div>
             <p class="video-title">${escapeHtml(item.title || item.content_id)}</p>
             <p class="video-meta">${escapeHtml(item.author_name || "")}</p>
@@ -3748,10 +3878,15 @@ ${savedCardFeedbackBarHtml(listKind)}
         const cover = card.querySelector(".cover");
         bindSavedCoverFallback(cover);
         cover.addEventListener("click", () => {
-          if (url) trackRecommendationClick(item);
+          if (sourceLink.state === "exact") {
+            trackRecommendationClick(item);
+          } else if (sourceLink.state === "search") {
+            const status = card.querySelector(".status-line");
+            if (status) status.textContent = "已打开来源检索；搜索结果不会被当作原文或已读记录。";
+          }
         });
         cover.addEventListener("auxclick", (event) => {
-          if (url && event.button === 1) trackRecommendationClick(item);
+          if (sourceLink.state === "exact" && event.button === 1) trackRecommendationClick(item);
         });
         card.querySelector(".saved-sync-one")?.addEventListener("click", (e) => {
           desktopSavedPendingFocus[listKind] = window.NewsClawSavedSync.captureSavedFocus(focusRoot, e.currentTarget);
@@ -4603,13 +4738,17 @@ ${savedCardFeedbackBarHtml(listKind)}
           try { return new URL(item.display_url || item.canonical_url).hostname; } catch { return "网页监控"; }
         })();
         const status = String(item.status || "");
+        const monitorUrl = safeHttpContentUrl(item.canonical_url || item.display_url);
+        const eventId = String(item.event_id || "").trim();
         const statusClass = status === "needs_attention" ? "is-error" : status === "retry_wait" ? "is-waiting" : status === "paused" ? "is-paused" : "is-healthy";
         card.className = `monitor-card ${statusClass}`;
         card.dataset.monitorId = monitorId;
         card.innerHTML = `
           <div class="monitor-card-main">
             <div class="monitor-card-title-row"><span class="monitor-status-dot" aria-hidden="true"></span><h3>${escapeHtml(label)}</h3><span class="monitor-status-label">${escapeHtml(busy ? "正在检查" : webMonitorStatusLabel(item))}</span></div>
-            <a class="monitor-url" href="${escapeHtml(item.canonical_url || item.display_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.display_url || item.canonical_url || "")}</a>
+            ${monitorUrl
+              ? `<a class="monitor-url" href="${escapeHtml(monitorUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.display_url || item.canonical_url || monitorUrl)}</a>`
+              : '<span class="monitor-url is-missing" aria-disabled="true">网页地址暂不可用</span>'}
             <div class="monitor-facts">
               <span>版本 <strong>${item.current_version || "—"}</strong></span>
               <span>变化 <strong>${Number(item.change_count || 0)}</strong></span>
@@ -4619,11 +4758,11 @@ ${savedCardFeedbackBarHtml(listKind)}
             ${item.last_error ? `<p class="monitor-card-error">${escapeHtml(item.last_error)}</p>` : ""}
           </div>
           <div class="monitor-card-actions">
-            <button class="small-btn" data-monitor-action="event" type="button">事件档案</button>
+            <button class="small-btn" data-monitor-action="event" type="button" ${eventId ? "" : 'disabled aria-disabled="true" title="首次变化确认后才会建立事件档案"'}>${eventId ? "事件档案" : "尚无事件"}</button>
             <button class="small-btn" data-monitor-action="history" type="button">版本</button>
             <button class="small-btn" data-monitor-action="check" type="button" ${busy || status === "paused" ? "disabled" : ""}>立即检查</button>
-            <button class="small-btn" data-monitor-action="${status === "paused" ? "resume" : "pause"}" type="button">${status === "paused" ? "恢复" : "暂停"}</button>
-            <button class="small-btn is-danger" data-monitor-action="delete" type="button">移除</button>
+            <button class="small-btn" data-monitor-action="${status === "paused" ? "resume" : "pause"}" type="button" ${busy ? 'disabled aria-disabled="true"' : ""}>${status === "paused" ? "恢复" : "暂停"}</button>
+            <button class="small-btn is-danger" data-monitor-action="delete" type="button" ${busy ? 'disabled aria-disabled="true"' : ""}>移除</button>
           </div>
           ${webMonitorHistoryHtml(item)}`;
         return card;
@@ -4676,15 +4815,28 @@ ${savedCardFeedbackBarHtml(listKind)}
       const intervalInput = document.getElementById("monitoringIntervalSelect");
       const submit = document.getElementById("monitoringAddBtn");
       const url = String(urlInput?.value || "").trim();
-      if (!url) return;
-      if (submit) submit.disabled = true;
+      const canonicalUrl = safeHttpContentUrl(url);
+      if (!canonicalUrl) {
+        const status = document.getElementById("monitoringStatus");
+        if (status) {
+          status.setAttribute("role", "alert");
+          status.textContent = url ? "请输入完整的 http 或 https 网页地址。" : "请先填写要监控的网页或 PDF 地址。";
+        }
+        urlInput?.focus();
+        syncWebMonitorComposer();
+        return;
+      }
+      if (submit) {
+        submit.dataset.submitting = "true";
+        submit.disabled = true;
+      }
       if (document.getElementById("monitoringStatus")) document.getElementById("monitoringStatus").textContent = "正在安全读取并建立首个正文基线…";
       try {
         const payload = await requestJsonStrict(ENDPOINTS.webMonitors, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            url,
+            url: canonicalUrl,
             label: String(labelInput?.value || "").trim(),
             kind: "auto",
             interval_minutes: Number(intervalInput?.value || 1440),
@@ -4703,17 +4855,29 @@ ${savedCardFeedbackBarHtml(listKind)}
         showToast(message);
         renderWebMonitors();
       } finally {
-        if (submit) submit.disabled = false;
+        if (submit) delete submit.dataset.submitting;
+        syncWebMonitorComposer();
       }
     }
 
+    function syncWebMonitorComposer() {
+      const input = document.getElementById("monitoringUrlInput");
+      const submit = document.getElementById("monitoringAddBtn");
+      if (!submit) return;
+      submit.disabled = submit.dataset.submitting === "true" || !safeHttpContentUrl(input?.value);
+    }
+
     async function runWebMonitorAction(action, monitorId) {
-      if (!action || !monitorId || state.webMonitors.busyIds.has(monitorId)) return;
+      if (!action || !monitorId) return;
       const item = asArray(state.webMonitors.items).find((row) => String(row.monitor_id) === monitorId);
       if (!item) return;
+      const readOnlyAction = action === "event" || action === "history";
+      if (!readOnlyAction && (state.webMonitors.busyIds.has(monitorId) || Boolean(item.is_running))) return;
       if (action === "event") {
+        const eventId = String(item.event_id || "").trim();
+        if (!eventId) return;
         openHomePage("events");
-        await eventWorkspaceController?.openEvent?.(String(item.event_id || ""));
+        await eventWorkspaceController?.openEvent?.(eventId);
         return;
       }
       if (action === "history") {
@@ -4944,6 +5108,8 @@ ${savedCardFeedbackBarHtml(listKind)}
         event.preventDefault();
         void createWebMonitor();
       });
+      document.getElementById("monitoringUrlInput")?.addEventListener("input", syncWebMonitorComposer);
+      syncWebMonitorComposer();
       document.getElementById("monitoringList")?.addEventListener("click", (event) => {
         const button = event.target.closest("[data-monitor-action]");
         if (!button) return;
@@ -5732,6 +5898,7 @@ ${savedCardFeedbackBarHtml(listKind)}
       const drawer = document.getElementById("sideDrawer");
       drawer?.classList.toggle("is-open", open);
       drawer?.setAttribute("aria-hidden", open ? "false" : "true");
+      if (drawer) drawer.inert = !open;
       const button = document.getElementById("sideDrawerBtn");
       if (button) {
         button.setAttribute("aria-expanded", open ? "true" : "false");
@@ -5776,12 +5943,16 @@ ${savedCardFeedbackBarHtml(listKind)}
         }).catch(() => {});
       }
       document.body.classList.add("mobile-menu-open");
-      document.getElementById("mobileMenu")?.classList.add("is-open");
+      const menu = document.getElementById("mobileMenu");
+      menu?.classList.add("is-open");
+      activateModalSurface(menu);
     }
 
     function closeMobileMenu() {
       document.body.classList.remove("mobile-menu-open");
-      document.getElementById("mobileMenu")?.classList.remove("is-open");
+      const menu = document.getElementById("mobileMenu");
+      menu?.classList.remove("is-open");
+      deactivateModalSurface(menu);
     }
 
     function openMobilePanel(id, options = {}) {
@@ -5793,6 +5964,7 @@ ${savedCardFeedbackBarHtml(listKind)}
         returnToMessages();
         renderMessages();
         void refreshProfile().catch(() => {});
+        void refreshPendingNotification();
       }
       if (id === "activityDrawer") renderActivityHistory();
       const panel = document.getElementById(id);
@@ -8420,7 +8592,7 @@ ${cardFeedbackBarHtml()}`;
 
     async function handleCardAction(action, item, card) {
       const status = card.querySelector(".status-line");
-      if (card.dataset.feedbackPending === "true") return;
+      if (card.dataset.feedbackPending === "true" || card.dataset.commentSubmitting === "true") return;
       if (action === "open") return openRecommendation(item, card);
       if (action === "comment") { openCardComposer(card); return; }
       if (action === "cancel-comment") { closeCardComposer(card); return; }
@@ -8484,25 +8656,44 @@ ${cardFeedbackBarHtml()}`;
       }
       if (action === "send-comment") {
         const input = card.querySelector(".comment-field input");
-        const note = input.value.trim();
+        const submitButton = card.querySelector('[data-action="send-comment"]');
+        const note = input?.value.trim() || "";
         if (!note) {
           status.textContent = "先写一句反馈，再提交。";
           input?.focus();
           return;
         }
         const previousFeedbackType = item.feedback_type;
-        if (input) input.value = "";
-        closeCardComposer(card);
-        item.feedback_type = "comment";
-        status.textContent = "已提交推荐反馈，推荐会继续保留在当前列表。";
-        finishRecommendationFeedback(card, "comment");
-        showToast("已提交推荐反馈");
-        void submitFeedback(item, "comment", note).catch((error) => {
+        let shouldRestoreFocus = false;
+        card.dataset.commentSubmitting = "true";
+        if (input) input.disabled = true;
+        if (submitButton) submitButton.disabled = true;
+        if (status) {
+          status.removeAttribute("role");
+          status.textContent = "正在提交推荐反馈…";
+        }
+        try {
+          await submitFeedback(item, "comment", note);
+          item.feedback_type = "comment";
+          if (input) input.value = "";
+          closeCardComposer(card);
+          if (status) status.textContent = "已提交推荐反馈，推荐会继续保留在当前列表。";
+          finishRecommendationFeedback(card, "comment");
+          showToast("已提交推荐反馈");
+        } catch (error) {
           item.feedback_type = previousFeedbackType;
-          if (input) input.value = note;
-          status.textContent = configErrorMessage(error?.details) || error?.message || "反馈提交失败，请稍后重试。";
-          showToast(status.textContent);
-        });
+          if (status) {
+            status.setAttribute("role", "alert");
+            status.textContent = configErrorMessage(error?.details) || error?.message || "反馈提交失败，请稍后重试。";
+            showToast(status.textContent);
+          }
+          shouldRestoreFocus = true;
+        } finally {
+          delete card.dataset.commentSubmitting;
+          if (input) input.disabled = false;
+          if (submitButton?.isConnected) submitButton.disabled = false;
+          if (shouldRestoreFocus) input?.focus();
+        }
         return;
       }
       const feedbackType = action === "like" ? "like" : action === "dismiss" ? "dismiss" : "dislike";
@@ -8512,7 +8703,10 @@ ${cardFeedbackBarHtml()}`;
     function renderRail() {
       const activityItems = state.activityItems.length ? state.activityItems : asArray(state.activity?.items);
       const activityMarkup = (limit) => activityItems.length
-        ? activityItems.slice(0, limit).map((item) => `<div class="activity-item"><p>${escapeHtml(typeof item === "object" ? item.summary || item.detail || item.kind || valueList(item) : item)}</p></div>`).join("")
+        ? activityItems.slice(0, limit).map((item) => {
+          const summary = typeof item === "object" ? item.summary || item.detail || item.kind || valueList(item) : item;
+          return `<div class="activity-item"><p title="${escapeHtml(summary)}">${escapeHtml(summary)}</p></div>`;
+        }).join("")
         : `<div class="empty-state">还没有新的动态；实时流收到 activity.added 后会自动刷新。</div>`;
       if ($("#activityList")) $("#activityList").innerHTML = activityMarkup(1);
       if ($("#mobileActivityList")) $("#mobileActivityList").innerHTML = activityMarkup(5);
@@ -8523,28 +8717,76 @@ ${cardFeedbackBarHtml()}`;
     function renderActivityHistory() {
       const list = $("#activityHistory");
       if (!list) return;
-      if (!state.activityItems.length) {
+      if (state.activityLoading && !state.activityItems.length) {
+        list.innerHTML = '<div class="empty-state" role="status">正在读取动态历史…</div>';
+      } else if (state.activityError && !state.activityItems.length) {
+        list.innerHTML = `<div class="message-load-error" role="alert"><strong>动态历史暂时无法读取</strong><p>${escapeHtml(state.activityError)}</p><button class="small-btn" type="button" data-activity-retry>重新读取</button></div>`;
+        list.querySelector("[data-activity-retry]")?.addEventListener("click", () => void loadActivityPage({ reset: true }));
+      } else if (!state.activityItems.length) {
         list.innerHTML = `<div class="empty-state">暂无历史动态。</div>`;
       } else {
-        list.innerHTML = state.activityItems.map((item) => `<article class="activity-item"><p class="eyebrow">${escapeHtml(item.kind || "activity")}</p><h3>${escapeHtml(item.summary || "后台动态")}</h3><p class="video-meta">${escapeHtml(item.detail || item.created_at || "")}</p></article>`).join("");
+        const error = state.activityError
+          ? `<div class="message-load-error" role="alert"><strong>更早动态加载失败</strong><p>${escapeHtml(state.activityError)}</p><button class="small-btn" type="button" data-activity-retry>重试</button></div>`
+          : "";
+        list.innerHTML = `${error}${state.activityItems.map((item, index) => {
+          const summary = String(item.summary || "后台动态");
+          const summaryMarkup = summary.length > 72
+            ? `<h3 class="activity-summary"><button type="button" data-activity-summary="${index}" aria-expanded="false" aria-label="展开完整动态：${escapeHtml(summary)}">${escapeHtml(summary)}</button></h3>`
+            : `<h3>${escapeHtml(summary)}</h3>`;
+          return `<article class="activity-item"><p class="eyebrow">${escapeHtml(item.kind || "activity")}</p>${summaryMarkup}<p class="video-meta">${escapeHtml(item.detail || item.created_at || "")}</p></article>`;
+        }).join("")}`;
+        list.querySelector("[data-activity-retry]")?.addEventListener("click", () => void loadActivityPage({ reset: !state.activityItems.length }));
+        list.querySelectorAll("[data-activity-summary]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const expanded = button.getAttribute("aria-expanded") !== "true";
+            button.setAttribute("aria-expanded", expanded ? "true" : "false");
+            button.setAttribute("aria-label", `${expanded ? "收起" : "展开"}完整动态：${button.textContent || ""}`);
+          });
+        });
       }
       const more = $("#activityMoreBtn");
-      if (more) more.disabled = !state.activityHasMore;
+      if (more) {
+        more.disabled = state.activityLoading || !state.activityHasMore;
+        more.textContent = state.activityLoading ? "加载中…" : "加载更早动态";
+      }
+    }
+
+    function activityItemKey(item) {
+      return String(item?.id || item?.event_id || item?.activity_id || [item?.kind, item?.created_at, item?.summary].join("\u0000"));
     }
 
     async function loadActivityPage({ reset = false } = {}) {
+      if (state.activityLoading) return;
       const cursor = reset ? "" : state.activityCursor;
       const query = new URLSearchParams({ limit: "10" });
       if (cursor) query.set("before", cursor);
-      const payload = await requestJson(`${ENDPOINTS.activityFeed}?${query.toString()}`);
-      if (!payload) { showToast("动态加载失败：后端不可用"); return; }
-      const items = Array.isArray(payload.items) ? payload.items : [];
-      state.activity = payload;
-      state.activityItems = reset ? items : state.activityItems.concat(items);
-      state.activityCursor = payload.next_cursor || payload.next || "";
-      state.activityHasMore = Boolean(payload.has_more && state.activityCursor);
-      renderRail();
+      state.activityLoading = true;
+      state.activityError = "";
       renderActivityHistory();
+      try {
+        const payload = await requestJsonStrict(`${ENDPOINTS.activityFeed}?${query.toString()}`, {
+          cache: "no-store",
+          timeoutMs: 15000,
+        });
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        const merged = reset ? items : state.activityItems.concat(items);
+        const seen = new Set();
+        state.activity = payload;
+        state.activityItems = merged.filter((item) => {
+          const key = activityItemKey(item);
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        state.activityCursor = payload?.next_cursor || payload?.next || "";
+        state.activityHasMore = Boolean(payload?.has_more && state.activityCursor);
+        renderRail();
+      } catch (error) {
+        state.activityError = configErrorMessage(error?.details) || error?.message || "动态加载失败：后端不可用";
+      } finally {
+        state.activityLoading = false;
+        renderActivityHistory();
+      }
     }
 
     function formatPercent(value) {
@@ -9264,14 +9506,16 @@ ${cardFeedbackBarHtml()}`;
         return null;
       }
       if (type === "notification") {
-        const bvid = item.bvid || item.id || item.recommendation_id;
+        const bvid = item.bvid || item.article_id || item.content_id || item.id || item.recommendation_id;
         if (!bvid) return null;
+        const articleId = item.article_id || "";
         return {
           type: "notification",
           id: Number(item.recommendation_id ?? item.id ?? 0) || null,
           recommendation_id: Number(item.recommendation_id ?? item.id ?? 0) || null,
           bvid: String(bvid),
-          content_id: String(item.article_id || item.content_id || bvid),
+          article_id: String(articleId || ""),
+          content_id: String(item.content_id || articleId || bvid),
           title: item.display_title || item.title || "有一条值得通知你的推荐",
           reason: item.reason || item.expression || "这条推荐达到了通知阈值。",
           original_url: item.original_url || "",
@@ -9344,6 +9588,36 @@ ${cardFeedbackBarHtml()}`;
       return Boolean($("#messagesDrawer")?.classList.contains("is-open"));
     }
 
+    async function refreshPendingNotification() {
+      if (pendingNotificationRefreshPromise) return pendingNotificationRefreshPromise;
+      pendingNotificationLoadState = "loading";
+      pendingNotificationLoadError = "";
+      renderMessages();
+      pendingNotificationRefreshPromise = (async () => {
+        try {
+          const snapshot = await requestJsonStrict(ENDPOINTS.notificationPending, {
+            cache: "no-store",
+            timeoutMs: 15000,
+          });
+          pendingNotificationLoadState = "ready";
+          state.messages = state.messages.filter((item) => messageType(item) !== "notification");
+          if (state.messageListSnapshot && isMessagesDrawerOpen()) {
+            state.messageListSnapshot = state.messageListSnapshot.filter(
+              (item) => messageType(item) !== "notification"
+            );
+          }
+          if (snapshot?.item) mergeMessages([{ ...snapshot.item, type: "notification" }]);
+        } catch (error) {
+          pendingNotificationLoadState = "error";
+          pendingNotificationLoadError = configErrorMessage(error?.details) || error?.message || "通知暂时无法读取。";
+        } finally {
+          pendingNotificationRefreshPromise = null;
+          renderMessages();
+        }
+      })();
+      return pendingNotificationRefreshPromise;
+    }
+
     function hydrateInboxFromSpeculations(speculations, type = "interest.probe") {
       if (speculations == null || speculations === "") return;
       const normalizedType = messageType({ type });
@@ -9390,11 +9664,15 @@ ${cardFeedbackBarHtml()}`;
       if (state.messageListSnapshot && isMessagesDrawerOpen()) state.messageListSnapshot = messages;
       else state.messages = messages;
       syncMessageCount();
-      if (!messages.length) {
+      if (pendingNotificationLoadState === "loading" && !messages.length) {
+        list.innerHTML = '<div class="empty-state" role="status">正在读取通知…</div>';
+        return;
+      }
+      if (!messages.length && pendingNotificationLoadState !== "error") {
         list.innerHTML = `<div class="empty-state">暂无通知。兴趣确认、避雷确认和待通知候选都会出现在这里。</div>`;
         return;
       }
-      list.replaceChildren(...messages.map((msg) => {
+      const messageElements = messages.map((msg) => {
         const el = document.createElement("article");
         const key = messageKey(msg);
         const resolvedResult = state.resolvedMessageResults.get(key);
@@ -9418,10 +9696,20 @@ ${cardFeedbackBarHtml()}`;
               : `<button class="small-btn" data-notification-msg="missing" data-source-link-state="missing" type="button" disabled aria-disabled="true" title="${escapeHtml(sourceLink.explanation)}">${escapeHtml(sourceLink.label)}</button>`;
           el.innerHTML = `<p class="eyebrow">待通知候选</p><h3>${escapeHtml(msg.title)}</h3><p class="video-meta">${escapeHtml(msg.reason)}</p><div class="message-note">这类消息来自后端挑出的高置信推荐，用于插件通知；标记已通知后不会反复出现。</div><div class="message-card-actions"><div class="card-feedback-icons" aria-label="通知候选状态"><button class="feedback-icon-btn" data-notification-msg="dismiss" type="button" aria-label="标记已通知" title="标记已通知"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div><div class="message-primary-actions">${viewAction}</div></div>`;
           el.querySelectorAll("[data-notification-msg]").forEach((btn) => {
-            btn.addEventListener("click", () => respondNotification(msg, btn.dataset.notificationMsg, el));
+            btn.addEventListener("click", (event) => {
+              if (el.getAttribute("aria-busy") === "true") {
+                event.preventDefault();
+                return;
+              }
+              void respondNotification(msg, btn.dataset.notificationMsg, el);
+            });
             btn.addEventListener("auxclick", (event) => {
               if (event.button === 1 && btn.dataset.notificationMsg === "view") {
-                respondNotification(msg, "view", el);
+                if (el.getAttribute("aria-busy") === "true") {
+                  event.preventDefault();
+                  return;
+                }
+                void respondNotification(msg, "view", el);
               }
             });
           });
@@ -9451,10 +9739,31 @@ ${cardFeedbackBarHtml()}`;
           }
         }
         return el;
-      }));
+      });
+      if (pendingNotificationLoadState === "loading") {
+        const loading = document.createElement("div");
+        loading.className = "message-load-state";
+        loading.setAttribute("role", "status");
+        loading.textContent = "正在核对最新通知…";
+        list.replaceChildren(loading, ...messageElements);
+        return;
+      }
+      if (pendingNotificationLoadState === "error") {
+        const error = document.createElement("div");
+        error.className = "message-load-error";
+        error.setAttribute("role", "alert");
+        error.innerHTML = `<strong>通知暂时无法读取</strong><p>${escapeHtml(pendingNotificationLoadError)}</p><button class="small-btn" type="button" data-notification-retry>重新读取</button>`;
+        error.querySelector("[data-notification-retry]")?.addEventListener("click", () => {
+          void refreshPendingNotification();
+        });
+        list.replaceChildren(error, ...messageElements);
+      } else {
+        list.replaceChildren(...messageElements);
+      }
     }
 
     async function respondNotification(msg, response, el) {
+      if (el?.getAttribute("aria-busy") === "true") return;
       const sourceLink = recommendationSourceLink(msg);
       if (response === "search") {
         showToast("已打开来源检索；搜索结果不会被当作原文或已读通知");
@@ -9465,15 +9774,38 @@ ${cardFeedbackBarHtml()}`;
         if (sourceLink.state !== "exact" || !sourceLink.url) return;
         trackRecommendationClick(msg);
       }
+      const articleId = String(msg?.article_id || "").trim();
+      if (!articleId) {
+        const reason = "这条通知缺少文章编号，无法确认；请重新读取通知后再试。";
+        el?.removeAttribute("aria-busy");
+        el?.querySelectorAll("button").forEach((button) => {
+          button.disabled = button.dataset.notificationMsg === "missing";
+        });
+        const note = el?.querySelector(".message-note");
+        if (note) {
+          note.setAttribute("role", "alert");
+          note.textContent = reason;
+        }
+        showToast(reason);
+        return;
+      }
       const notificationKey = messageKey(msg);
+      const pending = rememberPendingRequestId("notification-ack", articleId);
       el?.setAttribute("aria-busy", "true");
-      el?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+      el?.querySelectorAll("[data-notification-msg]").forEach((control) => {
+        control.setAttribute("aria-disabled", "true");
+        if (control instanceof HTMLButtonElement) control.disabled = true;
+      });
       try {
-        await requestJsonStrict(ENDPOINTS.notificationSent, {
+        const result = await requestJsonStrict(ENDPOINTS.notificationAck, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ bvid: msg.bvid }),
+          body: JSON.stringify({ article_id: articleId, request_id: pending.requestId }),
         });
+        if (result?.ok !== true || String(result?.article_id || result?.bvid || "") !== articleId) {
+          throw new Error("后端没有确认这条通知，请重新读取后再试。");
+        }
+        forgetPendingRequestId(pending);
         state.messages = state.messages.filter((item) => messageKey(item) !== notificationKey);
         if (state.messageListSnapshot) {
           state.messageListSnapshot = state.messageListSnapshot.filter(
@@ -9482,11 +9814,13 @@ ${cardFeedbackBarHtml()}`;
         }
         renderMessages();
         el?.remove();
-        showToast(response === "view" ? "已打开并标记这条通知" : "已标记这条通知");
+        showToast(response === "view" ? "已打开原文并确认这条通知" : "已确认这条通知");
       } catch (error) {
         el?.removeAttribute("aria-busy");
-        el?.querySelectorAll("button").forEach((button) => {
-          button.disabled = button.dataset.notificationMsg === "missing";
+        el?.querySelectorAll("[data-notification-msg]").forEach((control) => {
+          const missing = control.dataset.notificationMsg === "missing";
+          control.setAttribute("aria-disabled", missing ? "true" : "false");
+          if (control instanceof HTMLButtonElement) control.disabled = missing;
         });
         showToast(error?.message || "标记通知失败，请稍后重试");
       }
@@ -10048,11 +10382,6 @@ ${cardFeedbackBarHtml()}`;
       return current;
     }
 
-    function delightContentUrl(delight) {
-      if (!delight) return "";
-      return contentUrl(delight);
-    }
-
     function delightSourceLink(delight) {
       return recommendationSourceLink(delight || {});
     }
@@ -10074,9 +10403,9 @@ ${cardFeedbackBarHtml()}`;
     function syncDelightThumbLink(delight) {
       const thumb = ensureDelightThumbAnchor();
       if (!thumb) return null;
-      const url = delightContentUrl(delight);
-      if (url) {
-        thumb.href = url;
+      const sourceLink = delightSourceLink(delight);
+      if (sourceLink.state === "exact" && sourceLink.url) {
+        thumb.href = sourceLink.url;
         thumb.target = "_blank";
         thumb.rel = "noopener noreferrer";
         thumb.removeAttribute("role");
@@ -10091,7 +10420,12 @@ ${cardFeedbackBarHtml()}`;
       thumb.setAttribute("role", "img");
       thumb.setAttribute("tabindex", "-1");
       thumb.setAttribute("aria-disabled", "true");
-      thumb.setAttribute("aria-label", "当前今日首选没有安全的原文链接");
+      thumb.setAttribute(
+        "aria-label",
+        sourceLink.state === "search"
+          ? "当前今日首选仅有来源检索入口，请使用检索来源按钮"
+          : "当前今日首选没有安全的原文链接"
+      );
       return thumb;
     }
 
@@ -10782,6 +11116,22 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function sendChat(message, options = {}) {
+      const surface = String(options.surface || "main");
+      if (chatSubmissionInFlight.has(surface)) return false;
+      const form = options.form instanceof HTMLFormElement
+        ? options.form
+        : document.getElementById(surface === "messages" ? "messageChatForm" : "chatForm");
+      const input = options.input instanceof HTMLInputElement
+        ? options.input
+        : document.getElementById(surface === "messages" ? "messageChatInput" : "chatInput");
+      const submitButton = form?.querySelector('button[type="submit"]');
+      chatSubmissionInFlight.add(surface);
+      form?.setAttribute("aria-busy", "true");
+      if (input) {
+        input.value = "";
+        input.disabled = true;
+      }
+      if (submitButton) submitButton.disabled = true;
       const payloadMessage = options.contextPrefix ? `${options.contextPrefix}\n\n${message}` : message;
       const replyToTurnId = dialogueContextSelection?.["reply_to_turn_id"] || "";
       state.chat.push({ role: "user", text: message });
@@ -10792,6 +11142,7 @@ ${cardFeedbackBarHtml()}`;
       });
       renderChat({ forceBottom: true });
       const payload = {
+        turn_id: createClientTurnId(`chat-${surface}`),
         session: SHARED_CHAT_SESSION,
         scope: options.scope || "chat",
         subject_id: options.subjectId || "",
@@ -10801,46 +11152,55 @@ ${cardFeedbackBarHtml()}`;
       };
       let turn;
       try {
-        turn = await requestJsonStrict(ENDPOINTS.chatTurns, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      } catch (error) {
-        retainedChatDraft = message;
-        const input = $("#chatInput");
-        if (input) input.value = message;
-        state.chat[state.chat.length - 1] = { role: "agent", text: contextErrorMessage(error) };
-        renderChat();
-        showToast(contextErrorMessage(error));
-        return;
-      }
-      if (!turn?.turn_id) {
-        state.chat[state.chat.length - 1] = { role: "agent", text: "当前没有连上后端，聊天没有提交成功。请检查 FastAPI 地址后重试。" };
-        renderChat();
-        showToast("聊天提交失败：后端不可用");
-        return;
-      }
-      await refreshDialogueTurns().catch(() => {});
-      void refreshDesktopPendingConfirmations().catch(() => {});
-      const startedAt = Date.now();
-      const poll = async () => {
-        const latest = await requestJson(`${ENDPOINTS.chatTurns}/${encodeURIComponent(turn.turn_id)}`);
-        if (latest?.status === "failed" || Date.now() - startedAt > 180000) {
-          if (latest?.status === "failed") await refreshDialogueTurns().catch(() => {});
-          else {
-            state.chat.push({ role: "agent", text: "聊天处理超时，稍后可以在历史里继续查看。" });
-            renderChat();
+        try {
+          turn = await requestJsonStrict(ENDPOINTS.chatTurns, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        } catch (error) {
+          if (surface === "main") retainedChatDraft = message;
+          if (input) input.value = message;
+          state.chat[state.chat.length - 1] = { role: "agent", text: contextErrorMessage(error) };
+          renderChat();
+          showToast(contextErrorMessage(error));
+          return false;
+        }
+        if (!turn?.turn_id) {
+          if (input) input.value = message;
+          state.chat[state.chat.length - 1] = { role: "agent", text: "当前没有连上后端，聊天没有提交成功。请检查 FastAPI 地址后重试。" };
+          renderChat();
+          showToast("聊天提交失败：后端不可用");
+          return false;
+        }
+        if (surface === "main") retainedChatDraft = "";
+        await refreshDialogueTurns().catch(() => {});
+        void refreshDesktopPendingConfirmations().catch(() => {});
+        const startedAt = Date.now();
+        const poll = async () => {
+          const latest = await requestJson(`${ENDPOINTS.chatTurns}/${encodeURIComponent(turn.turn_id)}`);
+          if (latest?.status === "failed" || Date.now() - startedAt > 180000) {
+            if (latest?.status === "failed") await refreshDialogueTurns().catch(() => {});
+            else {
+              state.chat.push({ role: "agent", text: "聊天处理超时，稍后可以在历史里继续查看。" });
+              renderChat();
+            }
+            return;
           }
-          return;
-        }
-        if (latest?.status === "completed" || latest?.reply) {
-          await refreshDialogueConfirmationSurface();
-          // 回复完成 ≠ 结算完成：锚归属（support/contradict/revise/answer）是在回复
-          // 之后由结算 worker 落库的，所以此刻卡片往往还停在 discussing。不补这一步，
-          // 用户说完「我认可修正版」后卡片会一直显示「正在聊这条」，直到手动刷新。
-          await refreshUntilDialogueCardsSettle();
-          return;
-        }
+          if (latest?.status === "completed" || latest?.reply) {
+            await refreshDialogueConfirmationSurface();
+            // 回复完成 ≠ 结算完成：锚归属（support/contradict/revise/answer）是在回复
+            // 之后由结算 worker 落库的，所以此刻卡片往往还停在 discussing。不补这一步，
+            // 用户说完「我认可修正版」后卡片会一直显示「正在聊这条」，直到手动刷新。
+            await refreshUntilDialogueCardsSettle();
+            return;
+          }
+          window.setTimeout(poll, 1200);
+        };
         window.setTimeout(poll, 1200);
-      };
-      window.setTimeout(poll, 1200);
+        return true;
+      } finally {
+        chatSubmissionInFlight.delete(surface);
+        form?.removeAttribute("aria-busy");
+        if (input) input.disabled = false;
+        if (submitButton) submitButton.disabled = false;
+      }
     }
 
     async function refreshRecommendations() {
@@ -13559,6 +13919,11 @@ ${cardFeedbackBarHtml()}`;
         if (!item) continue;
         const key = messageKey(item);
         if (!state.messages.some((msg) => messageKey(msg) === key)) state.messages.push(item);
+        if (
+          state.messageListSnapshot
+          && isMessagesDrawerOpen()
+          && !state.messageListSnapshot.some((msg) => messageKey(msg) === key)
+        ) state.messageListSnapshot.push(item);
       }
       renderMessages();
       applyRuntimeStatus({ unread_count: getRenderableMessages().length });
@@ -14214,10 +14579,6 @@ ${cardFeedbackBarHtml()}`;
         applyDelights(snapshot);
       }
 
-      function applyNotificationSnapshot(snapshot) {
-        if (snapshot?.item) mergeMessages([{ ...snapshot.item, type: "notification" }]);
-      }
-
       function applyChatSnapshot(snapshot) {
         // Use the same scoped durable-turn renderer as later refreshes. The
         // initial snapshot must not briefly show delight-only history or
@@ -14298,10 +14659,10 @@ ${cardFeedbackBarHtml()}`;
         refreshTrackedObservations({ silent: true }),
         requestJson(ENDPOINTS.health).then(applyHealthSnapshot),
         requestJson(ENDPOINTS.initStatus).then(applyInitStatusSnapshot),
-        requestJson(`${ENDPOINTS.activityFeed}?limit=5`).then(applyActivitySnapshot),
+        loadActivityPage({ reset: true }),
         requestJson(ENDPOINTS.profile).then(applyProfileSnapshot),
         fetchDelightQueue(),
-        requestJson(ENDPOINTS.notificationPending).then(applyNotificationSnapshot),
+        refreshPendingNotification(),
         requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&limit=100`).then(applyChatSnapshot),
         requestJson(`${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&scope=delight&limit=80`).then(applyDelightChatSnapshot),
         loadConfigSnapshot(),
@@ -14631,16 +14992,15 @@ ${cardFeedbackBarHtml()}`;
     }
 
     function applyHomeSearch(value) {
+      if (!isNewMaterialsSearchAvailable()) return false;
       const query = String(value || "");
-      if (state.homeMode === "events") eventWorkspaceController?.applySearch(query);
-      else {
-        state.query = query;
-        renderAll();
-      }
+      state.query = query;
+      renderAll();
       const desktopInput = $("#searchInput");
       const mobileInput = $("#mobileSearchInput");
       if (desktopInput && desktopInput.value !== query) desktopInput.value = query;
       if (mobileInput && mobileInput.value !== query) mobileInput.value = query;
+      return true;
     }
 
     safeBind("#sideDrawerBtn", "click", toggleSideDrawer);
@@ -14649,7 +15009,10 @@ ${cardFeedbackBarHtml()}`;
     safeBind("#mobileMenuBtn", "click", openMobileMenu);
     safeBind("#mobileMenuClose", "click", closeMobileMenu);
     safeBind("#mobileSearchInput", "input", (event) => applyHomeSearch(event.target.value));
-    safeBind("#mobileSearchForm", "submit", (event) => { event.preventDefault(); applyHomeSearch($("#mobileSearchInput")?.value || ""); closeMobileMenu(); });
+    safeBind("#mobileSearchForm", "submit", (event) => {
+      event.preventDefault();
+      if (applyHomeSearch($("#mobileSearchInput")?.value || "")) closeMobileMenu();
+    });
     document.querySelectorAll("[data-mobile-panel]").forEach((button) => {
       button.addEventListener("click", () => openMobilePanel(button.dataset.mobilePanel, { settingsPanel: button.dataset.settings }));
     });
@@ -14790,6 +15153,7 @@ ${cardFeedbackBarHtml()}`;
       returnToMessages();
       renderMessages();
       void refreshProfile().catch(() => {});
+      void refreshPendingNotification();
     });
     safeBind("#activityBtn", "click", () => { closeSideDrawer(); renderActivityHistory(); openPanel("activityDrawer"); });
     safeBind("#activityMoreBtn", "click", () => loadActivityPage());
@@ -14929,23 +15293,37 @@ ${cardFeedbackBarHtml()}`;
         : null;
       if (button instanceof HTMLButtonElement) void handleDesktopCardAction(button);
     });
-    safeBind("#chatForm", "submit", (event) => { event.preventDefault(); const input = $("#chatInput"); const text = input?.value?.trim() || ""; if (!text) return; input.value = ""; sendChat(text); });
+    safeBind("#chatForm", "submit", (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const input = $("#chatInput");
+      const text = input?.value?.trim() || "";
+      if (!text) return;
+      void sendChat(text, { surface: "main", form, input });
+    });
     safeBind("#messageChatBackBtn", "click", returnToMessages);
     safeBind("#messageChatForm", "submit", (event) => {
       event.preventDefault();
       const input = $("#messageChatInput");
       const text = input?.value?.trim() || "";
       if (!text) return;
-      input.value = "";
-      if (state.messageChatDomain && (state.messageChatScope === "probe" || state.messageChatScope === "avoidance_probe")) {
-        const probeType = state.messageChatScope === "avoidance_probe" ? "avoidance.probe" : "interest.probe";
-        state.handledProbeKeys.add(probeKey(probeType, state.messageChatDomain));
-      }
-      sendChat(text, {
+      const chatDomain = state.messageChatDomain;
+      const chatScope = state.messageChatScope;
+      const probeType = chatScope === "avoidance_probe" ? "avoidance.probe" : "interest.probe";
+      void sendChat(text, {
+        surface: "messages",
+        form: event.currentTarget,
+        input,
         contextPrefix: state.messageChatPrompt,
-        scope: state.messageChatScope,
-        subjectId: state.messageChatDomain,
+        scope: chatScope,
+        subjectId: chatDomain,
         subjectTitle: state.messageChatSubjectTitle
+      }).then((accepted) => {
+        if (
+          accepted
+          && chatDomain
+          && (chatScope === "probe" || chatScope === "avoidance_probe")
+        ) state.handledProbeKeys.add(probeKey(probeType, chatDomain));
       });
     });
     safeBind("#addLlmInstance", "click", () => openLlmInstanceDialog());
@@ -15155,6 +15533,43 @@ ${cardFeedbackBarHtml()}`;
       renderSettingsDirty();
     }
 
+    function settingsDomainOutcome(label, result) {
+      if (result.status === "fulfilled") return `${label}：写入请求已成功`;
+      const error = result.reason;
+      const detail = configErrorMessage(error?.details) || error?.message || "未知错误";
+      if (error?.code === "request_timeout" || error?.name === "TimeoutError" || error instanceof TypeError) {
+        return `${label}：写入结果暂时无法确认（${detail}）`;
+      }
+      return `${label}：写入失败或仅部分写入（${detail}）`;
+    }
+
+    async function reconcileSettingsAfterPartialSave() {
+      const reads = await Promise.allSettled([
+        requestJsonStrict(ENDPOINTS.config, { cache: "no-store", timeoutMs: 20000 }),
+        requestJsonStrict("/news/sources", { cache: "no-store", timeoutMs: 15000 }),
+        requestJsonStrict("/news/settings", { cache: "no-store", timeoutMs: 15000 }).catch((error) => {
+          if (error?.status === 404) return { unsupported: true };
+          throw error;
+        }),
+      ]);
+      if (reads.some((result) => result.status === "rejected")) {
+        const failed = ["通用配置", "新闻源", "新闻运行参数"]
+          .filter((_, index) => reads[index].status === "rejected")
+          .join("、");
+        return { ok: false, failed };
+      }
+      const configSnapshot = reads[0].value?.config || reads[0].value;
+      const sourceSnapshot = reads[1].value;
+      const runtimeSnapshot = reads[2].value?.unsupported
+        ? sourceSnapshot?.settings
+        : (reads[2].value?.settings || reads[2].value);
+      applyConfig(configSnapshot);
+      renderNewsSourceContracts(sourceSnapshot);
+      applyNewsRuntimeSettings(runtimeSnapshot);
+      clearSettingsDirty();
+      return { ok: true };
+    }
+
     ["input", "change"].forEach((type) => {
       $("#settingsForm")?.addEventListener(type, (event) => {
         const el = event.target;
@@ -15202,17 +15617,51 @@ ${cardFeedbackBarHtml()}`;
       const frontend = persistFrontendSettings();
       if ($("#configStatus")) $("#configStatus").value = `正在保存到 ${endpoint.host}:${endpoint.port}，惊喜队列加载 ${frontend.delightQueueLimit} 条，主题${THEME_LABELS[frontend.themeMode]}，滚动自动加载${frontend.autoLoadOnScroll ? "已开启" : "已关闭"}，后端热重载可能需要几秒。`;
       try {
-        await Promise.all([
+        const payload = buildConfigUpdate();
+        const domainResults = await Promise.allSettled([
           persistNewsSourceSettings(),
           persistNewsRuntimeSettings(),
-        ]);
-        const payload = buildConfigUpdate();
-        const result = await requestJsonStrict(ENDPOINTS.config, {
+          requestJsonStrict(ENDPOINTS.config, {
           method: "PUT",
           timeoutMs: 60000,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
-        });
+          }),
+        ]);
+        const failedDomains = domainResults.filter((result) => result.status === "rejected");
+        const result = domainResults[2].status === "fulfilled" ? domainResults[2].value : null;
+        if (failedDomains.length) {
+          if (result?.apply_state === "queued") {
+            settingsPendingApplyRevision = Math.max(
+              settingsPendingApplyRevision,
+              Number(result?.apply_revision || 0),
+            );
+          }
+          const reconciliation = await reconcileSettingsAfterPartialSave();
+          settingsSavePhase = "failed";
+          renderSettingsDirty();
+          const lines = [
+            "本机界面偏好：已保存",
+            settingsDomainOutcome("新闻源", domainResults[0]),
+            settingsDomainOutcome("新闻运行参数", domainResults[1]),
+            settingsDomainOutcome("模型与通用配置", domainResults[2]),
+            reconciliation.ok
+              ? "已严格重新读取本机当前状态；失败项已还原为后端实际值。"
+              : `重新核账未完成（${reconciliation.failed || "后端不可用"}读取失败）；表单仍保留为未确认状态。`,
+          ];
+          if ($("#configStatus")) {
+            $("#configStatus").setAttribute("role", "alert");
+            $("#configStatus").value = lines.join("\n");
+          }
+          showToast(
+            reconciliation.ok
+              ? "部分设置未保存，已重新核账"
+              : "部分设置结果不一致，重新核账失败",
+            { duration: 6200 },
+          );
+          if (result?.apply_state === "queued") void refreshConfigApplyStatus();
+          return;
+        }
         if (result?.config) applyConfig(result.config);
         else clearSettingsDirty();
         const message = result?.message || "配置已保存。";

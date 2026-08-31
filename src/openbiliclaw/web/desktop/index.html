@@ -46,8 +46,8 @@
           <span class="brand-copy"><span class="brand-title">NewsClaw</span><span class="brand-sub">你的本地新闻理解入口</span></span>
         </a>
       </div>
-      <form class="search" id="searchForm">
-        <input id="searchInput" type="search" placeholder="筛选当前已加载的推荐">
+      <form class="search" id="searchForm" hidden aria-hidden="true">
+        <input id="searchInput" type="search" placeholder="筛选当前已加载的新材料" disabled>
         <button type="submit">筛选</button>
       </form>
       <div class="top-actions" aria-label="状态与消息">
@@ -394,7 +394,7 @@
           <label class="monitoring-url-field"><span class="sr-only">网页或 PDF 地址</span><input id="monitoringUrlInput" type="url" maxlength="4096" required autocomplete="off" placeholder="粘贴公开网页或 PDF 地址"></label>
           <label><span class="sr-only">名称（可选）</span><input id="monitoringLabelInput" type="text" maxlength="500" autocomplete="off" placeholder="名称（可选）"></label>
           <label><span class="sr-only">检查频率</span><select id="monitoringIntervalSelect"><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440" selected>每天</option><option value="10080">每周</option></select></label>
-          <button class="pill-btn primary" id="monitoringAddBtn" type="submit">开始监控</button>
+          <button class="pill-btn primary" id="monitoringAddBtn" type="submit" disabled>开始监控</button>
         </form>
         <div class="monitoring-summary" aria-label="网页监控摘要">
           <div><span>正在监控</span><strong id="monitoringActiveCount">—</strong></div>
@@ -982,14 +982,14 @@
     </div>
   </div>
 
-  <section class="mobile-menu" id="mobileMenu" aria-label="手机菜单">
+  <section class="mobile-menu" id="mobileMenu" aria-label="手机菜单" aria-hidden="true">
     <div class="mobile-menu-panel">
       <div class="mobile-menu-head">
         <div><p class="eyebrow">NewsClaw</p><h2>菜单</h2></div>
         <button class="icon-btn" id="mobileMenuClose" type="button" aria-label="关闭手机菜单">×</button>
       </div>
-      <form class="mobile-search" id="mobileSearchForm">
-        <input id="mobileSearchInput" type="search" placeholder="筛选当前已加载的推荐">
+      <form class="mobile-search" id="mobileSearchForm" hidden aria-hidden="true">
+        <input id="mobileSearchInput" type="search" placeholder="筛选当前已加载的新材料" disabled>
         <button class="pill-btn dark" type="submit">筛选</button>
       </form>
       <div class="mobile-menu-list" aria-label="手机功能入口">
@@ -1030,7 +1030,7 @@
     </div>
   </section>
 
-  <section class="overlay" id="aboutOverlay" aria-label="关于新闻爪" data-od-id="about-newsclaw">
+  <section class="overlay" id="aboutOverlay" aria-label="关于新闻爪" aria-hidden="true" data-od-id="about-newsclaw">
     <div class="scrim" data-close="aboutOverlay"></div>
     <div class="modal-panel about-panel" role="dialog" aria-modal="true" aria-labelledby="aboutNewsClawTitle">
       <div class="modal-head">
@@ -1061,7 +1061,7 @@
     </div>
   </section>
 
-  <section class="drawer" id="messagesDrawer" aria-label="消息中心" data-od-id="messages-drawer">
+  <section class="drawer" id="messagesDrawer" aria-label="消息中心" aria-hidden="true" data-od-id="messages-drawer">
     <div class="scrim" data-close="messagesDrawer"></div>
     <div class="drawer-panel" id="messagesPanel">
       <div class="drawer-head" id="messagesHead"><button class="small-btn mobile-back-btn" data-mobile-back type="button">← 返回菜单</button><div><p class="eyebrow">Inbox</p><h2>消息</h2></div><button class="icon-btn" data-close="messagesDrawer" type="button">×</button></div>
@@ -1080,7 +1080,7 @@
     </div>
   </section>
 
-  <section class="drawer" id="mobileQrDrawer" aria-label="手机版入口" data-od-id="mobile-qr-drawer">
+  <section class="drawer" id="mobileQrDrawer" aria-label="手机版入口" aria-hidden="true" data-od-id="mobile-qr-drawer">
     <div class="scrim" data-close="mobileQrDrawer"></div>
     <div class="drawer-panel mobile-qr-panel">
       <div class="drawer-head"><div><p class="eyebrow">Mobile web</p><h2>手机上也能用</h2></div><button class="icon-btn" data-close="mobileQrDrawer" type="button">×</button></div>
@@ -1101,7 +1101,7 @@
     </div>
   </section>
 
-  <section class="drawer" id="activityDrawer" aria-label="动态历史" data-od-id="activity-drawer">
+  <section class="drawer" id="activityDrawer" aria-label="动态历史" aria-hidden="true" data-od-id="activity-drawer">
     <div class="scrim" data-close="activityDrawer"></div>
     <div class="drawer-panel">
       <div class="drawer-head"><button class="small-btn mobile-back-btn" data-mobile-back type="button">← 返回菜单</button><div><p class="eyebrow">Activity history</p><h2>动态历史</h2></div><button class="icon-btn" data-close="activityDrawer" type="button">×</button></div>

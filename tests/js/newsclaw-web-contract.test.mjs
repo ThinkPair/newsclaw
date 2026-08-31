@@ -324,14 +324,17 @@ test("today pick uses the canonical safe URL and explicit failed presentation", 
   const safeSource = functionSource("safeHttpContentUrl");
   const contentSource = functionSource("contentUrl");
   const sourceLinkSource = functionSource("recommendationSourceLink");
-  const delightSource = functionSource("delightContentUrl");
   const emptySource = functionSource("delightEmptyPresentation");
-  assert.ok(safeSource && contentSource && sourceLinkSource && delightSource && emptySource);
+  assert.ok(safeSource && contentSource && sourceLinkSource && emptySource);
   const helpers = new Function(
-    `${safeSource}\n${contentSource}\n${sourceLinkSource}\n${delightSource}\n${emptySource}; return { recommendationSourceLink, delightContentUrl, delightEmptyPresentation };`,
+    `${safeSource}\n${contentSource}\n${sourceLinkSource}\n${emptySource}; return { recommendationSourceLink, delightEmptyPresentation };`,
   )();
-  assert.equal(helpers.delightContentUrl({ content_url: "javascript:alert(1)", platform: "news" }), "");
-  assert.equal(helpers.delightContentUrl({ content_url: "https://example.com/news", platform: "news" }), "https://example.com/news");
+  const thumbStart = js.indexOf("function syncDelightThumbLink");
+  const thumbEnd = js.indexOf("function applyTurnToDelight", thumbStart);
+  const thumbSource = js.slice(thumbStart, thumbEnd);
+  assert.ok(thumbStart >= 0 && thumbEnd > thumbStart);
+  assert.match(thumbSource, /sourceLink\.state === "exact" && sourceLink\.url/);
+  assert.doesNotMatch(thumbSource, /contentUrl\(|delightContentUrl\(/);
   assert.deepEqual(
     helpers.recommendationSourceLink({ source_lookup_url: "https://www.bing.com/search?q=article", platform: "news" }),
     {
@@ -473,9 +476,11 @@ test("desktop pending notifications keep exact, search and missing source action
   assert.match(responder, /if \(response === "search"\) \{[\s\S]{0,220}?return;/);
   assert.match(responder, /if \(response === "missing"\) return;/);
   assert.match(responder, /if \(response === "view"\) \{\s*if \(sourceLink\.state !== "exact" \|\| !sourceLink\.url\) return;\s*trackRecommendationClick\(msg\);/);
-  assert.ok(responder.indexOf('if (response === "search")') < responder.indexOf("ENDPOINTS.notificationSent"));
-  assert.match(responder, /await requestJsonStrict\(ENDPOINTS\.notificationSent/);
-  assert.doesNotMatch(responder, /await requestJson\(ENDPOINTS\.notificationSent/);
+  assert.ok(responder.indexOf('if (response === "search")') < responder.indexOf("ENDPOINTS.notificationAck"));
+  assert.match(responder, /rememberPendingRequestId\("notification-ack", articleId\)/);
+  assert.match(responder, /await requestJsonStrict\(ENDPOINTS\.notificationAck/);
+  assert.match(responder, /article_id: articleId, request_id: pending\.requestId/);
+  assert.doesNotMatch(responder, /notificationSent|notifications\/sent/);
   assert.match(responder, /state\.messageListSnapshot = state\.messageListSnapshot\.filter/);
   assert.match(responder, /catch \(error\) \{[\s\S]{0,500}?标记通知失败/);
 });
