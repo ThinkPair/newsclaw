@@ -207,6 +207,47 @@ export function createDialogFocusController(options = {}) {
   };
 }
 
+/**
+ * Put focus back inside a dialog after its children were replaced.
+ *
+ * The focus trap is attached to the document and therefore survives an
+ * `innerHTML` rerender, but the focused child does not.  Browsers move focus to
+ * `body` when that child is detached, leaving keyboard users outside the still
+ * open modal until the next Tab press.  This helper repairs that exact seam
+ * without stealing focus when the active element already belongs to the dialog.
+ */
+export function restoreDialogFocusAfterRender(dialog, preferred = null, doc = globalThis.document) {
+  if (!dialog) return false;
+  if (dialog.contains?.(doc?.activeElement)) return false;
+  const fallback = dialog.querySelector?.(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+  );
+  const target = preferred || fallback || dialog;
+  if (typeof target?.focus !== "function") return false;
+  target.focus({ preventScroll: true });
+  return true;
+}
+
+/**
+ * Run an ordered mutation queue while retaining the uncertain mutation.
+ *
+ * A rejected request may have reached the server before its response was lost,
+ * so the failed item remains at the head of `remaining`.  Callers may safely
+ * retry that exact idempotent payload and continue with the unattempted tail;
+ * already confirmed mutations are never replayed.
+ */
+export async function runResumableMutationQueue(payloads, mutate) {
+  const queue = Array.isArray(payloads) ? [...payloads] : [];
+  for (let index = 0; index < queue.length; index += 1) {
+    try {
+      await mutate(queue[index]);
+    } catch (error) {
+      return { complete: false, remaining: queue.slice(index), error };
+    }
+  }
+  return { complete: true, remaining: [], error: null };
+}
+
 export function createDurableTaskTracker(options = {}) {
   const poll = options.poll;
   const now = options.now || Date.now;

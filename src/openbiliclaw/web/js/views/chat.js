@@ -28,7 +28,10 @@ import {
   respondToAvoidanceProbe,
 } from "../api.js";
 import { setUnreadCount, navigateToTab } from "../app.js";
-import { createDialogFocusController } from "../saved-sync-runtime.js";
+import {
+  createDialogFocusController,
+  restoreDialogFocusAfterRender,
+} from "../saved-sync-runtime.js";
 import {
   forgetHandledProbe,
   mergeProbeNotifications,
@@ -862,6 +865,8 @@ function renderOverlay() {
     });
     messagesFocusController.activate();
     closeBtn.focus();
+  } else {
+    restoreDialogFocusAfterRender(overlay, closeBtn);
   }
 
   // Bind probe actions
@@ -978,7 +983,16 @@ function monitorRequestId(action, deliveryId) {
 async function handleMonitorNotificationAction(item, action, card) {
   if (!item?.delivery_id || !["read", "dismiss"].includes(action)) return;
   const status = card?.querySelector(".message-card-status");
-  const pendingWindow = action === "read" ? window.open("about:blank", "_blank", "noopener") : null;
+  const monitorUrl = `${globalThis.location?.origin || ""}/web/#library/monitoring`;
+  // Open synchronously while the click gesture is active. Passing `noopener`
+  // in windowFeatures makes some browsers intentionally return null even when
+  // the tab opened, so we detach the opener immediately after obtaining the
+  // real handle instead. A blocked window must not consume the notification.
+  const pendingWindow = action === "read" ? window.open(monitorUrl, "_blank") : null;
+  if (action === "read" && !pendingWindow) {
+    if (status) status.textContent = "浏览器阻止了新窗口，消息已保留；请允许弹窗后重试。";
+    return;
+  }
   if (pendingWindow) pendingWindow.opener = null;
   card?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   if (status) status.textContent = action === "read" ? "正在打开…" : "正在忽略…";
@@ -991,16 +1005,14 @@ async function handleMonitorNotificationAction(item, action, card) {
     monitorNotificationRequestIds.delete(`${action}:${item.delivery_id}`);
     monitorNotifications = monitorNotifications.filter((candidate) => candidate.delivery_id !== item.delivery_id);
     updateBadgeCount();
-    if (action === "read") {
-      const monitorUrl = `${globalThis.location?.origin || ""}/web/#library/monitoring`;
-      if (pendingWindow) pendingWindow.location.replace(monitorUrl);
-      else openContentUrl(monitorUrl);
-    }
     renderOverlay();
   } catch {
-    pendingWindow?.close?.();
     card?.querySelectorAll("button").forEach((button) => { button.disabled = false; });
-    if (status) status.textContent = "操作失败，消息已保留，请重试。";
+    if (status) {
+      status.textContent = action === "read"
+        ? "监控页已打开，但确认失败；消息已保留，请重试。"
+        : "操作失败，消息已保留，请重试。";
+    }
   }
 }
 

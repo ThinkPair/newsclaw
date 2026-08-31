@@ -22,6 +22,7 @@ import {
   getProbeMessageActions,
   formatRelativeTimestamp,
 } from "../view-models.js";
+import { runResumableMutationQueue } from "../saved-sync-runtime.js";
 import { state, patchState } from "../state.js";
 import {
   filterVisibleProbes,
@@ -522,6 +523,11 @@ function clearEditUndo() {
   editUndo = null;
 }
 
+function stopEditUndoTimer() {
+  if (editUndoTimer !== null) window.clearTimeout(editUndoTimer);
+  editUndoTimer = null;
+}
+
 function offerEditUndo(payloads, label) {
   clearEditUndo();
   editUndo = { payloads, label };
@@ -681,7 +687,7 @@ function renderEditPanelHtml() {
   if (editNotice || editUndo) {
     html += `<div class="profile-edit-feedback" data-tone="${escAttr(editNotice?.tone || "success")}" role="status" aria-live="polite">
       <span>${esc(editNotice?.text || "")}</span>
-      ${editUndo ? `<button type="button" data-edit-undo="1">撤销删除「${esc(editUndo.label)}」</button>` : ""}
+      ${editUndo ? `<button type="button" data-edit-undo="1" ${editUndo.inFlight ? "disabled" : ""}>${editUndo.inFlight ? "正在撤销…" : `撤销删除「${esc(editUndo.label)}」`}</button>` : ""}
     </div>`;
   }
   if (!editState) {
@@ -715,14 +721,34 @@ function bindEditActions() {
 
   $root.querySelector("[data-edit-undo]")?.addEventListener("click", async () => {
     const pending = editUndo;
-    if (!pending) return;
-    clearEditUndo();
-    try {
-      for (const payload of pending.payloads) await submitProfileEdit(payload);
-      editState = await fetchEditState();
-      editNotice = { tone: "success", text: `已撤销删除「${pending.label}」。` };
-    } catch {
-      editNotice = { tone: "error", text: "撤销失败，当前画像状态已重新读取；请重试添加。" };
+    if (!pending || pending.inFlight) return;
+    stopEditUndoTimer();
+    editUndo = { ...pending, inFlight: true };
+    editNotice = { tone: "success", text: `正在撤销删除「${pending.label}」…` };
+    render();
+    const result = await runResumableMutationQueue(pending.payloads, submitProfileEdit);
+    if (result.complete) {
+      clearEditUndo();
+      try {
+        editState = await fetchEditState();
+        editNotice = { tone: "success", text: `已撤销删除「${pending.label}」。` };
+      } catch {
+        // Every restore mutation is already confirmed.  A follow-up read
+        // failure must not turn a completed undo into an unhandled rejection.
+        editNotice = {
+          tone: "success",
+          text: `已撤销删除「${pending.label}」，画像刷新暂时失败；重新打开后会同步。`,
+        };
+      }
+    } else {
+      // Keep the failed (possibly applied) payload and every unattempted item.
+      // Profile add mutations are idempotent, so retrying the exact remaining
+      // queue finishes the restore without replaying confirmed items.
+      editUndo = { ...pending, payloads: result.remaining, inFlight: false };
+      editNotice = {
+        tone: "error",
+        text: `撤销尚未全部完成，剩余 ${result.remaining.length} 项；请再次点撤销继续。`,
+      };
       try { editState = await fetchEditState(); } catch { /* keep current editState */ }
     }
     render();

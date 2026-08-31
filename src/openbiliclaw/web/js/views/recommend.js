@@ -57,7 +57,11 @@ import {
   escapeHtmlAttribute,
 } from "../view-models.js";
 import { openContentUrl } from "../app-launch.js";
-import { createDialogFocusController, createSavedMutationRegistry } from "../saved-sync-runtime.js";
+import {
+  createDialogFocusController,
+  createSavedMutationRegistry,
+  restoreDialogFocusAfterRender,
+} from "../saved-sync-runtime.js";
 
 const dialogueConfirmation = globalThis.NewsClawDialogueConfirmation;
 if (!dialogueConfirmation) {
@@ -1487,7 +1491,11 @@ function renderCard(rawItem, index = 0) {
   // Whole card click (except action row)
   if (sourceLink.state === "exact" && url) {
     card.style.cursor = "pointer";
-    card.addEventListener("click", () => {
+    card.addEventListener("click", (event) => {
+      // The explanation is an interactive disclosure, not a source link.
+      // Guard the whole subtree so tapping <summary> or selecting its text
+      // cannot bubble into the card-level "open original" action.
+      if (event.target?.closest?.(".card-explanation")) return;
       reportClick(buildRecommendationClickPayload(item, url));
       openContentUrl(url);
     });
@@ -1633,6 +1641,8 @@ function renderFeedbackSheet() {
     });
     feedbackFocusController.activate();
     overlay.querySelector("#feedback-note")?.focus();
+  } else {
+    restoreDialogFocusAfterRender(overlay, overlay.querySelector("#feedback-note"));
   }
 }
 

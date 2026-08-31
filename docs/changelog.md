@@ -33,6 +33,7 @@
 - **NewsClaw 本机受控 Tavily Research MVP**：新增按需 Search/Extract、独立 `newsclaw_research.db` 证据账本与 general 24h / news 30m / finance 15m TTL 缓存。Search 固定 basic 与 `chunks_per_source=1`、默认 5 条且上限 8 条，关闭 answer/raw content/images/auto parameters；Extract 要求问题和 1–3 个显式公开 HTTP(S) URL，basic 模式每来源默认 2、上限 3 个片段。新增 Tavily 凭据状态/本机写入删除、`/api/research/providers/tavily/probe`、`/api/research/search`、`/api/research/extract`，以及 Agent Bridge `research-search` / `research-extract`；桌面设置卡片明确标为“不是新闻源”，可查看脱敏状态、保存/删除 Key，并通过本机 probe 调用 Tavily 官方 `GET /usage` 验证连接和额度，不发送 Search、不消耗搜索 credit，只返回脱敏的 `key_usage` / `key_limit` / `account_plan` / `plan_usage` / `plan_limit`。Phase 1 研究交互只开放 DSH Agent 工具与后端 REST；桌面无研究问题/结果 UI，手机/PWA 和浏览器扩展无研究按钮且不持有 Key。Key 仅留在私有 runtime 或 `TAVILY_API_KEY` 环境回退。研究结果只作为带 URL 的外部证据，不自动写画像、新闻候选或推荐池。
 - **私有源码备份安全边界**：GitHub 源码快照不包含视觉验收截图、本地调试证据、运行数据和机器路径；视觉 QA 文档只保留可复核的视口、方法与结论，避免把真实画像、活动记录或推荐内容带入源码历史。专业密钥扫描命中的文档示例、测试假值与上游公开匿名客户端标识均已逐行说明，不使用整文件或整目录豁免。
 - **移动端新闻原生闭环**：共享 URL 投影在新闻或普通网页条目缺少原文地址时不再把兼容内容 ID 拼成 B 站视频链接；显式原文地址照常打开，旧 B 站视频回退保持兼容。移动画像中的“UP/UP主”用户文案统一为“媒体/记者”。
+- **移动端与插件交互闭环**：推荐卡展开「查看解读」不再误触整卡打开原文；消息抽屉只有确认监控页实际打开后才提交确认，弹窗被拦或确认失败时保留消息；消息/反馈弹层重绘后恢复弹层内焦点，插件设置保存后恢复入口焦点。画像多步撤销改为可继续队列，中途失败会保留失败项与未执行项供重试。
 - 数据隔离边界：NewsClaw 模式的待发通知、30 天内容历史、收藏 / 稍后读（含兼容列表与状态查询）和活动流只投影 `news` 内容；分页游标与总数在过滤后计算，旧视频行不会造成首屏假空。新闻爪迁移包新增产品标记，导入时 fail-closed 拒绝未标记的 OpenBiliClaw 包，避免把旧视频行为与画像带入新闻产品；普通 OpenBiliClaw 模式保持原查询和迁移兼容行为。
 - 可见文案边界：NewsClaw 模式的活动摘要、认知更新与新画像事件统一使用“新闻爪”，不再暴露 OpenBiliClaw 的“阿B”助手称呼；历史视频型兴趣猜测在新闻画像中安全隐藏，内容库明确为本机保存，旧数据不删除。
 
@@ -4947,7 +4948,7 @@ AI agent（Claude / Codex / Cursor / OpenClaw）跑一句话装机时会读这�
 - 新增 `ContinuousRefreshController`，在本地 API 运行时按“事件触发 + 定时保底”持续刷新候选池，并分层调度 Search/Related、Trending、Explore 策略
 - 新增 `discovery_runtime.json`，持久化最近刷新时间、最近处理事件 ID 和最近通知时间
 - `content_cache` 新增 `last_scored_at`、`notification_sent`、`notified_at`，用于候选保鲜和通知去重
-- 新增 `/api/runtime-status` 与 `/api/notifications/pending`、`/api/notifications/sent`，popup 和 service worker 可分别读取运行状态、拉取待发通知并确认送达
+- 新增 `/api/runtime-status` 与 `/api/notifications/pending`、`/api/notifications/ack`，popup 和 service worker 可分别读取运行状态、拉取待发通知，并用 `article_id + request_id` 幂等确认；旧 `/api/notifications/sent` 只作后端兼容
 - popup 现在会区分“未初始化 / 正在补货 / 推荐可用”三态，service worker 会对高置信且未通知的推荐触发浏览器通知并回写已发送状态
 
 ### Gemini Provider 支持 — `gemini-provider`

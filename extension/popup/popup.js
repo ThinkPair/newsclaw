@@ -259,7 +259,9 @@ $("#settingsForm").addEventListener("submit", async (event) => {
     connectionGeneration += 1;
     await storageSet(endpoint);
     activeEndpoint = endpoint;
-    closeSettings({ restoreFocus: false });
+    // The connection panel remains alive in side-panel and standalone popup
+    // contexts, so a successful save must return keyboard focus to its opener.
+    closeSettings();
     await connect({ allowDevelopmentFallback: false });
   } catch (error) {
     stateCard.hidden = false;

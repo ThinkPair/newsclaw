@@ -21,7 +21,13 @@ def test_mobile_message_drawer_merges_durable_monitor_notifications() -> None:
     assert '"delivered"' in chat and '"read"' in chat and '"dismiss"' in chat
     assert "monitorNotificationRequestIds.get(key)" in chat
     assert "操作失败，消息已保留，请重试。" in chat
+    assert "浏览器阻止了新窗口，消息已保留" in chat
     assert "/web/#library/monitoring" in chat
+    assert 'window.open(monitorUrl, "_blank")' in chat
+    assert 'window.open("about:blank", "_blank", "noopener")' not in chat
+    assert chat.index('window.open(monitorUrl, "_blank")') < chat.index(
+        "await actOnMonitorNotification("
+    )
 
 
 def test_mobile_notification_ack_uses_article_identity_and_stable_retry_key() -> None:
@@ -39,6 +45,7 @@ def test_mobile_notification_ack_uses_article_identity_and_stable_retry_key() ->
 def test_mobile_failed_mutations_remain_visible_and_recoverable() -> None:
     recommend = read("src/openbiliclaw/web/js/views/recommend.js")
     profile = read("src/openbiliclaw/web/js/views/profile.js")
+    runtime = read("src/openbiliclaw/web/js/saved-sync-runtime.js")
 
     assert "换一批失败，当前内容已保留" in recommend
     assert "reconcileRecommendationReplacement" in recommend
@@ -47,7 +54,10 @@ def test_mobile_failed_mutations_remain_visible_and_recoverable() -> None:
     assert "撤销删除" in profile
     assert "8000" in profile
     assert "specifics.map(editSpecificName)" in profile
-    assert "for (const payload of pending.payloads)" in profile
+    assert "runResumableMutationQueue" in profile
+    assert "result.remaining" in profile
+    assert "撤销尚未全部完成" in profile
+    assert "export async function runResumableMutationQueue" in runtime
 
 
 def test_mobile_dialog_focus_density_and_source_status_contract() -> None:
@@ -60,8 +70,11 @@ def test_mobile_dialog_focus_density_and_source_status_contract() -> None:
     assert 'aria-label", "查看新闻源状态"' in app
     assert "createDialogFocusController" in chat
     assert "createDialogFocusController" in recommend
+    assert "restoreDialogFocusAfterRender" in chat
+    assert "restoreDialogFocusAfterRender" in recommend
     assert '<details class="card-explanation">' in recommend
     assert "<summary>查看解读</summary>" in recommend
+    assert 'closest?.(".card-explanation")' in recommend
     assert ".card-explanation" in css
     assert "background: var(--bg-base)" in css
 
@@ -78,3 +91,4 @@ def test_extension_keeps_monitor_entry_in_degraded_state_and_traps_focus() -> No
     assert 'event.key === "Escape"' in popup
     assert 'event.key !== "Tab"' in popup
     assert "settingsOpener?.focus?.()" in popup
+    assert "closeSettings();\n    await connect" in popup
