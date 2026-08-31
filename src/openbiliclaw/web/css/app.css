@@ -577,10 +577,28 @@ body.chat-view-active .back-to-top {
   font-size: 12.5px;
   line-height: 1.6;
   color: var(--text-secondary);
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+}
+
+.card-explanation {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.card-explanation summary {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+}
+
+.card-explanation summary::-webkit-details-marker { display: none; }
+.card-explanation summary::after { content: "＋"; margin-left: auto; }
+.card-explanation[open] summary::after { content: "－"; }
+.card-explanation[open] .card-expression { margin-top: 0; padding-bottom: 4px; }
 }
 
 /* ── Recommend Header ─────────────────────────────────────── */
@@ -1225,6 +1243,30 @@ body.chat-view-active .back-to-top {
   color: var(--text-muted);
   line-height: 1.6;
   margin-bottom: 12px;
+}
+.profile-edit-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  color: #1a7a4a;
+  background: var(--lime-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.profile-edit-feedback[data-tone="error"] { color: var(--danger); background: rgba(239, 122, 134, 0.12); }
+.profile-edit-feedback button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
 }
 .edit-field {
   background: var(--surface);
@@ -2819,7 +2861,7 @@ body.chat-view-active .back-to-top {
 .saved-empty-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.6; }
 .saved-empty-text { font-size: 13px; line-height: 1.6; }
 
-.mobile-settings-overlay { position: fixed; inset: 0; z-index: 100; overflow-y: auto; background: var(--bg); padding: 20px 16px calc(24px + env(safe-area-inset-bottom)); }
+.mobile-settings-overlay { position: fixed; inset: 0; z-index: 100; overflow-y: auto; background: var(--bg-base); padding: 20px 16px calc(24px + env(safe-area-inset-bottom)); }
 .mobile-settings-card { max-width: 560px; margin: 0 auto; padding: 18px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); }
 .mobile-settings-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
 .mobile-settings-close, .mobile-settings-save, .mobile-settings-retry { min-width: 44px; min-height: 44px; border: 0; border-radius: 10px; cursor: pointer; }

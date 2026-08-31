@@ -154,6 +154,7 @@ def test_mobile_deep_link_fallback_cannot_keep_an_opener() -> None:
 
 def test_mobile_pending_notifications_use_truthful_source_actions() -> None:
     chat_js = (ROOT / "src/openbiliclaw/web/js/views/chat.js").read_text(encoding="utf-8")
+    api_js = (ROOT / "src/openbiliclaw/web/js/api.js").read_text(encoding="utf-8")
     action_handler = chat_js[
         chat_js.index("async function handleNewsNotificationAction") : chat_js.index(
             "function updateBadgeCount"
@@ -178,3 +179,10 @@ def test_mobile_pending_notifications_use_truthful_source_actions() -> None:
     assert "openContentUrl(sourceLink.url)" in search_branch
     assert "ackNotification" not in search_branch
     assert "reportClick" not in search_branch
+    assert 'requestJson("/notifications/ack"' in api_js
+    assert "article_id: articleId" in api_js
+    assert "request_id: requestId" in api_js
+    assert 'requestJson("/notifications/sent"' not in api_js
+    assert "newsNotificationRequestIds.get(articleId)" in action_handler
+    assert "newsNotificationRequestIds.set(articleId, stableRequestId)" in action_handler
+    assert "await ackNotification(articleId, stableRequestId)" in action_handler

@@ -201,6 +201,12 @@ def test_news_actions_use_article_identity_and_replay_after_restart(
     assert opened.json()["duplicate"] is False
     assert acknowledged.status_code == 200, acknowledged.text
     assert acknowledged.json()["duplicate"] is False
+    missing_ack = client.post(
+        "/api/notifications/ack",
+        json={"article_id": "article-does-not-exist", "request_id": "notification-missing-001"},
+    )
+    assert missing_ack.status_code == 404
+    assert missing_ack.json()["detail"] == "Notification article was not found."
     assert database.get_saved_membership("favorite", "news:article-001") is not None
     removed_watch_later = client.delete("/api/watch-later/article-001")
     assert removed_watch_later.status_code == 200

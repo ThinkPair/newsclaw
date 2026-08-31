@@ -16,12 +16,17 @@ const settingsPanel = $("#settingsPanel");
 const endpointInput = $("#endpointInput");
 let activeEndpoint = DEFAULT_ENDPOINT;
 let connectionGeneration = 0;
+let settingsOpener = null;
+
+const SETTINGS_FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
 
 function resetMonitorBadge() {
   monitorButton.hidden = true;
+  monitorButton.classList.remove("degraded");
   monitorBadge.hidden = true;
   monitorBadge.textContent = "";
   monitorButton.setAttribute("aria-label", "打开网页监控");
+  monitorButton.title = "打开网页监控";
 }
 
 function normalizeEndpoint(raw) {
@@ -118,13 +123,19 @@ async function refreshMonitorBadge(
     if (generation !== connectionGeneration || endpoint !== activeEndpoint) return;
     const count = Math.max(0, Number(payload?.unread_count || 0));
     monitorButton.hidden = false;
+    monitorButton.classList.remove("degraded");
     monitorBadge.textContent = count > 99 ? "99+" : String(count);
     monitorBadge.hidden = count <= 0;
     monitorButton.setAttribute("aria-label", count ? `网页监控，${count} 条未读变化` : "打开网页监控");
+    monitorButton.title = "打开网页监控";
   } catch {
     if (generation !== connectionGeneration || endpoint !== activeEndpoint) return;
-    monitorButton.hidden = true;
+    monitorButton.hidden = false;
+    monitorButton.classList.add("degraded");
     monitorBadge.hidden = true;
+    monitorBadge.textContent = "";
+    monitorButton.setAttribute("aria-label", "网页监控状态暂不可用，仍可打开监控页");
+    monitorButton.title = "监控状态暂不可用，点击查看";
   } finally {
     clearTimeout(timeout);
   }
@@ -190,15 +201,46 @@ async function connect({ allowDevelopmentFallback = true } = {}) {
   showOffline(activeEndpoint, lastReason);
 }
 
-function openSettings() {
+function openSettings(event) {
+  settingsOpener = event?.currentTarget || document.activeElement;
   endpointInput.value = activeEndpoint;
   settingsPanel.hidden = false;
   endpointInput.focus();
 }
 
-function closeSettings() {
+function closeSettings({ restoreFocus = true } = {}) {
   settingsPanel.hidden = true;
+  if (restoreFocus) settingsOpener?.focus?.();
+  settingsOpener = null;
 }
+
+settingsPanel.addEventListener("click", (event) => {
+  if (event.target === settingsPanel) closeSettings();
+});
+
+settingsPanel.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSettings();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const nodes = [...settingsPanel.querySelectorAll(SETTINGS_FOCUSABLE)].filter(node => !node.hidden);
+  if (!nodes.length) {
+    event.preventDefault();
+    settingsPanel.focus();
+    return;
+  }
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
 $("#retryButton").addEventListener("click", () => void connect());
 $("#settingsButton").addEventListener("click", openSettings);
@@ -217,7 +259,7 @@ $("#settingsForm").addEventListener("submit", async (event) => {
     connectionGeneration += 1;
     await storageSet(endpoint);
     activeEndpoint = endpoint;
-    closeSettings();
+    closeSettings({ restoreFocus: false });
     await connect({ allowDevelopmentFallback: false });
   } catch (error) {
     stateCard.hidden = false;

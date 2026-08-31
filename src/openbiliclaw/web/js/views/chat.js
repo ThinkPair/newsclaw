@@ -15,6 +15,8 @@ import {
   fetchProfileSummary,
   fetchActivityFeed,
   fetchPendingNotifications,
+  fetchMonitorNotifications,
+  actOnMonitorNotification,
   fetchPendingProbes,
   fetchPendingAvoidanceProbes,
   ackNotification,
@@ -26,6 +28,7 @@ import {
   respondToAvoidanceProbe,
 } from "../api.js";
 import { setUnreadCount, navigateToTab } from "../app.js";
+import { createDialogFocusController } from "../saved-sync-runtime.js";
 import {
   forgetHandledProbe,
   mergeProbeNotifications,
@@ -113,8 +116,13 @@ let pendingConfirmations = {
 let overlayOpen = false;
 let notifications = [];
 let newsNotifications = [];
+let monitorNotifications = [];
 let delightMsgs = [];
+let messagesOpener = null;
+let messagesFocusController = null;
 const pendingProbeActions = new Map();
+const newsNotificationRequestIds = new Map();
+const monitorNotificationRequestIds = new Map();
 
 function pendingProbeAction(type, domain) {
   return pendingProbeActions.get(probeNotificationKey(type, domain)) || null;
@@ -707,8 +715,12 @@ function renderOverlay() {
   if (!overlay) {
     overlay = document.createElement("div");
     overlay.className = "messages-overlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "消息");
+    overlay.tabIndex = -1;
     overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) toggleMessages();
+      if (e.target === overlay) closeMessages();
     });
     document.body.appendChild(overlay);
   }
@@ -716,6 +728,9 @@ function renderOverlay() {
 
   if (!overlayOpen) {
     overlay.innerHTML = "";
+    messagesFocusController?.deactivate();
+    messagesFocusController = null;
+    messagesOpener = null;
     return;
   }
 
@@ -729,13 +744,40 @@ function renderOverlay() {
   const closeBtn = document.createElement("button");
   closeBtn.className = "messages-close";
   closeBtn.textContent = "\u2715";
+  closeBtn.type = "button";
+  closeBtn.setAttribute("aria-label", "关闭消息");
   closeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    overlayOpen = false;
-    renderOverlay();
+    closeMessages();
   });
   header.appendChild(closeBtn);
   panel.appendChild(header);
+
+  for (const n of monitorNotifications) {
+    const card = document.createElement("div");
+    card.className = `message-card is-monitor-notification${n.kind === "failure" ? " is-monitor-failure" : ""}`;
+    card.dataset.monitorDeliveryId = n.delivery_id;
+    const typeLabel = n.kind === "failure"
+      ? "监控需要处理"
+      : n.kind === "recovered"
+        ? "监控恢复正常"
+        : "正文发生变化";
+    card.innerHTML = `
+      <div class="message-card-type">${esc(typeLabel)}</div>
+      <div class="message-card-title">${esc(n.title || n.label || n.display_url || "网页监控更新")}</div>
+      ${n.body ? `<div class="message-card-body">${esc(n.body)}</div>` : ""}
+      <div class="message-card-status" role="status" aria-live="polite"></div>
+      <div class="message-card-actions">
+        <button type="button" class="message-action-btn primary" data-monitor-action="read">查看监控</button>
+        <button type="button" class="message-action-btn secondary" data-monitor-action="dismiss">忽略</button>
+      </div>`;
+    card.querySelectorAll("[data-monitor-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        void handleMonitorNotificationAction(n, button.dataset.monitorAction, card);
+      });
+    });
+    panel.appendChild(card);
+  }
 
   // High-confidence news notifications. Source navigation remains truthful:
   // only exact URLs consume the notification as viewed, while a title search
@@ -797,7 +839,7 @@ function renderOverlay() {
     panel.appendChild(card);
   }
 
-  if (newsNotifications.length === 0 && notifications.length === 0) {
+  if (monitorNotifications.length === 0 && newsNotifications.length === 0 && notifications.length === 0) {
     const emptyState = document.createElement("div");
     emptyState.className = "messages-empty-state";
     emptyState.innerHTML = `
@@ -812,6 +854,15 @@ function renderOverlay() {
 
   overlay.innerHTML = "";
   overlay.appendChild(panel);
+  if (!messagesFocusController) {
+    messagesFocusController = createDialogFocusController({
+      dialog: overlay,
+      opener: messagesOpener,
+      onClose: closeMessages,
+    });
+    messagesFocusController.activate();
+    closeBtn.focus();
+  }
 
   // Bind probe actions
   for (const btn of panel.querySelectorAll("[data-probe]")) {
@@ -913,6 +964,52 @@ function renderOverlay() {
   }
 }
 
+function monitorRequestId(action, deliveryId) {
+  const key = `${action}:${deliveryId}`;
+  let stableRequestId = monitorNotificationRequestIds.get(key);
+  if (!stableRequestId) {
+    const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    stableRequestId = `mobile:monitor:${action}:${deliveryId}:${random}`;
+    monitorNotificationRequestIds.set(key, stableRequestId);
+  }
+  return stableRequestId;
+}
+
+async function handleMonitorNotificationAction(item, action, card) {
+  if (!item?.delivery_id || !["read", "dismiss"].includes(action)) return;
+  const status = card?.querySelector(".message-card-status");
+  const pendingWindow = action === "read" ? window.open("about:blank", "_blank", "noopener") : null;
+  if (pendingWindow) pendingWindow.opener = null;
+  card?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  if (status) status.textContent = action === "read" ? "正在打开…" : "正在忽略…";
+  try {
+    await actOnMonitorNotification(
+      item.delivery_id,
+      action,
+      monitorRequestId(action, item.delivery_id),
+    );
+    monitorNotificationRequestIds.delete(`${action}:${item.delivery_id}`);
+    monitorNotifications = monitorNotifications.filter((candidate) => candidate.delivery_id !== item.delivery_id);
+    updateBadgeCount();
+    if (action === "read") {
+      const monitorUrl = `${globalThis.location?.origin || ""}/web/#library/monitoring`;
+      if (pendingWindow) pendingWindow.location.replace(monitorUrl);
+      else openContentUrl(monitorUrl);
+    }
+    renderOverlay();
+  } catch {
+    pendingWindow?.close?.();
+    card?.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+    if (status) status.textContent = "操作失败，消息已保留，请重试。";
+  }
+}
+
+function closeMessages() {
+  if (!overlayOpen) return;
+  overlayOpen = false;
+  renderOverlay();
+}
+
 async function handleNewsNotificationAction(item, action, card) {
   const sourceLink = getRecommendationSourceLink(item);
   if (action === "search") {
@@ -927,7 +1024,16 @@ async function handleNewsNotificationAction(item, action, card) {
   }
   card?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   try {
-    await ackNotification(item.bvid);
+    const articleId = String(item.article_id || item.content_id || item.bvid || "").trim();
+    if (!articleId) throw new Error("通知缺少文章标识");
+    let stableRequestId = newsNotificationRequestIds.get(articleId);
+    if (!stableRequestId) {
+      const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      stableRequestId = `mobile:notification:ack:${articleId}:${random}`;
+      newsNotificationRequestIds.set(articleId, stableRequestId);
+    }
+    await ackNotification(articleId, stableRequestId);
+    newsNotificationRequestIds.delete(articleId);
     newsNotifications = newsNotifications.filter((candidate) => candidate.bvid !== item.bvid);
     updateBadgeCount();
     renderOverlay();
@@ -939,9 +1045,9 @@ async function handleNewsNotificationAction(item, action, card) {
 }
 
 function updateBadgeCount() {
-  const msgs = { notifications: [...newsNotifications, ...notifications], delights: [] };
+  const msgs = { notifications: [...monitorNotifications, ...newsNotifications, ...notifications], delights: [] };
   patchState({ messages: msgs });
-  setUnreadCount(newsNotifications.length + notifications.length);
+  setUnreadCount(monitorNotifications.length + newsNotifications.length + notifications.length);
 }
 
 // ── Load ─────────────────────────────────────────────────────
@@ -1039,8 +1145,9 @@ async function refreshAfterChatTurn() {
 
 export async function loadNotifications({ includeDelights = false } = {}) {
   try {
-    const [notifData, probeData, avoidanceProbeData, delightData] = await Promise.all([
+    const [notifData, monitorData, probeData, avoidanceProbeData, delightData] = await Promise.all([
       fetchPendingNotifications().catch(() => null),
+      fetchMonitorNotifications().catch(() => null),
       fetchPendingProbes().catch(() => []),
       fetchPendingAvoidanceProbes().catch(() => []),
       includeDelights ? fetchDelightBatch().catch(() => []) : Promise.resolve(delightMsgs),
@@ -1053,6 +1160,18 @@ export async function loadNotifications({ includeDelights = false } = {}) {
         : []),
     ];
     notifications = mergeProbeNotifications(probes, notifications);
+    if (monitorData !== null) {
+      monitorNotifications = Array.isArray(monitorData?.items)
+        ? monitorData.items.filter((item) => item?.delivery_id && !item.read_at && !item.dismissed_at)
+        : [];
+      void Promise.allSettled(monitorNotifications.map((item) =>
+        actOnMonitorNotification(
+          item.delivery_id,
+          "delivered",
+          `mobile:monitor:delivered:${item.delivery_id}`,
+        )
+      ));
+    }
     if (notifData !== null) {
       const pendingNews = notifData?.item;
       newsNotifications = pendingNews
@@ -1090,9 +1209,10 @@ export function initChatView(root) {
   loadHistory();
 }
 
-export async function toggleMessages() {
+export async function toggleMessages(opener = null) {
   overlayOpen = !overlayOpen;
   if (overlayOpen) {
+    messagesOpener = opener || document.activeElement;
     renderOverlay();          // show panel immediately (loading state)
     await loadNotifications({ includeDelights: true });
     renderOverlay();          // re-render with actual data

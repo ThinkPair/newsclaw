@@ -141,14 +141,14 @@ function renderStatusBar() {
   badge.dataset.count = unread;
   badge.textContent = unread > 0 ? (unread > 99 ? "99+" : String(unread)) : "";
   bell.appendChild(badge);
-  bell.addEventListener("click", () => toggleMessages());
+  bell.addEventListener("click", () => toggleMessages(bell));
   right.appendChild(bell);
 
   const settings = document.createElement("button");
   settings.id = "mobile-settings-button";
   settings.className = "badge-btn";
   settings.type = "button";
-  settings.setAttribute("aria-label", "打开新闻源设置");
+  settings.setAttribute("aria-label", "查看新闻源状态");
   settings.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5v.2h-4v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1-2.8-2.8.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3v-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1 2.8-2.8.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3h4v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1 2.8 2.8-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.2v4h-.2a1.7 1.7 0 0 0-1.4 1z"/></svg>';
   settings.addEventListener("click", () => { void openMobileSettings(settings); });
   right.appendChild(settings);

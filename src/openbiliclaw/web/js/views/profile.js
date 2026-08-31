@@ -39,6 +39,9 @@ let profileRefreshInFlight = false;
 let profileRefreshPending = false;
 let editing = false;
 let editState = null;
+let editNotice = null;
+let editUndo = null;
+let editUndoTimer = null;
 
 // ── Escape helper ────────────────────────────────────────────
 function esc(s) {
@@ -506,14 +509,40 @@ async function enterEdit() {
 function exitEdit() {
   editing = false;
   editState = null;
+  editNotice = null;
+  editUndo = null;
+  if (editUndoTimer !== null) window.clearTimeout(editUndoTimer);
+  editUndoTimer = null;
   loadData();
 }
 
-async function applyEdit(payload) {
+function clearEditUndo() {
+  if (editUndoTimer !== null) window.clearTimeout(editUndoTimer);
+  editUndoTimer = null;
+  editUndo = null;
+}
+
+function offerEditUndo(payloads, label) {
+  clearEditUndo();
+  editUndo = { payloads, label };
+  editUndoTimer = window.setTimeout(() => {
+    editUndoTimer = null;
+    editUndo = null;
+    if (editing) render();
+  }, 8000);
+}
+
+async function applyEdit(payload, { successMessage = "已保存。", undo = null } = {}) {
   try {
     const res = await submitProfileEdit(payload);
     editState = res?.edit_state?.initialized ? res.edit_state : await fetchEditState();
+    editNotice = { tone: "success", text: successMessage };
+    if (undo) offerEditUndo(undo.payloads, undo.label);
+    else clearEditUndo();
+    render();
+    return true;
   } catch {
+    editNotice = { tone: "error", text: "保存失败，改动没有确认生效；请检查连接后重试。" };
     try {
       editState = await fetchEditState();
     } catch {
@@ -521,6 +550,7 @@ async function applyEdit(payload) {
     }
   }
   render();
+  return false;
 }
 
 function renderTextEditField(path, label, field) {
@@ -648,6 +678,12 @@ function renderInterestEditField(path, label, field) {
 
 function renderEditPanelHtml() {
   let html = `<div class="profile-edit-bar"><button class="profile-edit-toggle" data-edit-toggle="exit">✓ 完成</button></div>`;
+  if (editNotice || editUndo) {
+    html += `<div class="profile-edit-feedback" data-tone="${escAttr(editNotice?.tone || "success")}" role="status" aria-live="polite">
+      <span>${esc(editNotice?.text || "")}</span>
+      ${editUndo ? `<button type="button" data-edit-undo="1">撤销删除「${esc(editUndo.label)}」</button>` : ""}
+    </div>`;
+  }
   if (!editState) {
     html += `<div style="padding:24px"><div class="spinner"></div></div>`;
     return html;
@@ -660,7 +696,7 @@ function renderEditPanelHtml() {
     html += `<div class="profile-edit-note">画像还没建立起来，请先在电脑端完成新闻爪首次设置，再回来编辑。</div>`;
     return html;
   }
-  html += `<div class="profile-edit-note">标签 / 兴趣类增删即时生效；文本与滑杆类改完点「保存」才生效。改动都不会被后续自动重建覆盖，删错了点「恢复 AI 建议」即可。</div>`;
+  html += `<div class="profile-edit-note">标签 / 兴趣类增删即时生效；删除后 8 秒内可撤销。文本与滑杆类改完点「保存」才生效。</div>`;
   for (const path of EDIT_FIELD_ORDER) {
     const field = editState.fields[path];
     if (!field || typeof field !== "object") continue;
@@ -677,20 +713,58 @@ function bindEditActions() {
   $root.querySelector('[data-edit-toggle="exit"]')?.addEventListener("click", exitEdit);
   $root.querySelector("[data-edit-retry]")?.addEventListener("click", () => void enterEdit());
 
+  $root.querySelector("[data-edit-undo]")?.addEventListener("click", async () => {
+    const pending = editUndo;
+    if (!pending) return;
+    clearEditUndo();
+    try {
+      for (const payload of pending.payloads) await submitProfileEdit(payload);
+      editState = await fetchEditState();
+      editNotice = { tone: "success", text: `已撤销删除「${pending.label}」。` };
+    } catch {
+      editNotice = { tone: "error", text: "撤销失败，当前画像状态已重新读取；请重试添加。" };
+      try { editState = await fetchEditState(); } catch { /* keep current editState */ }
+    }
+    render();
+  });
+
   for (const btn of $root.querySelectorAll("[data-edit-remove]")) {
-    btn.addEventListener("click", () =>
-      void applyEdit({ target: btn.dataset.editRemove, op: "remove", value: btn.dataset.editValue }),
-    );
+    btn.addEventListener("click", () => {
+      const payload = { target: btn.dataset.editRemove, op: "remove", value: btn.dataset.editValue };
+      const domain = editState?.fields?.[payload.target]?.domains?.find(
+        (item) => item?.domain === payload.value,
+      );
+      const specifics = Array.isArray(domain?.specifics)
+        ? domain.specifics.map(editSpecificName).filter(Boolean)
+        : [];
+      const restorePayloads = [
+        { ...payload, op: "add" },
+        ...specifics.map((specific) => ({
+          target: payload.target,
+          op: "add",
+          value: specific,
+          parent: payload.value,
+        })),
+      ];
+      void applyEdit(payload, {
+        successMessage: `已删除「${payload.value}」。`,
+        undo: { label: payload.value, payloads: restorePayloads },
+      });
+    });
   }
   for (const btn of $root.querySelectorAll("[data-edit-remove-specific]")) {
-    btn.addEventListener("click", () =>
-      void applyEdit({
+    btn.addEventListener("click", () => {
+      const payload = {
         target: btn.dataset.editRemoveSpecific,
         op: "remove",
         value: btn.dataset.editValue,
         parent: btn.dataset.editParent || "",
-      }),
-    );
+      };
+      void applyEdit(payload, {
+        successMessage: `已删除「${payload.value}」。`,
+        undo: { label: payload.value, payloads: [{ ...payload, op: "add" }] },
+      });
+    });
   }
   for (const btn of $root.querySelectorAll("[data-edit-reset]")) {
     btn.addEventListener("click", () => void applyEdit({ target: btn.dataset.editReset, op: "reset" }));

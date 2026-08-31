@@ -331,8 +331,27 @@ export async function fetchPendingNotifications() {
   return requestJson("/notifications/pending");
 }
 
-export async function ackNotification(bvid) {
-  return requestJson("/notifications/sent", json({ bvid }));
+export async function ackNotification(articleId, requestId) {
+  const data = await requestJson("/notifications/ack", {
+    ...json({ article_id: articleId, request_id: requestId }),
+    timeoutMs: 10_000,
+  });
+  if (data?.ok !== true || String(data?.article_id || "") !== String(articleId || "")) {
+    throw new Error("通知确认没有得到后端确认，请稍后重试。");
+  }
+  return data;
+}
+
+export async function fetchMonitorNotifications({ limit = 100 } = {}) {
+  const bounded = Math.max(1, Math.min(200, Number(limit) || 100));
+  return requestJson(`/news/monitor-notifications?limit=${encodeURIComponent(String(bounded))}`);
+}
+
+export async function actOnMonitorNotification(deliveryId, action, requestId) {
+  return requestJson(`/news/monitor-notifications/${encodeURIComponent(deliveryId)}`, {
+    ...json({ action, request_id: requestId }),
+    timeoutMs: 10_000,
+  });
 }
 
 // ── Cognition Updates ───────────────────────────────────────

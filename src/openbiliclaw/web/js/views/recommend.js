@@ -57,7 +57,7 @@ import {
   escapeHtmlAttribute,
 } from "../view-models.js";
 import { openContentUrl } from "../app-launch.js";
-import { createSavedMutationRegistry } from "../saved-sync-runtime.js";
+import { createDialogFocusController, createSavedMutationRegistry } from "../saved-sync-runtime.js";
 
 const dialogueConfirmation = globalThis.NewsClawDialogueConfirmation;
 if (!dialogueConfirmation) {
@@ -69,6 +69,7 @@ let $root = null;
 let loaded = false;
 let loading = false;
 let feedbackSheet = null; // { itemId, note, submitState }
+let feedbackFocusController = null;
 const feedbackDone = new Map(); // recId -> "like" | "dislike" | "comment"
 const savedMutations = createSavedMutationRegistry();
 const COVER_PRELOAD_BATCH_SIZE = 12;
@@ -1318,7 +1319,11 @@ function renderCard(rawItem, index = 0) {
         ${publishedHtml}
       </div>
       ${recommendationStats(item) ? `<div class="card-stats">${esc(recommendationStats(item))}</div>` : ""}
-      ${explanation ? `<div class="card-expression">${esc(explanation)}</div>` : ""}
+      ${explanation ? `
+        <details class="card-explanation">
+          <summary>查看解读</summary>
+          <div class="card-expression">${esc(explanation)}</div>
+        </details>` : ""}
     </div>`;
 
   // Card actions — icon style with feedback state persistence
@@ -1398,7 +1403,7 @@ function renderCard(rawItem, index = 0) {
   const commentBtn = createCardAction(
     "",
     () => {
-      feedbackSheet = { itemId: item.id, note: "", submitState: "idle" };
+      feedbackSheet = { itemId: item.id, note: "", submitState: "idle", opener: commentBtn };
       renderFeedbackSheet();
     },
     { ariaLabel: "聊一聊", iconHtml: MESSAGE_SVG_ICON },
@@ -1562,6 +1567,8 @@ function setChipState(btn, pressed) {
 function renderFeedbackSheet() {
   let overlay = document.querySelector(".feedback-sheet");
   if (!feedbackSheet) {
+    feedbackFocusController?.deactivate();
+    feedbackFocusController = null;
     if (overlay) overlay.remove();
     return;
   }
@@ -1569,8 +1576,12 @@ function renderFeedbackSheet() {
   if (!overlay) {
     overlay = document.createElement("div");
     overlay.className = "feedback-sheet";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "写一句反馈");
+    overlay.tabIndex = -1;
     overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) { feedbackSheet = null; renderFeedbackSheet(); }
+      if (e.target === overlay) closeFeedbackSheet();
     });
     document.body.appendChild(overlay);
   }
@@ -1581,17 +1592,14 @@ function renderFeedbackSheet() {
     <div class="feedback-sheet-panel">
       <div class="messages-header">
         <span class="messages-title">\u5199\u4E00\u53E5</span>
-        <button class="messages-close" id="feedback-close">\u2715</button>
+        <button class="messages-close" id="feedback-close" type="button" aria-label="关闭反馈">\u2715</button>
       </div>
       <textarea class="feedback-input" id="feedback-note" placeholder="\u8BF4\u8BF4\u4F60\u7684\u60F3\u6CD5\u2026" rows="3">${esc(feedbackSheet.note)}</textarea>
       ${uiState.statusMessage ? `<div style="font-size:12px;color:var(--text-muted);margin-top:4px">${esc(uiState.statusMessage)}</div>` : ""}
       <button class="btn btn-brand" id="feedback-submit" style="margin-top:8px;width:100%" ${uiState.disabled ? "disabled" : ""}>${esc(uiState.buttonLabel)}</button>
     </div>`;
 
-  overlay.querySelector("#feedback-close").addEventListener("click", () => {
-    feedbackSheet = null;
-    renderFeedbackSheet();
-  });
+  overlay.querySelector("#feedback-close").addEventListener("click", closeFeedbackSheet);
 
   overlay.querySelector("#feedback-note").addEventListener("input", (e) => {
     feedbackSheet.note = e.target.value;
@@ -1616,6 +1624,21 @@ function renderFeedbackSheet() {
       renderFeedbackSheet();
     }
   });
+
+  if (!feedbackFocusController) {
+    feedbackFocusController = createDialogFocusController({
+      dialog: overlay,
+      opener: feedbackSheet.opener,
+      onClose: closeFeedbackSheet,
+    });
+    feedbackFocusController.activate();
+    overlay.querySelector("#feedback-note")?.focus();
+  }
+}
+
+function closeFeedbackSheet() {
+  feedbackSheet = null;
+  renderFeedbackSheet();
 }
 
 // ── Actions ──────────────────────────────────────────────────
@@ -1642,7 +1665,9 @@ async function handleReshuffle() {
     void fetchRuntimeStatus()
       .then((status) => applyRuntimeStatusSnapshot(status, requestGeneration))
       .catch(() => {});
-  } catch { /* ignore */ }
+  } catch {
+    recommendationActionMessage = "换一批失败，当前内容已保留。请检查连接后重试。";
+  }
   loading = false;
   render();
 }

@@ -54,6 +54,7 @@
       border-radius: 10px; color: #59677f; background: #fff;
     }
     .monitor-btn { position: relative; }
+    .monitor-btn.degraded { color: #9a6415; border-color: rgba(242,165,59,.55); background: #fff8ec; }
     .monitor-badge {
       position: absolute; top: -5px; right: -5px; min-width: 16px; height: 16px;
       padding: 0 4px; border: 2px solid #fff; border-radius: 999px;
@@ -75,6 +76,10 @@
       color: #56647b; background: #fff;
     }
     .pill.primary { border-color: var(--brand); color: #fff; background: linear-gradient(135deg, var(--brand), var(--brand-strong)); }
+    .icon-btn:focus-visible, .pill:focus-visible, .settings-card input:focus-visible {
+      outline: 3px solid rgba(251,114,153,.42);
+      outline-offset: 2px;
+    }
     .settings {
       position: absolute; inset: 0; z-index: 3; display: grid; place-items: start center;
       padding: 78px 18px 18px; background: rgba(35,48,70,.24); backdrop-filter: blur(5px);
@@ -117,9 +122,9 @@
           </div>
         </div>
       </div>
-      <div class="settings" id="settingsPanel" hidden>
+      <div class="settings" id="settingsPanel" role="dialog" aria-modal="true" aria-labelledby="connection-settings-title" tabindex="-1" hidden>
         <form class="settings-card" id="settingsForm">
-          <h2>连接本机 NewsClaw</h2>
+          <h2 id="connection-settings-title">连接本机 NewsClaw</h2>
           <p>默认地址是正式端口 8430。开发环境也会自动尝试 8431。</p>
           <label>本机服务地址
             <input id="endpointInput" inputmode="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8430">

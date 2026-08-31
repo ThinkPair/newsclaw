@@ -573,9 +573,9 @@ class TestMobileWebViewModels:
         )
 
     def test_mobile_cover_templates_use_wrapper_fallbacks(self) -> None:
-        recommend_js = Path("src/openbiliclaw/web/js/views/recommend.js").read_text()
-        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text()
-        app_css = Path("src/openbiliclaw/web/css/app.css").read_text()
+        recommend_js = Path("src/openbiliclaw/web/js/views/recommend.js").read_text(encoding="utf-8")
+        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text(encoding="utf-8")
+        app_css = Path("src/openbiliclaw/web/css/app.css").read_text(encoding="utf-8")
 
         assert 'referrerpolicy="${cover.referrerPolicy}"' not in recommend_js
         assert 'referrerpolicy="${cover.referrerPolicy}"' not in chat_js
@@ -696,7 +696,7 @@ class TestMobileWebViewModels:
         )
 
     def test_mobile_recommendation_view_preloads_and_auto_appends(self) -> None:
-        recommend_js = Path("src/openbiliclaw/web/js/views/recommend.js").read_text()
+        recommend_js = Path("src/openbiliclaw/web/js/views/recommend.js").read_text(encoding="utf-8")
 
         assert "getRecommendationCoverPreloadUrls" in recommend_js
         assert "getRecommendationImageLoadingAttrs" in recommend_js
@@ -1236,9 +1236,9 @@ class TestMobileWebViewModels:
         )
 
     def test_profile_confirm_probe_actions_mark_profile_surface(self) -> None:
-        api_js = Path("src/openbiliclaw/web/js/api.js").read_text()
-        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text()
-        desktop_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text()
+        api_js = Path("src/openbiliclaw/web/js/api.js").read_text(encoding="utf-8")
+        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text(encoding="utf-8")
+        desktop_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
         assert "export async function respondToProbe(domain, responseType, options = {})" in api_js
         assert 'surface: "profile"' in profile_js
@@ -1250,8 +1250,8 @@ class TestMobileWebViewModels:
         assert 'respondToProbe(domain, action, { surface: "profile" })' in profile_js
 
     def test_profile_edit_interest_specifics_are_editable_in_web_surfaces(self) -> None:
-        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text()
-        desktop_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text()
+        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text(encoding="utf-8")
+        desktop_js = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
         for source in (profile_js, desktop_js):
             assert "specifics" in source
@@ -1277,10 +1277,10 @@ class TestMobileWebViewModels:
         )
 
     def test_mobile_avoidance_probe_ui_wiring_is_present(self) -> None:
-        api_js = Path("src/openbiliclaw/web/js/api.js").read_text()
-        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text()
-        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text()
-        view_models_js = Path("src/openbiliclaw/web/js/view-models.js").read_text()
+        api_js = Path("src/openbiliclaw/web/js/api.js").read_text(encoding="utf-8")
+        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text(encoding="utf-8")
+        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text(encoding="utf-8")
+        view_models_js = Path("src/openbiliclaw/web/js/view-models.js").read_text(encoding="utf-8")
 
         assert "fetchPendingAvoidanceProbes" in api_js
         assert 'requestJson("/avoidance-probes/pending")' in api_js
@@ -1297,7 +1297,7 @@ class TestMobileWebViewModels:
         assert "respondToAvoidanceProbe" in profile_js
 
     def test_mobile_avoidance_actions_do_not_bind_interest_handler(self) -> None:
-        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text()
+        profile_js = Path("src/openbiliclaw/web/js/views/profile.js").read_text(encoding="utf-8")
         interest_binder = (
             "function bindSpecInterestActions()"
             + profile_js.split("function bindSpecInterestActions()", 1)[1].split(
@@ -1376,21 +1376,21 @@ class TestMobileWebViewModels:
         _assert_js(script)
 
     def test_mobile_probe_card_locks_all_actions_after_tap(self) -> None:
-        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text()
+        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text(encoding="utf-8")
 
         assert "setProbeCardBusy(card, true)" in chat_js
         assert "setProbeCardBusy(card, false)" in chat_js
         assert 'card.querySelectorAll("[data-probe]")' in chat_js
 
     def test_mobile_empty_messages_overlay_preserves_close_handler(self) -> None:
-        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text()
+        chat_js = Path("src/openbiliclaw/web/js/views/chat.js").read_text(encoding="utf-8")
 
         assert "panel.innerHTML +=" not in chat_js
         assert 'emptyState.className = "messages-empty-state"' in chat_js
         assert "panel.appendChild(emptyState)" in chat_js
 
     def test_desktop_web_knows_avoidance_probe_endpoint(self) -> None:
-        source = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text()
+        source = Path("src/openbiliclaw/web/desktop/assets/js/app.js").read_text(encoding="utf-8")
 
         assert "avoidanceProbeRespond" in source
         assert "avoidance.probe" in source

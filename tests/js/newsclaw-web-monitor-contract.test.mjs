@@ -90,7 +90,7 @@ test("extension monitor badge executes after a successful local connection", asy
           delete this[name];
         },
         focus() {},
-        classList: { contains: () => false },
+        classList: { contains: () => false, add() {}, remove() {} },
       });
     }
     return elements.get(selector);
@@ -142,7 +142,7 @@ test("extension clears and fences an old monitor badge when the endpoint goes of
         hidden: false, textContent: "", className: "", value: "", src: "",
         addEventListener() {}, setAttribute(name, value) { this[name] = value; },
         removeAttribute(name) { delete this[name]; }, focus() {},
-        classList: { contains: () => false },
+        classList: { contains: () => false, add() {}, remove() {} },
       });
     }
     return elements.get(selector);
@@ -185,7 +185,7 @@ test("extension periodic health refresh replaces a stale online state with offli
         addEventListener() {}, setAttribute(name, value) { this[name] = value; },
         removeAttribute(name) { delete this[name]; }, focus() {},
       };
-      row.classList = { contains: (name) => row.className.split(/\s+/).includes(name) };
+      row.classList = { contains: (name) => row.className.split(/\s+/).includes(name), add() {}, remove() {} };
       elements.set(selector, row);
     }
     return elements.get(selector);
@@ -239,7 +239,7 @@ test("saving a new extension endpoint invalidates an older connection probe", as
         setAttribute(name, value) { this[name] = value; },
         removeAttribute(name) { delete this[name]; }, focus() {},
       };
-      row.classList = { contains: (name) => row.className.split(/\s+/).includes(name) };
+      row.classList = { contains: (name) => row.className.split(/\s+/).includes(name), add() {}, remove() {} };
       elements.set(selector, row);
     }
     return elements.get(selector);
