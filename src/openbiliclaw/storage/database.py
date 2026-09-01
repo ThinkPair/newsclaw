@@ -8187,7 +8187,9 @@ class Database:
             order_prefix = ""
             order_params = ()
         scoped_quality_order = "source_rank DESC, rating_score DESC, " if scope_sql else ""
-        window_params: tuple[Any, ...] = (*order_params, *scope_params, window_limit)
+        # Placeholder order must match SQL text order: WHERE (scope) placeholders
+        # appear before ORDER BY (preferred-platform CASE) placeholders.
+        window_params: tuple[Any, ...] = (*scope_params, *order_params, window_limit)
         cursor = self.conn.execute(
             f"""
             SELECT *
