@@ -109,7 +109,7 @@ function renderStatusBar() {
 
   const title = document.createElement("span");
   title.className = "status-title";
-  title.innerHTML = '<img class="status-brand-icon" src="icon-maskable-192.png" alt="" aria-hidden="true"><span>NewsClaw</span>';
+  title.innerHTML = '<img class="status-brand-icon" src="icon-192.png?v=a639f641" alt="" aria-hidden="true"><span>NewsClaw</span>';
 
   const right = document.createElement("div");
   right.className = "status-right";

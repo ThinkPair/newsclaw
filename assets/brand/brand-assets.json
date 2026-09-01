@@ -1,0 +1,73 @@
+{
+  "assets": [
+    {
+      "path": "assets/brand/newsclaw-icon.png",
+      "sha256": "610c16b0784a46feef4807e586a69723e6d5cc1c259e3b09ca8c2a6cee0719e2"
+    },
+    {
+      "path": "assets/brand/newsclaw-logo-application.png",
+      "sha256": "517749bd65def81779c8afd7f06459e37095037f2a5445e7d31bcb26f6a09b2a"
+    },
+    {
+      "path": "extension/icons/icon16.png",
+      "sha256": "7de9f16de68f031c97dda98fdd32b1d709bf5bec1074c2b2799f26799387623d"
+    },
+    {
+      "path": "extension/icons/icon32.png",
+      "sha256": "5a8922f2856548cdeecb0b64ac5550b80aa601123008075935d7f2e175e443e1"
+    },
+    {
+      "path": "extension/icons/icon48.png",
+      "sha256": "2c805106daf8d35d90c68dfbb691880ddbfded07c79176f37194caa7a0a79186"
+    },
+    {
+      "path": "extension/icons/icon128.png",
+      "sha256": "1203b7e1d6e331f23d3dcea87bedd4e8b4ba63647c555b1c4aee2ce7dbe103e1"
+    },
+    {
+      "path": "src/openbiliclaw/web/icon-32.png",
+      "sha256": "5a8922f2856548cdeecb0b64ac5550b80aa601123008075935d7f2e175e443e1"
+    },
+    {
+      "path": "src/openbiliclaw/web/icon-192.png",
+      "sha256": "ca2a054be071312412f3f9a777fb6c22c02e6dd42ae764c2b5ed78d8e9ee23ff"
+    },
+    {
+      "path": "src/openbiliclaw/web/icon-512.png",
+      "sha256": "7eb855f966fa9f015398602a2bc0dd0f45e8f48db2c1ddf4f2be71cd8d8ea142"
+    },
+    {
+      "path": "src/openbiliclaw/web/icon-maskable-192.png",
+      "sha256": "f72338d1ff66c6c5e81b017a0db6e0ec4d293a481223ea9d2161622e284f3c1d"
+    },
+    {
+      "path": "src/openbiliclaw/web/icon-maskable-512.png",
+      "sha256": "e666a24a7e6ad1ee57f3d606bc5cad13daa5a19512628560621f16bc59fa0ea2"
+    },
+    {
+      "path": "src/openbiliclaw/web/apple-touch-icon.png",
+      "sha256": "745cad21a579ff2bd8045025fba6dacdf708283e2d24ec0761c125f543d8f384"
+    },
+    {
+      "path": "docs/images/newsclaw-icon-32.png",
+      "sha256": "5a8922f2856548cdeecb0b64ac5550b80aa601123008075935d7f2e175e443e1"
+    },
+    {
+      "path": "docs/images/newsclaw-icon-512.png",
+      "sha256": "7eb855f966fa9f015398602a2bc0dd0f45e8f48db2c1ddf4f2be71cd8d8ea142"
+    },
+    {
+      "path": "packaging/icon.ico",
+      "sha256": "73c031893e7667bb9479f3f68a882e49ed715ae5c9e1989b558b0d6b96846d45"
+    },
+    {
+      "path": "packaging/icon.icns",
+      "sha256": "002df43a8ed8091e0accc89e1bde335c75aeee48c81e0af373b720e0ff1c30d8"
+    }
+  ],
+  "brand": "NewsClaw",
+  "brand_revision": "a639f641",
+  "generator": "scripts/build_brand_icons.py",
+  "source": "assets/brand/newsclaw-icon-source.png",
+  "source_sha256": "a639f641a808221a3da8547c4bcfe814bc98707dc03a4f5e916c1fbd970126db"
+}

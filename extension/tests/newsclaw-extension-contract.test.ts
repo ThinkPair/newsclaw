@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 
 import { collectManifestBuildAssets } from "../scripts/verify-build-assets.mjs";
+
+type IconMap = Record<string, string>;
 
 type Manifest = {
   manifest_version?: number;
@@ -13,9 +15,10 @@ type Manifest = {
   host_permissions?: string[];
   optional_host_permissions?: string[];
   background?: { service_worker?: string; scripts?: string[] };
-  action?: { default_popup?: string };
+  action?: { default_popup?: string; default_icon?: IconMap };
+  icons?: IconMap;
   side_panel?: { default_path?: string };
-  sidebar_action?: { default_panel?: string };
+  sidebar_action?: { default_panel?: string; default_icon?: IconMap };
   content_scripts?: unknown;
   web_accessible_resources?: unknown;
   content_security_policy?: { extension_pages?: string };
@@ -102,6 +105,30 @@ test("Chrome, Firefox, and Safari expose the same local client through native si
   assert.deepEqual(collectManifestBuildAssets(safari), [
     "background/service-worker.js",
   ]);
+});
+
+test("all browser surfaces ship the generated NewsClaw icon set", async () => {
+  const manifests = [
+    await readJson<Manifest>("manifest.json"),
+    await readJson<Manifest>("manifest.firefox.json"),
+    await readJson<Manifest>("manifest.safari.json"),
+  ];
+  const requiredSizes = ["16", "32", "48", "128"].sort();
+
+  for (const manifest of manifests) {
+    assert.deepEqual(Object.keys(manifest.icons ?? {}).sort(), requiredSizes);
+    assert.deepEqual(Object.keys(manifest.action?.default_icon ?? {}).sort(), requiredSizes);
+    for (const iconPath of Object.values(manifest.icons ?? {})) {
+      assert.equal((await stat(iconPath)).isFile(), true, iconPath);
+    }
+  }
+
+  const firefoxSidebarIcons = manifests[1]?.sidebar_action?.default_icon ?? {};
+  assert.deepEqual(Object.keys(firefoxSidebarIcons).sort(), requiredSizes);
+  const popup = await readFile("popup/popup.html", "utf8");
+  assert.match(popup, /icons\/icon32\.png/);
+  assert.match(popup, /icons\/icon48\.png/);
+  assert.match(popup, /icons\/icon128\.png/);
 });
 
 test("extension-page CSP permits only the two local NewsClaw origins", async () => {

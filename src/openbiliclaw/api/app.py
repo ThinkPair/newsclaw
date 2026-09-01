@@ -21676,7 +21676,11 @@ def create_app(
         def _favicon() -> FileResponse:
             if not _favicon_path.is_file():
                 raise HTTPException(status_code=404, detail="favicon not found")
-            return FileResponse(_favicon_path, media_type="image/png")
+            return FileResponse(
+                _favicon_path,
+                media_type="image/png",
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
 
         app.mount(
             "/m",

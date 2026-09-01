@@ -1963,7 +1963,7 @@ class TestBackendAPI:
         assert '<meta name="apple-mobile-web-app-capable" content="yes">' in response.text
         assert '<meta name="apple-mobile-web-app-title" content="NewsClaw">' in response.text
         assert (
-            '<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=4">'
+            '<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=a639f641">'
         ) in response.text
 
     def test_mobile_web_index_versions_the_complete_module_graph(self) -> None:
@@ -2071,6 +2071,7 @@ class TestBackendAPI:
         favicon_response = client.get("/favicon.ico")
         assert favicon_response.status_code == 200
         assert favicon_response.headers.get("content-type", "").startswith("image/png")
+        assert favicon_response.headers["cache-control"] == "no-cache, must-revalidate"
 
     @pytest.mark.asyncio
     async def test_runtime_context_presence_survives_rebuild(
@@ -4340,6 +4341,7 @@ class TestBackendAPI:
 
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("image/png")
+        assert response.headers["cache-control"] == "no-cache, must-revalidate"
         assert (
             response.content
             == (

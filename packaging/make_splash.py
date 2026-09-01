@@ -26,12 +26,12 @@ if TYPE_CHECKING:
 _W, _H = 560, 280
 _BG_TOP = (19, 17, 27)
 _BG_BOTTOM = (31, 23, 35)
-_ACCENT = (247, 105, 157)  # OpenBiliClaw pink
+_ACCENT = (240, 111, 145)  # NewsClaw coral
 _ACCENT_SOFT = (255, 153, 190)
 _FG = (248, 246, 250)
 _SUB = (185, 177, 193)
 _MUTED = (132, 124, 143)
-_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "brand" / "openbiliclaw-icon.png"
+_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "brand" / "newsclaw-icon.png"
 _PROJECT_FILE = Path(__file__).resolve().parent.parent / "pyproject.toml"
 _ICON_X, _ICON_Y, _ICON_SIZE = 38, 40, 94
 
@@ -145,11 +145,11 @@ def make_splash(
         img.paste(icon, (icon_x, icon_y), icon)
 
     title_font, body_font, label_font, cjk = _load_fonts()
-    subtitle = "懂你的内容伙伴" if cjk else "Your personal content companion"
+    subtitle = "你的本地变化助手" if cjk else "Your local change companion"
     status = "正在准备，只需片刻" if cjk else "Getting things ready"
-    detail = "启动本地服务与智能引擎" if cjk else "Starting local services and intelligence"
+    detail = "启动本地证据库与智能引擎" if cjk else "Starting local evidence and intelligence"
 
-    draw.text((158, 49), "OpenBiliClaw", font=title_font, fill=_FG)
+    draw.text((158, 49), "NewsClaw", font=title_font, fill=_FG)
     draw.text((160, 98), subtitle, font=body_font, fill=_SUB)
 
     version_text = _display_version(version or _read_project_version())

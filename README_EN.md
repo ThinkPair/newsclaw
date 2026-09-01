@@ -1,5 +1,9 @@
 # NewsClaw
 
+<p align="center">
+  <img src="assets/brand/newsclaw-icon.png" width="144" alt="NewsClaw friendly claw news assistant logo">
+</p>
+
 **NewsClaw does not merely collect news; it tracks what objectively changed.**
 
 📌 Latest: **v0.1.0**

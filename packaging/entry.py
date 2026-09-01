@@ -685,7 +685,7 @@ def _notify_starting() -> None:
             [
                 "osascript",  # noqa: S607
                 "-e",
-                'display notification "正在启动,请稍候…" with title "OpenBiliClaw"',
+                'display notification "正在启动,请稍候…" with title "NewsClaw"',
             ]
         )
 
@@ -860,9 +860,9 @@ def _run_server_in_tray(
     menu = pystray.Menu(
         pystray.MenuItem("打开 Web 界面", _open_web, default=True),
         pystray.MenuItem("查看运行日志", _open_logs),
-        pystray.MenuItem("退出 OpenBiliClaw", _quit),
+        pystray.MenuItem("退出 NewsClaw", _quit),
     )
-    icon = pystray.Icon("OpenBiliClaw", _tray_icon_image(), "OpenBiliClaw", menu)
+    icon = pystray.Icon("NewsClaw", _tray_icon_image(), "NewsClaw", menu)
     # Backend is assembled and the tray icon is about to appear → drop the boot
     # splash now, handing visual feedback over to the tray with no perceptible gap.
     _close_splash()

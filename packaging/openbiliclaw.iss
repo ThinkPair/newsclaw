@@ -66,6 +66,7 @@ OutputBaseFilename=OpenBiliClaw-windows-{#MyAppVersion}{#MyAppVariantSuffix}-Set
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=packaging\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Tasks]

@@ -165,7 +165,7 @@ body.chat-view-active .back-to-top {
   display: block;
   border-radius: 8px;
   object-fit: cover;
-  background: #fb7299;
+  background: transparent;
 }
 
 .status-right {

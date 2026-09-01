@@ -25,6 +25,13 @@ The complete license text is retained at:
 
   src/openbiliclaw/web/desktop/assets/icons/phosphor/LICENSE
 
+The current NewsClaw mascot and application icon are project-specific,
+AI-assisted brand assets created for NewsClaw on 2026-09-01. The original
+source image, generation prompt, SHA-256 provenance, deterministic derivative
+builder, and generated asset manifest are retained in assets/brand/. This
+brand artwork is not derived from the OpenBiliClaw logo. No trademark
+registration or global exclusivity is claimed by this notice.
+
 News articles, publisher names, publisher marks, and third-party API data are
 not covered by the software licenses. NewsClaw stores provenance and links to
 the original publisher. The default build is for the owner's personal,

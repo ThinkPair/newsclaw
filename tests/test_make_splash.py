@@ -40,16 +40,17 @@ def test_make_splash_has_expected_dimensions(tmp_path: Path) -> None:
     out = make_splash_mod.make_splash(tmp_path / "splash.png", version="1.2.3")
     with Image.open(out) as img:
         assert img.size == (make_splash_mod._W, make_splash_mod._H)
-        # The launch screen carries the canonical pink brand mark instead of a
+        # The launch screen carries the canonical NewsClaw mascot instead of a
         # text-only placeholder. Its transparent corners blend into the splash.
-        center = (
-            make_splash_mod._ICON_X + make_splash_mod._ICON_SIZE // 2,
-            make_splash_mod._ICON_Y + make_splash_mod._ICON_SIZE // 2,
+        pincer = (
+            make_splash_mod._ICON_X + round(make_splash_mod._ICON_SIZE * 0.25),
+            make_splash_mod._ICON_Y + round(make_splash_mod._ICON_SIZE * 0.66),
         )
-        red, green, blue = img.convert("RGB").getpixel(center)
+        red, green, blue = img.convert("RGB").getpixel(pincer)
         assert red > 220
         assert green < 180
-        assert blue > 120
+        assert blue >= 115
+    assert make_splash_mod._ICON_PATH.name == "newsclaw-icon.png"
 
 
 def test_make_splash_renders_requested_version(tmp_path: Path) -> None:

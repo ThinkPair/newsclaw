@@ -1,5 +1,9 @@
 # NewsClaw / 新闻爪
 
+<p align="center">
+  <img src="assets/brand/newsclaw-icon.png" width="144" alt="NewsClaw 可爱蟹钳新闻助手 Logo">
+</p>
+
 **新闻爪抓的不是新闻，而是真正发生的变化。**
 
 📌 最新版本：**v0.1.0**
